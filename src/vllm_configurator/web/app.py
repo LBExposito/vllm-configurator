@@ -4,17 +4,46 @@ from __future__ import annotations
 
 import json
 import re
+import sys
 from pathlib import Path
 
-import streamlit as st
-import yaml
-from pydantic import ValidationError
+# Toujours exécuter le package du dépôt, pas une copie installée dans le venv : un hébergeur (Streamlit Community
+# Cloud) installe le projet au premier déploiement puis met à jour le dépôt sans le réinstaller. Si le code ou le
+# catalogue a changé depuis le dernier import dans ce process, les modules sont purgés pour être relus.
+_SRC = Path(__file__).resolve().parents[2]
+_ROOT = _SRC.parent
+sys.path[:] = [str(_SRC)] + [entry for entry in sys.path if Path(entry or ".").resolve() != _SRC]
 
-from vllm_configurator import render
-from vllm_configurator.catalog import default_catalog
-from vllm_configurator.domain import DeploymentRequest, GenerationError
-from vllm_configurator.engine import generate
-from vllm_configurator.scenario import ScenarioError, dump_scenario, load_scenario, request_to_form
+
+def _source_stamp() -> float:
+    files = list((_SRC / "vllm_configurator").rglob("*.py")) + list((_ROOT / "catalog").rglob("*.yaml"))
+    return max((f.stat().st_mtime for f in files), default=0.0)
+
+
+def _refresh_package() -> None:
+    stamp = _source_stamp()
+    loaded = sys.modules.get("vllm_configurator")
+    stale_copy = loaded is not None and not Path(loaded.__file__).resolve().is_relative_to(_SRC)
+    if stale_copy or getattr(sys, "_vllm_configurator_stamp", None) != stamp:
+        for name in [m for m in sys.modules if m == "vllm_configurator" or m.startswith("vllm_configurator.")]:
+            del sys.modules[name]
+        sys._vllm_configurator_stamp = stamp
+
+
+_refresh_package()
+
+import streamlit as st  # noqa: E402
+import yaml  # noqa: E402
+from pydantic import ValidationError  # noqa: E402
+
+from vllm_configurator import render  # noqa: E402
+from vllm_configurator.catalog import default_catalog  # noqa: E402
+from vllm_configurator.domain import DeploymentRequest, GenerationError  # noqa: E402
+from vllm_configurator.engine import generate  # noqa: E402
+from vllm_configurator.llmd import generate_routing, render_epp_config, render_vllm_args  # noqa: E402
+from vllm_configurator.scenario import (  # noqa: E402
+    ROUTING_WEIGHT_KEYS, ScenarioError, dump_scenario, load_scenario, request_to_form,
+)
 
 REFERENCE_INPUT = Path(__file__).resolve().parents[3] / "tests" / "golden" / "reference_case" / "input.yaml"
 SEVERITY_LABEL = {"critical": "🛑 Critique", "warning": "⚠️ Avertissement", "info": "ℹ️ Info"}
@@ -32,10 +61,12 @@ DEFAULTS = {
     "model_id": sorted(catalog.models)[0], "vllm_version": catalog.sorted_versions()[-1],
     "usage_type": "agentic", "mode": "interactive", "spec_enabled": True, "draft_sample_method": "défaut vLLM",
     "allow_lossy": False, "itl_metric": "itl",
+    "llmd_version": sorted(catalog.llmd_versions)[-1], "llmd_mode": "approximate", "llmd_kv_endpoint": "",
 }
 OPTIONAL = ["isl_p50", "isl_p95", "isl_p99", "osl_p50", "osl_p95", "osl_p99", "hit_rate", "target_concurrency",
             "paused_sessions", "ttft", "itl", "itl_measured", "ttft_measured", "k", "acceptance_length", "kv_tokens", "kv_util", "kv_block", "gpu_util",
-            "reserve", "max_model_len"]
+            "reserve", "max_model_len", "llmd_shared_prefix", "llmd_obs_block", "llmd_obs_lru", "llmd_obs_window",
+            "llmd_obs_hit", *ROUTING_WEIGHT_KEYS.values()]
 for _key, _value in DEFAULTS.items():
     st.session_state.setdefault(_key, _value)
 for _key in OPTIONAL:
@@ -43,6 +74,7 @@ for _key in OPTIONAL:
 st.session_state.setdefault("scenario_name", "")
 st.session_state.setdefault("extra_args_text", "")
 st.session_state.setdefault("extra_env_text", "")
+st.session_state.setdefault("llmd_params_text", "")
 
 
 def parse_mapping(text: str, label: str) -> dict:
@@ -67,8 +99,13 @@ def apply_request(request: DeploymentRequest) -> list[str]:
                                 ("Version de vLLM", request.vllm_version, catalog.vllm_versions)):
         if value not in known:
             problems.append(f"{label} {value!r} absent du catalogue (disponibles : {', '.join(sorted(known))}).")
+    if request.routing and request.routing.llmd_version and request.routing.llmd_version not in catalog.llmd_versions:
+        problems.append(f"llm-d {request.routing.llmd_version!r} absent du catalogue"
+                        f" (disponibles : {', '.join(sorted(catalog.llmd_versions))}).")
     if not problems:
-        st.session_state.update(request_to_form(request))
+        form = request_to_form(request)
+        form["llmd_version"] = form["llmd_version"] or DEFAULTS["llmd_version"]
+        st.session_state.update(form)
     return problems
 
 
@@ -115,7 +152,7 @@ def opt_float(label: str, key: str, min_value: float, max_value: float | None = 
 
 with st.sidebar:
     st.title("⚙️ Config vLLM")
-    st.button("Charger le cas de référence (§1)", on_click=load_reference, use_container_width=True)
+    st.button("Charger le cas de référence (§1)", on_click=load_reference, width="stretch")
 
     with st.expander("💾 Scénarios (import / export YAML)", expanded=False):
         st.file_uploader("Importer un scénario", type=["yaml", "yml"], key="scenario_file", on_change=import_scenario,
@@ -228,6 +265,49 @@ with st.sidebar:
     with c2:
         ttft_measured = opt_float("TTFT p95 mesuré (ms)", "ttft_measured", 1.0, step=10.0)
 
+    st.header("Routage llm-d (EPP)")
+    st.caption("Configuration de l'EndpointPickerConfig qui répartit les requêtes entre les instances vLLM ci-dessus.")
+    llmd_version = st.selectbox("Version d'llm-d", sorted(catalog.llmd_versions), key="llmd_version",
+                                format_func=lambda v: catalog.llmd_versions[v].display_name)
+    llmd_mode = st.radio(
+        "Index des préfixes", ["approximate", "precise"], horizontal=True, key="llmd_mode",
+        format_func=lambda m: {"approximate": "Approximatif", "precise": "Precise (KV events)"}[m],
+        help=("Approximatif : l'EPP estime le cache de chaque pod à partir des requêtes qu'il a routées, rien à changer"
+              " côté vLLM. Precise : les pods publient leurs KV events en ZMQ (--kv-events-config), sidecar tokenizer."))
+    llmd_shared_prefix = opt_int(
+        "Préfixe commun à toutes les sessions (tokens)", "llmd_shared_prefix", min_value=0,
+        help="System prompt + définitions d'outils communs à toutes les requêtes. Ils sont en cache sur tous les pods :"
+             " seule la partie propre à la session dépend du routage. Vide : 0 (cas où l'affinité compte le plus).")
+    if llmd_mode == "precise":
+        st.text_input("Endpoint ZMQ des KV events", key="llmd_kv_endpoint", placeholder="tcp://<service-epp>:5557")
+    _prefix_plugin = "precise-prefix-cache-scorer" if llmd_mode == "precise" else "approx-prefix-cache-producer"
+    _known_params = catalog.llmd_versions[llmd_version].plugins[_prefix_plugin].parameters
+    st.text_area(
+        "Paramètres llm-d forcés (YAML)", key="llmd_params_text", height=90,
+        placeholder="# Une ligne par paramètre, remplace la valeur calculée.\nlruCapacityPerServer: 700000\nmaxPrefixTokensToMatch: 262144",
+        help=(f"Paramètres de {_prefix_plugin}, posés tels quels dans l'EndpointPickerConfig. Connus : "
+              + ", ".join(_known_params) + ". Un nom inconnu est ignoré, avec un avertissement critique. Leur rôle est"
+              " expliqué dans l'onglet « Routage llm-d »."))
+    with st.expander("Forcer les poids du profil"):
+        st.caption("Vide : poids calculé par l'app.")
+        c1, c2 = st.columns(2)
+        with c1:
+            opt_int("queue", "llmd_w_queue", min_value=0)
+            opt_int("prefix-cache", "llmd_w_prefix", min_value=0)
+        with c2:
+            opt_int("kv-cache-utilization", "llmd_w_kv", min_value=0)
+            opt_int("no-hit-lru", "llmd_w_nohit", min_value=0)
+    with st.expander("Mesures llm-d (optionnel)"):
+        st.caption("Log « Prefix DataProducer initialized config={...} » de l'EPP déployé, et hit rate mesuré par pod.")
+        c1, c2 = st.columns(2)
+        with c1:
+            llmd_obs_block = opt_int("blockSizeTokens (log)", "llmd_obs_block")
+            llmd_obs_window = opt_int("maxPrefixTokensToMatch (log)", "llmd_obs_window")
+        with c2:
+            llmd_obs_lru = opt_int("lruCapacityPerServer (log)", "llmd_obs_lru")
+            llmd_obs_hit = opt_float("Hit rate mesuré, pire pod (0–1)", "llmd_obs_hit", 0.0, 1.0,
+                                     help="vllm:prefix_cache_hits / vllm:prefix_cache_queries sur le pod le moins bon.")
+
     with st.expander("Avancé"):
         gpu_util = opt_float("Forcer gpu-memory-utilization", "gpu_util", 0.05, 1.0)
         reserve = opt_float("Réserve par GPU pour l'estimation du KV (Gio)", "reserve", 0.0, step=1.0,
@@ -251,6 +331,7 @@ def pct(p50, p95, p99) -> dict:
 try:
     extra_args = parse_mapping(st.session_state["extra_args_text"], "Arguments supplémentaires")
     extra_env = {k: str(v) for k, v in parse_mapping(st.session_state["extra_env_text"], "Variables d'environnement").items()}
+    llmd_params = parse_mapping(st.session_state["llmd_params_text"], "Paramètres llm-d forcés")
 except ValueError as exc:
     st.error(str(exc))
     st.stop()
@@ -271,17 +352,28 @@ try:
                        if itl_measured or ttft_measured else None),
         gpu_memory_utilization=gpu_util, kv_estimate_reserve_gib_per_gpu=reserve,
         max_model_len=max_model_len, extra_args=extra_args, extra_env=extra_env,
+        routing={
+            "llmd_version": llmd_version, "prefix_mode": llmd_mode, "shared_prefix_tokens": llmd_shared_prefix,
+            "kv_events_endpoint": (st.session_state["llmd_kv_endpoint"] or None) if llmd_mode == "precise" else None,
+            "weights": {scorer: st.session_state[key] for scorer, key in ROUTING_WEIGHT_KEYS.items()
+                        if st.session_state[key] is not None},
+            "parameters": llmd_params,
+            "observed": ({"block_size_tokens": llmd_obs_block, "lru_capacity_per_server": llmd_obs_lru,
+                          "max_prefix_tokens_to_match": llmd_obs_window, "prefix_cache_hit_rate": llmd_obs_hit}
+                         if any(v is not None for v in (llmd_obs_block, llmd_obs_lru, llmd_obs_window, llmd_obs_hit))
+                         else None),
+        },
     )
 except ValidationError as exc:
     st.error("Entrées invalides :\n\n" + "\n".join(f"- {'.'.join(map(str, e['loc']))} : {e['msg']}" for e in exc.errors()))
     st.stop()
 
 
-def export_button(result=None, args_yaml: str | None = None) -> None:
+def export_button(result=None, args_yaml: str | None = None, epp_yaml: str | None = None) -> None:
     name = st.session_state.get("scenario_name") or ""
     export_slot.download_button(
-        "Exporter le scénario (.yaml)", dump_scenario(request, name or None, result, args_yaml),
-        file_name=f"{slug(name) if name else 'scenario'}.yaml", mime="application/x-yaml", use_container_width=True,
+        "Exporter le scénario (.yaml)", dump_scenario(request, name or None, result, args_yaml, epp_yaml),
+        file_name=f"{slug(name) if name else 'scenario'}.yaml", mime="application/x-yaml", width="stretch",
     )
 
 
@@ -291,7 +383,13 @@ except GenerationError as exc:
     export_button()
     st.error("\n\n".join(exc.errors))
     st.stop()
-export_button(result, render.render_k8s_args(result, catalog) if not result.blocking_errors else None)
+try:
+    routing = generate_routing(result, catalog)
+    routing_error = None
+except GenerationError as exc:
+    routing, routing_error = None, "\n\n".join(exc.errors)
+epp_yaml = render_epp_config(routing, catalog) if routing is not None else ""
+export_button(result, render.render_k8s_args(result, catalog) if not result.blocking_errors else None, epp_yaml or None)
 
 if result.blocking_errors:
     for error in result.blocking_errors:
@@ -320,7 +418,7 @@ if analysis is not None:
     for c in structural:
         (st.error if c.status == "ko" else st.warning)(f"**{c.label}** : {c.detail}")
 
-tabs = st.tabs(["Configuration", "Paliers et SLO", "Justifications", "Avertissements", "Indicateurs", "Hypothèses",
+tabs = st.tabs(["Configuration", "Routage llm-d", "Paliers et SLO", "Justifications", "Avertissements", "Indicateurs", "Hypothèses",
                 "Vérification et métriques"])
 
 with tabs[0]:
@@ -334,6 +432,102 @@ with tabs[0]:
     st.download_button("Télécharger args.yaml", k8s, file_name="vllm-args.yaml")
     st.subheader("Ligne de commande")
     st.code(cli, language="bash")
+
+def show_decision(d, default_label: str) -> None:
+    value = json.dumps(d.value, ensure_ascii=False) if isinstance(d.value, dict) else d.value
+    status = "émis" if d.emitted else "non émis"
+    with st.expander(f"{d.title} : {value if value is not None else '—'}  ·  {status}  ·  {CONFIDENCE_LABEL[d.confidence]}"):
+        st.markdown(f"**Règle** `{d.rule_id}` · **paramètre** `{d.key}`"
+                    + (f" · **{default_label}** `{d.default}`" if d.default is not None else ""))
+        st.write(d.justification)
+        if d.formula:
+            st.markdown(f"**Formule** : {d.formula}")
+        if d.computation:
+            st.markdown(f"**Calcul** : `{d.computation}`")
+        if not d.emitted and d.omitted_reason:
+            st.markdown(f"**Non émis** : {d.omitted_reason}")
+        if d.sources:
+            st.caption("Sources : " + " · ".join(d.sources))
+
+
+def show_warnings(warnings) -> None:
+    for severity in ("critical", "warning", "info"):
+        group = [w for w in warnings if w.severity == severity]
+        if not group:
+            continue
+        st.subheader(f"{SEVERITY_LABEL[severity]} ({len(group)})")
+        for w in group:
+            prefix = "🔶 " if w.category == "to_verify" else ""
+            box = {"critical": st.error, "warning": st.warning, "info": st.info}[severity]
+            box(prefix + w.message + (f"\n\n*Source : {w.source}*" if w.source else ""))
+
+
+def indicator_rows(indicators) -> list[dict]:
+    return [{"Indicateur": i.label, "Valeur": i.value, "Unité": i.unit or "", "Formule": i.formula or "",
+             "Calcul": i.computation or "", "Lecture": i.interpretation or "", "Statut": CONFIDENCE_LABEL[i.confidence]}
+            for i in indicators]
+
+
+with tabs[1]:
+    if routing_error:
+        st.error(routing_error)
+    elif routing.blocking_errors:
+        for error in routing.blocking_errors:
+            st.error(error)
+    else:
+        llmd_cat = catalog.llmd_versions[routing.llmd_version]
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Instances routées", result.facts.num_instances)
+        lru_d = next((d for d in routing.decisions if d.key == "lruCapacityPerServer"), None)
+        c2.metric("lruCapacityPerServer", f"{lru_d.value:,}".replace(",", " ") if lru_d else "— (precise)")
+        c3.metric("Poids du profil", " / ".join(f"{k.removesuffix('-scorer')} {v}" for k, v in routing.weights.items()))
+        for warning in [x for x in routing.warnings if x.severity == "critical"]:
+            st.error(warning.message)
+        st.subheader("EndpointPickerConfig")
+        st.caption(f"À poser dans : {llmd_cat.placement.value} ({CONFIDENCE_LABEL[llmd_cat.placement.status]},"
+                   f" {llmd_cat.placement.source}).")
+        st.code(epp_yaml, language="yaml")
+        st.download_button("Télécharger epp-config.yaml", epp_yaml, file_name="epp-config.yaml")
+        with st.expander("📖 Comprendre les paramètres llm-d", expanded=False):
+            st.markdown(
+                "L'EPP (*endpoint picker*) choisit le pod vLLM de chaque requête. Chaque **scorer** note chaque pod selon"
+                " un critère ; l'EPP fait la somme de ces notes pondérées par les **poids** du profil, et le picker"
+                " `max-score-picker` retient le pod le mieux noté. Un poids plus fort donne plus d'influence à son critère"
+                " face aux autres.\n\n"
+                "Le scorer de préfixe s'appuie sur un **index** : pour chaque pod, l'EPP retient les hashes des débuts de"
+                " prompts qu'il lui a envoyés, ce qui lui permet de renvoyer une session vers le pod qui a déjà son"
+                " préfixe en cache (affinité). Les paramètres ci-dessous règlent cet index.")
+            prefix_plugin = routing.plugins[0]["type"]  # le plugin de préfixe est toujours posé en premier
+            decided = {d.key: d.value for d in routing.decisions}
+            st.markdown(f"**Paramètres de l'index** (`{prefix_plugin}`) — modifiables dans « Paramètres llm-d forcés »")
+            st.dataframe([{
+                "Paramètre": name, "C'est quoi": param.description,
+                "Défaut EPP": "—" if param.value is None else str(param.value),
+                "Proposé": str(decided.get(name, "—")),
+            } for name, param in llmd_cat.plugins[prefix_plugin].parameters.items()], width="stretch", hide_index=True)
+            st.markdown("**Scorers du profil** — poids modifiables dans « Forcer les poids du profil »")
+            st.dataframe([{
+                "Scorer": scorer, "C'est quoi": llmd_cat.plugins[scorer].note or "",
+                "Défaut RHOAI": str(llmd_cat.default_profile.weights.get(scorer, "—")), "Poids proposé": weight,
+            } for scorer, weight in routing.weights.items()], width="stretch", hide_index=True)
+        vllm_extra = render_vllm_args(routing)
+        if vllm_extra:
+            st.subheader("À ajouter aux args vLLM (mode precise)")
+            st.code(vllm_extra, language="yaml")
+        st.subheader("Justifications")
+        for d in routing.decisions:
+            show_decision(d, "défaut EPP")
+        st.subheader("Indicateurs")
+        st.dataframe(indicator_rows(routing.indicators), width="stretch", hide_index=True)
+        for a in routing.assumptions:
+            st.warning(f"**Hypothèse — {a.label}** = `{a.value}` ({CONFIDENCE_LABEL[a.status]})\n\n{a.reason}")
+        st.subheader("Vérifier après déploiement")
+        st.caption("Lignes attendues dans les logs de l'EPP :")
+        st.code("\n".join(routing.expected_logs), language="text")
+        st.caption("Puis comparer vllm:prefix_cache_hits / vllm:prefix_cache_queries entre pods (cible : le hit rate attendu"
+                   " sur chacun) et l'équilibre de vllm:num_requests_running. Saisissez-les dans « Mesures llm-d ».")
+        show_warnings(routing.warnings)
+
 
 def fmt_ms(value: float) -> str:
     if value == float("inf"):
@@ -350,7 +544,7 @@ def fmt_range(pair, unit_ms: bool = True) -> str:
     return f"{low:,.0f} – {high:,.0f}".replace(",", " ")
 
 
-with tabs[1]:
+with tabs[2]:
     if analysis is None:
         st.info("Analyse indisponible.")
     else:
@@ -373,7 +567,7 @@ with tabs[1]:
             "Attendu vs SLO": VERDICT_LABEL[s.expectation],
             "Si validé : instances (GPU)": "—" if s.instances_needed is None else f"{s.instances_needed} ({s.gpus_needed})",
             "Pourquoi": s.expectation_reason,
-        } for s in plan.steps], use_container_width=True, hide_index=True)
+        } for s in plan.steps], width="stretch", hide_index=True)
         st.caption(f"★ : palier de la config générée. Plages = estimation ×{analysis.uncertainty[0]:g} à"
                    f" ×{analysis.uncertainty[1]:g} ({'recalée sur la mesure' if analysis.calibration else 'non calibrée'})."
                    f" Le verdict de chaque palier porte sur la cible {gen_label}."
@@ -397,7 +591,7 @@ with tabs[1]:
                            else f"{c.estimate:g} {c.unit or ''}".strip()),
             "Mesure": "—" if c.measured is None else f"{c.measured:g} {c.unit or ''}".strip(),
             "Verdict": "oui" if c.in_verdict else "non (cas pire)", "Détail": c.detail,
-        } for c in analysis.checks], use_container_width=True, hide_index=True)
+        } for c in analysis.checks], width="stretch", hide_index=True)
 
         with st.expander(f"Estimation indicative au point de la config générée : {VERDICT_LABEL[analysis.verdict]}"):
             st.write(analysis.summary)
@@ -416,61 +610,37 @@ with tabs[1]:
                             for key, value in r.changes.items()), language="yaml")
             if analysis.step_breakdown:
                 st.dataframe([{"Grandeur": k, "Valeur": str(v)} for k, v in analysis.step_breakdown.items()],
-                             use_container_width=True, hide_index=True)
+                             width="stretch", hide_index=True)
         st.caption(f"{CONFIDENCE_LABEL[analysis.confidence]} : ordres de grandeur, la mesure des paliers tranche.")
         for note in analysis.notes:
             st.caption(note)
 
-with tabs[2]:
-    for d in result.decisions:
-        value = json.dumps(d.value, ensure_ascii=False) if isinstance(d.value, dict) else d.value
-        status = "émis" if d.emitted else "non émis"
-        with st.expander(f"{d.title} : {value if value is not None else '—'}  ·  {status}  ·  {CONFIDENCE_LABEL[d.confidence]}"):
-            st.markdown(f"**Règle** `{d.rule_id}` · **paramètre** `{d.key}`"
-                        + (f" · **défaut vLLM** `{d.default}`" if d.default is not None else ""))
-            st.write(d.justification)
-            if d.formula:
-                st.markdown(f"**Formule** : {d.formula}")
-            if d.computation:
-                st.markdown(f"**Calcul** : `{d.computation}`")
-            if not d.emitted and d.omitted_reason:
-                st.markdown(f"**Non émis** : {d.omitted_reason}")
-            if d.sources:
-                st.caption("Sources : " + " · ".join(d.sources))
-
 with tabs[3]:
-    if not result.warnings:
-        st.success("Aucun avertissement.")
-    for severity in ("critical", "warning", "info"):
-        group = [w for w in result.warnings if w.severity == severity]
-        if not group:
-            continue
-        st.subheader(f"{SEVERITY_LABEL[severity]} ({len(group)})")
-        for w in group:
-            prefix = "🔶 " if w.category == "to_verify" else ""
-            box = {"critical": st.error, "warning": st.warning, "info": st.info}[severity]
-            box(prefix + w.message + (f"\n\n*Source : {w.source}*" if w.source else ""))
+    for d in result.decisions:
+        show_decision(d, "défaut vLLM")
 
 with tabs[4]:
-    rows = [{"Indicateur": i.label, "Valeur": i.value, "Unité": i.unit or "", "Formule": i.formula or "",
-             "Calcul": i.computation or "", "Lecture": i.interpretation or "", "Statut": CONFIDENCE_LABEL[i.confidence]}
-            for i in result.indicators]
-    st.dataframe(rows, use_container_width=True, hide_index=True)
+    if not result.warnings:
+        st.success("Aucun avertissement.")
+    show_warnings(result.warnings)
 
 with tabs[5]:
+    st.dataframe(indicator_rows(result.indicators), width="stretch", hide_index=True)
+
+with tabs[6]:
     if not result.assumptions:
         st.success("Aucune hypothèse : toutes les entrées utiles sont fournies.")
     for a in result.assumptions:
         st.warning(f"**{a.label}** = `{a.value}` ({CONFIDENCE_LABEL[a.status]})\n\n{a.reason}")
 
-with tabs[6]:
+with tabs[7]:
     st.subheader("Vérifier les flags sur l'image déployée")
     st.caption("Le frontend Rust de vLLM ≥ 0.33 échoue sur un flag inconnu : vérifier chaque flag sur l'image réelle.")
     st.code(render.render_verify_command(result, catalog), language="bash")
     st.subheader("Métriques à surveiller")
     st.dataframe([{"Métrique": m.name, "Usage": m.usage} for m in catalog.workload.metrics],
-                 use_container_width=True, hide_index=True)
+                 width="stretch", hide_index=True)
     for test in catalog.workload.validation_tests:
         st.info(test)
-    with st.expander("Faits transmis aux étapes suivantes (v2 : EPP llm-d)"):
+    with st.expander("Faits transmis à la cible llm-d (EPP)"):
         st.json(result.facts.model_dump())

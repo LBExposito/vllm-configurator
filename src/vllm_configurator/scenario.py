@@ -20,7 +20,7 @@ from typing import Any
 import yaml
 from pydantic import ValidationError
 
-from .domain import DeploymentRequest, GenerationResult
+from .domain import DeploymentRequest, GenerationResult, RoutingRequest
 
 KIND = "vllm-configurator/scenario"
 VERSION = 1
@@ -31,7 +31,7 @@ class ScenarioError(ValueError):
 
 
 def dump_scenario(request: DeploymentRequest, name: str | None = None, result: GenerationResult | None = None,
-                  args_yaml: str | None = None) -> str:
+                  args_yaml: str | None = None, epp_yaml: str | None = None) -> str:
     doc: dict[str, Any] = {"kind": KIND, "version": VERSION}
     if name:
         doc["name"] = name
@@ -43,6 +43,8 @@ def dump_scenario(request: DeploymentRequest, name: str | None = None, result: G
             generated["env"] = dict(result.env)
         if args_yaml:
             generated["args"] = yaml.safe_load(args_yaml)["args"]
+        if epp_yaml:
+            generated["llmd_epp"] = yaml.safe_load(epp_yaml)
         if result.analysis is not None:
             generated["slo_verdict"] = result.analysis.verdict
             generated["slo_summary"] = result.analysis.summary
@@ -98,7 +100,29 @@ def request_to_form(request: DeploymentRequest) -> dict[str, Any]:
         "gpu_util": request.gpu_memory_utilization, "reserve": request.kv_estimate_reserve_gib_per_gpu,
         "max_model_len": request.max_model_len,
         "extra_args_text": _yaml_text(request.extra_args), "extra_env_text": _yaml_text(request.extra_env),
+        **routing_to_form(request.routing),
     }
+
+
+ROUTING_WEIGHT_KEYS = {"queue-scorer": "llmd_w_queue", "kv-cache-utilization-scorer": "llmd_w_kv",
+                       "prefix-cache-scorer": "llmd_w_prefix", "no-hit-lru-scorer": "llmd_w_nohit"}
+
+
+def routing_to_form(routing: RoutingRequest | None) -> dict[str, Any]:
+    """Session-state values of the « Routage llm-d » form section."""
+    routing = routing or RoutingRequest()
+    obs = routing.observed
+    form: dict[str, Any] = {
+        "llmd_version": routing.llmd_version, "llmd_mode": routing.prefix_mode,
+        "llmd_shared_prefix": routing.shared_prefix_tokens, "llmd_kv_endpoint": routing.kv_events_endpoint or "",
+        "llmd_obs_block": obs.block_size_tokens if obs else None,
+        "llmd_obs_lru": obs.lru_capacity_per_server if obs else None,
+        "llmd_obs_window": obs.max_prefix_tokens_to_match if obs else None,
+        "llmd_obs_hit": obs.prefix_cache_hit_rate if obs else None,
+        "llmd_params_text": _yaml_text(routing.parameters),
+    }
+    form.update({key: routing.weights.get(scorer) for scorer, key in ROUTING_WEIGHT_KEYS.items()})
+    return form
 
 
 def _yaml_text(mapping: dict[str, Any]) -> str:

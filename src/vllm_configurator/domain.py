@@ -74,6 +74,38 @@ class ObservedPerf(_Frozen):
     ttft_p95_ms: float | None = Field(default=None, gt=0)
 
 
+class ObservedEpp(_Frozen):
+    """Values read in the EPP log (« Prefix DataProducer initialized config={...} ») and per-pod vLLM metrics."""
+
+    block_size_tokens: int | None = Field(default=None, gt=0)
+    lru_capacity_per_server: int | None = Field(default=None, gt=0)
+    max_prefix_tokens_to_match: int | None = Field(default=None, gt=0)
+    # vllm:prefix_cache_hits / vllm:prefix_cache_queries, pire pod.
+    prefix_cache_hit_rate: float | None = Field(default=None, ge=0, le=1)
+
+
+RoutingScorer = Literal["queue-scorer", "kv-cache-utilization-scorer", "prefix-cache-scorer", "no-hit-lru-scorer"]
+
+
+class RoutingRequest(_Frozen):
+    """Inputs of the llm-d EPP target (smart routing between the vLLM instances described above)."""
+
+    # None : la dernière version du catalogue llm-d.
+    llmd_version: str | None = None
+    # approximate : l'EPP estime le cache de chaque pod à partir de ce qu'il a routé ; precise : KV events ZMQ.
+    prefix_mode: Literal["approximate", "precise"] = "approximate"
+    # Préfixe commun à toutes les sessions (system prompt + outils), en tokens : il est en cache partout.
+    shared_prefix_tokens: int | None = Field(default=None, ge=0)
+    # Poids forcés du profil de scheduling (remplacent le poids calculé).
+    weights: dict[RoutingScorer, int] = {}
+    # Paramètres forcés du plugin de préfixe (approx-prefix-cache-producer, ou precise-prefix-cache-scorer en mode
+    # precise) : « lruCapacityPerServer: 700000 ». Ils remplacent la valeur calculée ; un nom inconnu est ignoré.
+    parameters: dict[str, Any] = {}
+    # Mode precise : endpoint ZMQ auquel les pods vLLM publient leurs KV events.
+    kv_events_endpoint: str | None = None
+    observed: ObservedEpp | None = None
+
+
 class DeploymentRequest(_Frozen):
     gpu_id: str
     gpus_per_instance: int = Field(gt=0)
@@ -97,6 +129,8 @@ class DeploymentRequest(_Frozen):
     extra_env: dict[str, str] = {}
     # Réserve par GPU (activations, CUDA graphs, drafter) pour l'estimation du KV sans logs.
     kv_estimate_reserve_gib_per_gpu: float | None = Field(default=None, ge=0)
+    # Routage llm-d (EPP) entre les instances : None = réglages par défaut de la cible llmd_epp.
+    routing: RoutingRequest | None = None
 
 
 # --- Outputs ---------------------------------------------------------------
@@ -104,7 +138,7 @@ class DeploymentRequest(_Frozen):
 Severity = Literal["info", "warning", "critical"]
 Category = Literal[
     "to_verify", "lossy", "osl_suspect", "isl_tail", "kv_limited", "unsupported", "breaking_change",
-    "assumption", "itl", "memory", "version", "model_note", "context", "extra_args",
+    "assumption", "itl", "memory", "version", "model_note", "context", "extra_args", "routing",
 ]
 
 
@@ -275,6 +309,34 @@ class GenerationResult(_Frozen):
     @property
     def emitted(self) -> list[Decision]:
         return [d for d in self.decisions if d.emitted]
+
+
+class RoutingResult(_Frozen):
+    """llm-d EPP configuration derived from the vLLM GenerationResult (DeploymentFacts)."""
+
+    llmd_version: str
+    prefix_mode: Literal["approximate", "precise"]
+    decisions: list[Decision]
+    warnings: list[Warning]
+    indicators: list[Indicator]
+    assumptions: list[Assumption]
+    # Plugins (type, parameters) et poids du profil, prêts à rendre en EndpointPickerConfig.
+    plugins: list[dict[str, Any]] = []
+    weights: dict[str, int] = {}
+    picker: str | None = None
+    # Commentaire court par paramètre, repris dans le YAML rendu.
+    comments: dict[str, str] = {}
+    # Flags à ajouter aux pods vLLM (mode precise : --kv-events-config).
+    vllm_args: dict[str, Any] = {}
+    # Lignes attendues dans les logs de l'EPP après déploiement.
+    expected_logs: list[str] = []
+    blocking_errors: list[str] = []
+
+    def decision(self, key: str) -> Decision:
+        for d in self.decisions:
+            if d.key == key:
+                return d
+        raise KeyError(key)
 
 
 class GenerationError(Exception):
