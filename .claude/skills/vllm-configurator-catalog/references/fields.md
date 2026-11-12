@@ -18,6 +18,7 @@ Le schéma `src/vllm_configurator/catalog/schema.py` fait foi ; ce guide expliqu
 | `block_size.forced_by_backend` | Logs de démarrage ou recette (NVIDIA) | `null` par défaut. |
 | `speculative.*` | `config.json` (champs `mtp*`, `dspark_*`, `num_nextn_predict_layers`), README, recette | `fixed_k: true` si le checkpoint impose la profondeur du draft. |
 | `serving.*` | Recette vLLM | `requires_custom_image` si aucune release ne prend le modèle en charge. |
+| `context_extension.*` | Model card ou recette (section contexte long / YaRN) | Facultatif. Recopier le bloc RoPE recommandé en entier, **sans** `factor` (calculé par l'app d'après la longueur visée), avec `override_path` (chemin dans `config.json`, ex. `[text_config, rope_parameters]`). `native_max_model_len` = `max_position_embeddings` ; `max_model_len` = longueur maximale annoncée. Jamais déduit par analogie avec un autre modèle. |
 | `performance.*` | Model card ou recette (paramètres activés), `config.json` (`moe_intermediate_size`, `first_k_dense_replace`) | Facultatif ; sans lui, l'analyse SLO ne fait que les contrôles de capacité. `moe_layers` = couches − couches denses. Octets par paramètre selon la quantization des experts (MXFP4 ≈ 0,53 avec les échelles) et du reste. Les tables de lookup (engram, n-gram) ne comptent pas dans les paramètres activés. `method` explique le calcul. |
 
 ### Formules KV standard (uniquement sans champ exotique)

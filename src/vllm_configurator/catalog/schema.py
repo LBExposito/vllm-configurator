@@ -145,6 +145,17 @@ class ModelPerformance(Provenance):
     compute_dtype: ComputeDtype
 
 
+class ContextExtension(Provenance):
+    """RoPE scaling that lets the model serve contexts beyond its native length (--hf-overrides)."""
+
+    method: Literal["yarn"]
+    native_max_model_len: int = Field(gt=0)
+    max_model_len: int = Field(gt=0)
+    override_path: list[str] = Field(min_length=1)
+    # Bloc complet, sans `factor` : le moteur calcule le facteur d'après la longueur visée.
+    rope_parameters: dict[str, Any]
+
+
 class Serving(Provenance):
     min_vllm_version: str | None = None
     requires_custom_image: str | None = None
@@ -163,6 +174,7 @@ class Model(_Strict):
     speculative: Speculative
     serving: Serving
     performance: ModelPerformance | None = None
+    context_extension: ContextExtension | None = None
     notes: list[str] = []
 
     @model_validator(mode="after")

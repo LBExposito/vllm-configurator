@@ -55,6 +55,26 @@ def eval_slot_expression(expr: str, k: int) -> int:
     raise ValueError(f"expression de slots inconnue : {expr!r}")
 
 
+def mean_from_percentiles(p50: float, p95: float | None = None, p99: float | None = None) -> float:
+    """Mean of a length distribution from its percentiles (lognormal fit, with a heavy-tail correction).
+
+    The lognormal is fitted on P50/P95 (or P50/P99). When the observed P99 exceeds the fitted one, at least 1 % of
+    the requests are that much longer: the mean gets 0.01 × (P99 − P99_fitted) on top. Without P95 nor P99: P50.
+    """
+    if p95 and p95 > p50:
+        sigma = math.log(p95 / p50) / 1.645
+    elif p99 and p99 > p50:
+        sigma = math.log(p99 / p50) / 2.326
+    else:
+        return float(p50)
+    mean = p50 * math.exp(sigma**2 / 2)
+    if p95 and p99:
+        fitted_p99 = p50 * math.exp(2.326 * sigma)
+        if p99 > fitted_p99:
+            mean += 0.01 * (p99 - fitted_p99)
+    return mean
+
+
 def kv_concurrency(kv_tokens: float, context_tokens: float) -> float:
     """§3.2: number of contexts of a given length that fit in the KV cache."""
     if context_tokens <= 0:

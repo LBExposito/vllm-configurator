@@ -14,10 +14,16 @@ SECTIONS = [
     ("Scheduler", ["max_num_seqs", "max_num_batched_tokens", "long_prefill_token_threshold",
                    "long_prefill_token_threshold_adaptive", "enable_chunked_prefill"]),
     ("KV cache / prefix caching", ["enable_prefix_caching", "kv_cache_dtype", "gpu_memory_utilization",
-                                   "block_size", "kv_offloading_size", "max_model_len"]),
+                                   "block_size", "kv_offloading_size", "max_model_len", "hf_overrides"]),
     ("Speculative decoding", ["speculative_config"]),
     ("CUDA graphs", ["compilation_config"]),
 ]
+EXTRA_SECTION = "Arguments supplémentaires"
+
+
+def _sections(result: GenerationResult) -> list[tuple[str, list[str]]]:
+    extra = [d.key for d in result.decisions if d.key.startswith("extra:")]
+    return SECTIONS + ([(EXTRA_SECTION, extra)] if extra else [])
 
 
 def _flag_args(spec: FlagSpec, value: Any) -> list[str]:
@@ -37,12 +43,12 @@ def args_pairs(result: GenerationResult, catalog: Catalog | None = None) -> list
     cli_flags = set(catalog.extracted[result.request.vllm_version].cli_flags)
     by_key = {d.key: d for d in result.emitted}
     pairs = []
-    for _, keys in SECTIONS:
+    for _, keys in _sections(result):
         for key in keys:
             decision = by_key.get(key)
             if decision is None:
                 continue
-            spec = flags[key]
+            spec = FlagSpec(cli=decision.cli, kind=decision.cli_kind) if decision.cli else flags[key]
             if spec.cli not in cli_flags:
                 raise ValueError(f"{spec.cli} absent de vLLM {result.request.vllm_version} : refus d'émettre un flag inconnu")
             pairs.append((decision, _flag_args(spec, decision.value)))
@@ -66,13 +72,14 @@ def render_k8s_args(result: GenerationResult, catalog: Catalog | None = None) ->
     pairs = {d.key: fragment for d, fragment in args_pairs(result, catalog)}
     omitted = {d.key: d for d in result.decisions if not d.emitted}
     lines = ["args:"]
-    for title, keys in SECTIONS:
+    for title, keys in _sections(result):
         body = []
         for key in keys:
             if key in pairs:
                 body += [f"  - {_yaml_scalar(token)}" for token in pairs[key]]
             elif key in omitted and omitted[key].omitted_reason:
-                body.append(f"  # pas de {key.replace('_', '-')} : {omitted[key].omitted_reason}")
+                flag = omitted[key].cli or "--" + key.replace("_", "-")
+                body.append(f"  # pas de {flag.removeprefix('--')} : {omitted[key].omitted_reason}")
         if body:
             lines.append(f"  # --- {title} ---")
             lines += body
@@ -80,10 +87,21 @@ def render_k8s_args(result: GenerationResult, catalog: Catalog | None = None) ->
     return "\n".join(lines).rstrip() + "\n"
 
 
+def render_k8s_env(result: GenerationResult) -> str:
+    """`env:` block of the vLLM container (empty string when no variable is needed)."""
+    if not result.env:
+        return ""
+    lines = ["env:"]
+    for name, value in result.env.items():
+        lines += [f"  - name: {name}", f"    value: {json.dumps(str(value))}"]
+    return "\n".join(lines) + "\n"
+
+
 def render_cli(result: GenerationResult, catalog: Catalog | None = None) -> str:
     catalog = catalog or default_catalog()
     model = catalog.models[result.request.model_id]
-    lines = [f"vllm serve {model.hf_repo}"]
+    env = "".join(f"{name}={value} " for name, value in result.env.items())
+    lines = [f"{env}vllm serve {model.hf_repo}"]
     for _, fragment in args_pairs(result, catalog):
         rendered = [f"'{t}'" if t.startswith("{") else t for t in fragment]
         lines.append("  " + " ".join(rendered))

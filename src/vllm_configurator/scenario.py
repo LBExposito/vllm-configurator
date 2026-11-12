@@ -39,11 +39,15 @@ def dump_scenario(request: DeploymentRequest, name: str | None = None, result: G
     doc["request"] = request.model_dump(mode="json", exclude_none=True)
     if result is not None:
         generated: dict[str, Any] = {"note": "Instantané informatif, ignoré à l'import : la config est recalculée."}
+        if result.env:
+            generated["env"] = dict(result.env)
         if args_yaml:
             generated["args"] = yaml.safe_load(args_yaml)["args"]
         if result.analysis is not None:
             generated["slo_verdict"] = result.analysis.verdict
             generated["slo_summary"] = result.analysis.summary
+            if result.analysis.test_plan is not None:
+                generated["test_plan"] = result.analysis.test_plan.summary
         doc["generated"] = generated
     return yaml.safe_dump(doc, allow_unicode=True, sort_keys=False, width=120)
 
@@ -85,11 +89,19 @@ def request_to_form(request: DeploymentRequest) -> dict[str, Any]:
         "osl_p50": wl.osl.p50, "osl_p95": wl.osl.p95, "osl_p99": wl.osl.p99,
         "hit_rate": wl.prefix_cache_hit_rate, "target_concurrency": wl.target_concurrency,
         "paused_sessions": wl.paused_sessions,
-        "ttft": request.slo.ttft_p95_ms, "itl": request.slo.itl_p95_ms,
+        "ttft": request.slo.ttft_p95_ms, "itl": request.slo.itl_p95_ms, "itl_metric": request.slo.itl_metric,
         "itl_measured": perf.itl_p95_ms if perf else None, "ttft_measured": perf.ttft_p95_ms if perf else None,
         "allow_lossy": request.allow_lossy, "spec_enabled": spec.enabled, "k": spec.num_speculative_tokens,
         "draft_sample_method": spec.draft_sample_method or "défaut vLLM", "acceptance_length": spec.acceptance_length,
         "kv_tokens": kv.kv_cache_tokens if kv else None, "kv_util": kv.gpu_memory_utilization if kv else None,
         "kv_block": kv.block_size if kv else None,
         "gpu_util": request.gpu_memory_utilization, "reserve": request.kv_estimate_reserve_gib_per_gpu,
+        "max_model_len": request.max_model_len,
+        "extra_args_text": _yaml_text(request.extra_args), "extra_env_text": _yaml_text(request.extra_env),
     }
+
+
+def _yaml_text(mapping: dict[str, Any]) -> str:
+    if not mapping:
+        return ""
+    return yaml.safe_dump(mapping, allow_unicode=True, sort_keys=False, default_flow_style=None, width=1000)

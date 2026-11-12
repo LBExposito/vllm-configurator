@@ -258,25 +258,133 @@ def decide_kv_offload(ctx: RuleContext, state: dict[str, Any]) -> RuleOutput:
     return out
 
 
+def _yarn_factor(target: int, native: int) -> float:
+    """Smallest multiple of 0.5 covering target / native (model card: 2.0 for 524 288, 4.0 for 1 000 000 on 262 144)."""
+    return max(1.0, math.ceil(target / native * 2) / 2)
+
+
+def _nest(path: list[str], value: Any) -> dict[str, Any]:
+    for key in reversed(path):
+        value = {key: value}
+    return value
+
+
 def decide_max_model_len(ctx: RuleContext, state: dict[str, Any]) -> RuleOutput:
     out = RuleOutput()
-    wl = ctx.request.workload
-    max_pos = ctx.model.architecture.max_position_embeddings
+    req, wl = ctx.request, ctx.request.workload
+    native = ctx.model.architecture.max_position_embeddings
+    ext = ctx.model.context_extension
+    target = req.max_model_len
     longest = (wl.isl.p99 or wl.isl.p95 or wl.isl.p50) + (wl.osl.p99 or wl.osl.p95 or wl.osl.p50)
-    if longest > max_pos:
+    arch_source = (ctx.model.architecture.source if isinstance(ctx.model.architecture.source, str)
+                   else ctx.model.architecture.source[0])
+    env: dict[str, str] = {}
+    user_override = "--hf-overrides" in {k if k.startswith("--") else "--" + k for k in req.extra_args}
+    allow_env = ctx.behavior("max_model_len.allow_long_env")
+
+    if target is None:
+        served = native
+        hint = ""
+        if ext is not None and longest > native:
+            hint = (f" Extension {ext.method.upper()} disponible jusqu'à {fmt_int(ext.max_model_len)} : renseigner la"
+                    " longueur de contexte cible.")
+        out.decisions.append(Decision(
+            key="max_model_len", value=native, rule_id="R-KV-07", title="Longueur de contexte maximale",
+            justification=(
+                f"Non émis : le défaut est le contexte natif du modèle ({fmt_int(native)}),"
+                f" {'compatible' if longest <= native else 'INCOMPATIBLE'} avec ISL + OSL au P99 ({fmt_int(longest)})."
+                + hint
+            ),
+            sources=[arch_source], emitted=False, omitted_reason=f"défaut = contexte maximal du modèle ({fmt_int(native)})",
+        ))
+    elif target <= native:
+        served = target
+        out.decisions.append(Decision(
+            key="max_model_len", value=target, rule_id="R-KV-07", title="Longueur de contexte maximale",
+            justification=(f"Longueur demandée {fmt_int(target)}, sous le contexte natif ({fmt_int(native)}) :"
+                           " les requêtes plus longues seront refusées par vLLM."),
+            sources=[arch_source], default=native,
+        ))
+    elif ext is not None and target <= ext.max_model_len and not user_override:
+        served = target
+        factor = _yarn_factor(target, ext.native_max_model_len)
+        rope = {**ext.rope_parameters, "factor": factor}
+        overrides = _nest(ext.override_path, rope)
+        ext_source = ext.source if isinstance(ext.source, str) else ext.source[0]
+        needs_env = not ctx.behavior("max_model_len.yarn_factor_extends_derived").value
+        if needs_env:
+            env[allow_env.value] = "1"
+        out.decisions.append(Decision(
+            key="max_model_len", value=target, rule_id="R-CTX-01", title="Longueur de contexte maximale",
+            justification=(
+                f"{fmt_int(target)} tokens, au-delà du contexte natif ({fmt_int(native)}) : extension {ext.method.upper()}"
+                " via --hf-overrides."
+                + (f" En vLLM {ctx.vllm.version}, le facteur YaRN n'agrandit pas le maximum dérivé de config.json :"
+                   f" {allow_env.value}=1 est nécessaire, sinon vLLM refuse de démarrer." if needs_env else "")
+            ),
+            sources=[ext_source, ctx.behavior("max_model_len.yarn_factor_extends_derived").source],
+            default=native, confidence=ext.status,
+        ))
+        out.decisions.append(Decision(
+            key="hf_overrides", value=overrides, rule_id="R-CTX-02", title=f"Extension de contexte {ext.method.upper()}",
+            justification=(
+                f"factor = {factor:g} : plus petit multiple de 0,5 couvrant {fmt_int(target)} / {fmt_int(ext.native_max_model_len)}"
+                " (la model card donne 2,0 pour 524 288 et 4,0 pour 1 000 000). Le bloc "
+                + ".".join(ext.override_path) + " est passé en entier : vLLM le remplace en bloc."
+            ),
+            formula="factor = ⌈2 × max_model_len / contexte_natif⌉ / 2",
+            computation=f"⌈2 × {fmt_int(target)} / {fmt_int(ext.native_max_model_len)}⌉ / 2 = {factor:g}",
+            sources=[ext_source, ctx.behavior("hf_overrides.nested_merge").source], confidence=ext.status,
+        ))
+        out.warnings.append(Warning(
+            severity="warning", category="context", rule_id="R-CTX-02",
+            message=(f"Extension {ext.method.upper()} active (factor {factor:g}). "
+                     + (ext.note or "Le facteur s'applique à toutes les requêtes et peut dégrader les textes courts.")
+                     + " Mesurer la qualité sur le trafic typique avant de la généraliser."),
+            source=ext.source if isinstance(ext.source, str) else " ; ".join(ext.source),
+        ))
+    elif user_override:
+        served = target
+        env[allow_env.value] = "1"
+        out.decisions.append(Decision(
+            key="max_model_len", value=target, rule_id="R-CTX-01", title="Longueur de contexte maximale",
+            justification=(f"{fmt_int(target)} tokens, au-delà du contexte natif ({fmt_int(native)}), avec le --hf-overrides"
+                           f" fourni en argument supplémentaire. {allow_env.value}=1 est posé : vLLM refuse sinon un"
+                           " --max-model-len supérieur au maximum dérivé de config.json."),
+            sources=[allow_env.source], default=native, confidence="unverified",
+        ))
+        out.warnings.append(Warning(
+            severity="warning", category="context", rule_id="R-CTX-01",
+            message=("À vérifier : extension de contexte par --hf-overrides fourni à la main. Si l'override ne met pas en"
+                     " place un RoPE scaling adapté, les positions au-delà du contexte natif produisent des NaN (avertissement"
+                     f" de vLLM sur {allow_env.value})."),
+        ))
+    else:
+        served = native
+        limit = ext.max_model_len if ext else native
+        out.warnings.append(Warning(
+            severity="critical", category="context", rule_id="R-CTX-01",
+            message=(
+                f"max-model-len demandé ({fmt_int(target)}) supérieur à "
+                + (f"l'extension maximale du modèle ({fmt_int(limit)})." if ext else
+                   f"son contexte natif ({fmt_int(native)}), sans extension connue au catalogue.")
+                + " Non émis. Pour forcer, fournir un --hf-overrides de RoPE scaling dans les arguments supplémentaires."
+            ),
+        ))
+        out.decisions.append(Decision(
+            key="max_model_len", value=native, rule_id="R-CTX-01", title="Longueur de contexte maximale",
+            justification="Longueur demandée hors de portée du modèle : contexte natif conservé.",
+            sources=[arch_source], emitted=False, omitted_reason="longueur demandée hors de portée, voir les avertissements",
+        ))
+
+    if longest > served:
         out.warnings.append(Warning(
             severity="critical", category="unsupported", rule_id="R-KV-07",
-            message=f"ISL + OSL au P99 ({fmt_int(longest)}) dépasse le contexte maximal du modèle ({fmt_int(max_pos)}).",
+            message=(f"ISL + OSL au P99 ({fmt_int(longest)}) dépasse le contexte servi ({fmt_int(served)})."
+                     + (f" Extension possible jusqu'à {fmt_int(ext.max_model_len)} (champ « max-model-len cible »)."
+                        if ext and longest <= ext.max_model_len and served < longest else "")),
         ))
-    out.decisions.append(Decision(
-        key="max_model_len", value=max_pos, rule_id="R-KV-07", title="Longueur de contexte maximale",
-        justification=(
-            f"Non émis : le défaut est le contexte maximal du modèle ({fmt_int(max_pos)}),"
-            f" {'compatible' if longest <= max_pos else 'INCOMPATIBLE'} avec ISL + OSL au P99 ({fmt_int(longest)})."
-        ),
-        sources=[ctx.model.architecture.source if isinstance(ctx.model.architecture.source, str) else ctx.model.architecture.source[0]],
-        emitted=False, omitted_reason=f"défaut = contexte maximal du modèle ({fmt_int(max_pos)})",
-    ))
+    out.state.update({"max_model_len": served, "env": env})
     kv_tokens = state.get("kv_tokens")
     if kv_tokens:
         for label, ctx_len in (("P50", wl.isl.p50), ("P95", wl.isl.p95), ("P99", wl.isl.p99)):

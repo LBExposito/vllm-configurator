@@ -31,16 +31,33 @@ DEFAULTS = {
     "gpu_id": sorted(catalog.gpus)[0], "gpus_per_instance": 4, "num_instances": 1,
     "model_id": sorted(catalog.models)[0], "vllm_version": catalog.sorted_versions()[-1],
     "usage_type": "agentic", "mode": "interactive", "spec_enabled": True, "draft_sample_method": "défaut vLLM",
-    "allow_lossy": False,
+    "allow_lossy": False, "itl_metric": "itl",
 }
 OPTIONAL = ["isl_p50", "isl_p95", "isl_p99", "osl_p50", "osl_p95", "osl_p99", "hit_rate", "target_concurrency",
             "paused_sessions", "ttft", "itl", "itl_measured", "ttft_measured", "k", "acceptance_length", "kv_tokens", "kv_util", "kv_block", "gpu_util",
-            "reserve"]
+            "reserve", "max_model_len"]
 for _key, _value in DEFAULTS.items():
     st.session_state.setdefault(_key, _value)
 for _key in OPTIONAL:
     st.session_state.setdefault(_key, None)
 st.session_state.setdefault("scenario_name", "")
+st.session_state.setdefault("extra_args_text", "")
+st.session_state.setdefault("extra_env_text", "")
+
+
+def parse_mapping(text: str, label: str) -> dict:
+    """YAML mapping typed in a text area ({} when empty). Raises ValueError with a readable message."""
+    if not text.strip():
+        return {}
+    try:
+        data = yaml.safe_load(text)
+    except yaml.YAMLError as exc:
+        raise ValueError(f"{label} : YAML invalide ({exc}).") from exc
+    if data is None:
+        return {}
+    if not isinstance(data, dict):
+        raise ValueError(f"{label} : attendu un dictionnaire « clé: valeur », une entrée par ligne.")
+    return {str(k): v for k, v in data.items()}
 
 
 def apply_request(request: DeploymentRequest) -> list[str]:
@@ -145,7 +162,12 @@ with st.sidebar:
         osl_p99 = opt_int("P99 ", "osl_p99")
     hit_rate = opt_float("Prefix cache hit attendu (0–1)", "hit_rate", 0.0, 1.0,
                          help="Vide : valeur publiée pour le type d'usage, affichée comme hypothèse.")
-    target_concurrency = opt_int("Concurrence cible (toutes instances)", "target_concurrency")
+    target_concurrency = opt_int(
+        "Requêtes en vol visées (toutes instances)", "target_concurrency",
+        help=("Requêtes en cours + en file (running + waiting), pas des utilisateurs : un utilisateur agentique n'a une"
+              " requête en cours qu'une partie du temps (outils, lecture, pauses). Mesure : somme de"
+              " vllm:num_requests_running + vllm:num_requests_waiting sur tous les pods, ou débit de requêtes × durée"
+              " d'une requête."))
     paused_sessions = opt_int("Sessions en pause à garder en cache", "paused_sessions", min_value=0)
 
     st.header("SLO")
@@ -153,7 +175,14 @@ with st.sidebar:
     with c1:
         ttft = opt_float("TTFT p95 (ms)", "ttft", 1.0, step=10.0)
     with c2:
-        itl = opt_float("ITL p95 (ms)", "itl", 1.0, step=1.0)
+        itl = opt_float("ITL / TPOT p95 (ms)", "itl", 1.0, step=1.0)
+    itl_metric = st.radio(
+        "La cible de génération porte sur", ["itl", "tpot"], horizontal=True, key="itl_metric",
+        format_func=lambda m: {"itl": "ITL (intervalle entre chunks)", "tpot": "TPOT (temps par token)"}[m],
+        help=("ITL = vllm:inter_token_latency_seconds : intervalle entre deux sorties d'une requête, soit un step ; avec le"
+              " speculative decoding, une sortie porte ~a tokens, donc l'ITL monte un peu. TPOT ="
+              " vllm:request_time_per_output_token_seconds : temps par token, divisé par ~a avec le speculative decoding."
+              " Pour le ressenti utilisateur (tokens/s), c'est le TPOT qui compte."))
 
     st.caption("Les SLO alimentent l'onglet « Interprétation SLO » : verdict, goulot et réglage correctif.")
 
@@ -165,6 +194,26 @@ with st.sidebar:
                            help="a = 1 + spec_decode_num_accepted_tokens / spec_decode_num_drafts")
     allow_lossy = st.checkbox("Tolérer une vérification lossy (FLy)", key="allow_lossy")
 
+    st.header("Contexte et arguments supplémentaires")
+    _ext = catalog.models[model_id].context_extension
+    _native = catalog.models[model_id].architecture.max_position_embeddings
+    _n = lambda v: f"{v:,}".replace(",", " ")  # noqa: E731
+    max_model_len = opt_int(
+        "max-model-len cible", "max_model_len",
+        help=f"Vide : contexte natif ({_n(_native)} tokens)." + (
+            f" Au-delà, extension {_ext.method.upper()} jusqu'à {_n(_ext.max_model_len)} : l'app génère --hf-overrides"
+            " et VLLM_ALLOW_LONG_MAX_MODEL_LEN=1." if _ext else " Ce modèle n'a pas d'extension de contexte au catalogue."
+        ),
+    )
+    if _ext:
+        st.caption(f"Contexte natif {_n(_native)}, extensible à {_n(_ext.max_model_len)} via {_ext.method.upper()}.")
+    st.text_area("Arguments vLLM supplémentaires (YAML)", key="extra_args_text", height=110,
+                 placeholder='# Une ligne par flag. dict → JSON, true → flag seul.\n--enable-log-requests: true\n--hf-overrides: {text_config: {rope_parameters: {rope_type: yarn, factor: 4.0}}}',
+                 help="Flags passés tels quels à vllm serve, vérifiés contre le code source de la version. Un flag"
+                      " généré par l'app est remplacé par la valeur fournie.")
+    st.text_area("Variables d'environnement (YAML)", key="extra_env_text", height=68,
+                 placeholder="VLLM_LOGGING_LEVEL: DEBUG")
+
     st.header("Logs de démarrage (optionnel)")
     kv_tokens = opt_int("GPU KV cache size (tokens)", "kv_tokens", help="Ligne « GPU KV cache size: N tokens » d'une instance.")
     kv_util = opt_float("gpu-memory-utilization lors de la mesure", "kv_util", 0.05, 1.0)
@@ -174,7 +223,8 @@ with st.sidebar:
     st.caption("Mesurées avec la config générée : elles priment sur l'estimation, et l'ITL recalibre le modèle de latence.")
     c1, c2 = st.columns(2)
     with c1:
-        itl_measured = opt_float("ITL p95 mesurée (ms)", "itl_measured", 0.1, step=1.0)
+        itl_measured = opt_float("ITL / TPOT p95 mesuré (ms)", "itl_measured", 0.1, step=1.0,
+                                 help="Même métrique que la cible (ITL ou TPOT), mesurée avec la config générée.")
     with c2:
         ttft_measured = opt_float("TTFT p95 mesuré (ms)", "ttft_measured", 1.0, step=10.0)
 
@@ -199,13 +249,20 @@ def pct(p50, p95, p99) -> dict:
 
 
 try:
+    extra_args = parse_mapping(st.session_state["extra_args_text"], "Arguments supplémentaires")
+    extra_env = {k: str(v) for k, v in parse_mapping(st.session_state["extra_env_text"], "Variables d'environnement").items()}
+except ValueError as exc:
+    st.error(str(exc))
+    st.stop()
+
+try:
     request = DeploymentRequest(
         gpu_id=gpu_id, gpus_per_instance=int(gpus_per_instance), num_instances=int(num_instances), model_id=model_id,
         vllm_version=vllm_version,
         workload={"usage_type": usage_type, "mode": mode, "isl": pct(isl_p50, isl_p95, isl_p99),
                   "osl": pct(osl_p50, osl_p95, osl_p99), "prefix_cache_hit_rate": hit_rate,
                   "target_concurrency": target_concurrency, "paused_sessions": paused_sessions},
-        slo={"ttft_p95_ms": ttft, "itl_p95_ms": itl}, allow_lossy=allow_lossy,
+        slo={"ttft_p95_ms": ttft, "itl_p95_ms": itl, "itl_metric": itl_metric}, allow_lossy=allow_lossy,
         spec={"enabled": spec_enabled, "num_speculative_tokens": k, "acceptance_length": acceptance,
               "draft_sample_method": None if draft_choice == "défaut vLLM" else draft_choice},
         observed_kv=({"kv_cache_tokens": kv_tokens, "gpu_memory_utilization": kv_util, "block_size": kv_block}
@@ -213,6 +270,7 @@ try:
         observed_perf=({"itl_p95_ms": itl_measured, "ttft_p95_ms": ttft_measured}
                        if itl_measured or ttft_measured else None),
         gpu_memory_utilization=gpu_util, kv_estimate_reserve_gib_per_gpu=reserve,
+        max_model_len=max_model_len, extra_args=extra_args, extra_env=extra_env,
     )
 except ValidationError as exc:
     st.error("Entrées invalides :\n\n" + "\n".join(f"- {'.'.join(map(str, e['loc']))} : {e['msg']}" for e in exc.errors()))
@@ -247,62 +305,119 @@ c1.metric("max-num-seqs", result.facts.max_num_seqs)
 c2.metric("max-num-batched-tokens", result.facts.max_num_batched_tokens)
 c3.metric("KV par instance", f"{result.facts.kv_tokens_per_instance:,}".replace(",", " ") if result.facts.kv_tokens_per_instance else "—",
           help={"startup_log": "Lu dans les logs", "estimate": "Estimation (à vérifier)"}.get(result.facts.kv_tokens_source))
-c4.metric("Avertissements", f"{len(critical)} critiques · {len(to_verify)} à vérifier")
+warnings_count = len([w for w in result.warnings if w.severity == "warning" and w.category != "to_verify"])
+c4.metric("Avertissements", f"{len(critical)} crit. · {warnings_count} avert. · {len(to_verify)} à vérifier",
+          help="Critiques, avertissements, données à vérifier : détail dans l'onglet Avertissements.")
 for w in critical:
     st.error(w.message)
 
 analysis = result.analysis
 if analysis is not None:
-    banner = {"ok": st.success, "at_risk": st.warning, "ko": st.error, "unknown": st.info}[analysis.verdict]
-    banner(f"**Interprétation SLO — {VERDICT_LABEL[analysis.verdict]}** : {analysis.summary}"
-           " Détail et réglage correctif dans l'onglet « Interprétation SLO ».")
+    plan = analysis.test_plan
+    if plan is not None:
+        st.info(f"**Paliers de test** : {plan.summary} Détail dans l'onglet « Paliers et SLO ».")
+    structural = [c for c in analysis.checks if c.key in ("kv", "prefill_load") and c.status in ("at_risk", "ko")]
+    for c in structural:
+        (st.error if c.status == "ko" else st.warning)(f"**{c.label}** : {c.detail}")
 
-tabs = st.tabs(["Configuration", "Interprétation SLO", "Justifications", "Avertissements", "Indicateurs", "Hypothèses",
+tabs = st.tabs(["Configuration", "Paliers et SLO", "Justifications", "Avertissements", "Indicateurs", "Hypothèses",
                 "Vérification et métriques"])
 
 with tabs[0]:
     k8s, cli = render.render_k8s_args(result, catalog), render.render_cli(result, catalog)
+    env_block = render.render_k8s_env(result)
+    if env_block:
+        st.subheader("YAML `env` du conteneur vLLM")
+        st.code(env_block, language="yaml")
     st.subheader("YAML `args` (KServe / Kubernetes)")
     st.code(k8s, language="yaml")
     st.download_button("Télécharger args.yaml", k8s, file_name="vllm-args.yaml")
     st.subheader("Ligne de commande")
     st.code(cli, language="bash")
 
+def fmt_ms(value: float) -> str:
+    if value == float("inf"):
+        return "∞"
+    return f"{value / 1e3:.1f} s" if value >= 1000 else f"{value:.0f} ms"
+
+
+def fmt_range(pair, unit_ms: bool = True) -> str:
+    if pair is None:
+        return "—"
+    low, high = pair
+    if unit_ms:
+        return f"{fmt_ms(low)} – {fmt_ms(high)}"
+    return f"{low:,.0f} – {high:,.0f}".replace(",", " ")
+
+
 with tabs[1]:
     if analysis is None:
         st.info("Analyse indisponible.")
     else:
-        st.subheader(f"Verdict : {VERDICT_LABEL[analysis.verdict]}")
-        st.write(analysis.summary)
+        plan = analysis.test_plan
+        st.subheader("Plan de test par paliers")
+        st.write(plan.summary)
+        gen_label = "ITL p95" if request.slo.itl_metric == "itl" else "TPOT p95"
+        st.dataframe([{
+            "Palier": f"{'★ ' if s.is_generated_config else ''}{s.index}",
+            "max-num-seqs": s.max_num_seqs,
+            "Requêtes en vol / instance": s.inflight_per_instance,
+            "max-num-batched-tokens": s.max_num_batched_tokens,
+            "long-prefill-token-threshold": s.long_prefill_token_threshold,
+            "Capture CUDA graphs": s.capture_size,
+            "ITL p95 attendue": fmt_range(s.itl_ms),
+            "TPOT p95 attendu": fmt_range(s.tpot_ms),
+            "TTFT p95 attendu": fmt_range(s.ttft_ms),
+            "Débit sortie / instance (tok/s)": fmt_range(s.output_tokens_per_s, unit_ms=False),
+            "KV": "—" if s.kv_usage_pct is None else f"{s.kv_usage_pct:g} %",
+            "Attendu vs SLO": VERDICT_LABEL[s.expectation],
+            "Si validé : instances (GPU)": "—" if s.instances_needed is None else f"{s.instances_needed} ({s.gpus_needed})",
+            "Pourquoi": s.expectation_reason,
+        } for s in plan.steps], use_container_width=True, hide_index=True)
+        st.caption(f"★ : palier de la config générée. Plages = estimation ×{analysis.uncertainty[0]:g} à"
+                   f" ×{analysis.uncertainty[1]:g} ({'recalée sur la mesure' if analysis.calibration else 'non calibrée'})."
+                   f" Le verdict de chaque palier porte sur la cible {gen_label}."
+                   if analysis.uncertainty else "★ : palier de la config générée. Pas de modèle de latence : la mesure tranche.")
+        c1, c2 = st.columns(2)
+        with c1:
+            st.markdown("**Protocole**")
+            st.markdown(chr(10).join(f"{i}. {step}" for i, step in enumerate(plan.protocol, 1)))
+        with c2:
+            st.markdown("**Critères de passage d'un palier**")
+            st.markdown(chr(10).join(f"- {c}" for c in plan.pass_criteria))
+            for note in plan.notes:
+                st.info(note)
+
+        st.subheader("Contrôles au point de la config générée")
         st.dataframe([{
             "Contrôle": c.label, "Statut": VERDICT_LABEL[c.status],
             "Cible": "—" if c.target is None else f"{c.target:g} {c.unit or ''}".strip(),
-            "Estimation": "—" if c.estimate is None else ("∞" if c.estimate == float("inf") else f"{c.estimate:g} {c.unit or ''}".strip()),
+            "Estimation": ("—" if c.estimate is None else
+                           fmt_range((c.estimate_low, c.estimate_high)) if c.estimate_low is not None and c.unit == "ms"
+                           else f"{c.estimate:g} {c.unit or ''}".strip()),
             "Mesure": "—" if c.measured is None else f"{c.measured:g} {c.unit or ''}".strip(),
             "Verdict": "oui" if c.in_verdict else "non (cas pire)", "Détail": c.detail,
         } for c in analysis.checks], use_container_width=True, hide_index=True)
 
-        st.subheader("Goulots d'étranglement")
-        if not analysis.bottlenecks:
-            st.success("Aucun goulot identifié au point de fonctionnement.")
-        for b in analysis.bottlenecks:
-            (st.error if b.status == "ko" else st.warning)(f"**{b.label}** — {b.explanation}")
-
-        st.subheader("Recommandations")
-        for i, r in enumerate(analysis.recommendations, 1):
-            with st.container(border=True):
-                st.markdown(f"**{i}. {RECO_LABEL[r.kind]} — {r.title}**")
-                st.write(r.rationale)
-                if r.changes:
-                    st.code(chr(10).join(
-                        f"{key}: {json.dumps(value, separators=(',', ':')) if isinstance(value, dict) else value}"
-                        for key, value in r.changes.items()), language="yaml")
-
-        if analysis.step_breakdown:
-            with st.expander("Décomposition du step au point de fonctionnement"):
+        with st.expander(f"Estimation indicative au point de la config générée : {VERDICT_LABEL[analysis.verdict]}"):
+            st.write(analysis.summary)
+            if analysis.bottlenecks:
+                st.markdown("**Goulots d'étranglement**")
+            for b in analysis.bottlenecks:
+                (st.error if b.status == "ko" else st.warning)(f"**{b.label}** — {b.explanation}")
+            st.markdown("**Pistes** (à valider par les paliers)")
+            for i, r in enumerate(analysis.recommendations, 1):
+                with st.container(border=True):
+                    st.markdown(f"**{i}. {RECO_LABEL[r.kind]} — {r.title}**")
+                    st.write(r.rationale)
+                    if r.changes:
+                        st.code(chr(10).join(
+                            f"{key}: {json.dumps(value, separators=(',', ':')) if isinstance(value, dict) else value}"
+                            for key, value in r.changes.items()), language="yaml")
+            if analysis.step_breakdown:
                 st.dataframe([{"Grandeur": k, "Valeur": str(v)} for k, v in analysis.step_breakdown.items()],
                              use_container_width=True, hide_index=True)
-        st.caption(f"{CONFIDENCE_LABEL[analysis.confidence]} : modèle d'ordre de grandeur, à confirmer par la mesure.")
+        st.caption(f"{CONFIDENCE_LABEL[analysis.confidence]} : ordres de grandeur, la mesure des paliers tranche.")
         for note in analysis.notes:
             st.caption(note)
 

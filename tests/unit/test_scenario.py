@@ -32,7 +32,7 @@ def test_round_trip_keeps_every_input(request_):
     assert name == "Prod agentique"
     doc = yaml.safe_load(text)
     assert doc["kind"] == KIND and doc["version"] == 1
-    assert doc["request"]["slo"] == {"ttft_p95_ms": 2000.0, "itl_p95_ms": 40.0}
+    assert doc["request"]["slo"] == {"ttft_p95_ms": 2000.0, "itl_p95_ms": 40.0, "itl_metric": "itl"}
 
 
 def test_generated_snapshot_is_informative_only(request_):

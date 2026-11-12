@@ -35,7 +35,8 @@ class Workload(_Frozen):
     osl: Percentiles
     # None : le moteur prend la valeur publiée pour le type d'usage (hypothèse affichée) s'il y en a une.
     prefix_cache_hit_rate: float | None = Field(default=None, ge=0, le=1)
-    # Concurrence cible totale (toutes instances confondues).
+    # Requêtes en vol visées (running + waiting), toutes instances confondues. Ce n'est pas un nombre
+    # d'utilisateurs : un utilisateur agentique n'a une requête en cours qu'une partie du temps.
     target_concurrency: int | None = Field(default=None, gt=0)
     # Sessions en pause dont le préfixe doit rester en cache (offload KV, §5).
     paused_sessions: int | None = Field(default=None, ge=0)
@@ -44,6 +45,10 @@ class Workload(_Frozen):
 class Slo(_Frozen):
     ttft_p95_ms: float | None = Field(default=None, gt=0)
     itl_p95_ms: float | None = Field(default=None, gt=0)
+    # Ce que mesure la cible de latence de génération : « itl » = intervalle entre deux sorties d'une requête
+    # (vllm:inter_token_latency_seconds, un step, plusieurs tokens avec le spec decoding) ; « tpot » = temps par
+    # token (vllm:request_time_per_output_token_seconds), divisé par ~a avec le spec decoding.
+    itl_metric: Literal["itl", "tpot"] = "itl"
 
 
 class SpecOptions(_Frozen):
@@ -82,6 +87,14 @@ class DeploymentRequest(_Frozen):
     observed_kv: ObservedKv | None = None
     observed_perf: ObservedPerf | None = None
     gpu_memory_utilization: float | None = Field(default=None, gt=0, le=1)
+    # Longueur de contexte servie (--max-model-len). None : contexte natif du modèle. Au-delà du natif, le moteur
+    # applique l'extension de contexte du catalogue (YaRN via --hf-overrides) si le modèle en a une.
+    max_model_len: int | None = Field(default=None, gt=0)
+    # Flags vLLM supplémentaires (« --flag »: valeur ; dict → JSON, true → flag seul, false → --no-flag). Ils
+    # remplacent un flag généré du même nom. Chaque flag est vérifié contre le code source de la version.
+    extra_args: dict[str, Any] = {}
+    # Variables d'environnement supplémentaires du conteneur vLLM.
+    extra_env: dict[str, str] = {}
     # Réserve par GPU (activations, CUDA graphs, drafter) pour l'estimation du KV sans logs.
     kv_estimate_reserve_gib_per_gpu: float | None = Field(default=None, ge=0)
 
@@ -91,7 +104,7 @@ class DeploymentRequest(_Frozen):
 Severity = Literal["info", "warning", "critical"]
 Category = Literal[
     "to_verify", "lossy", "osl_suspect", "isl_tail", "kv_limited", "unsupported", "breaking_change",
-    "assumption", "itl", "memory", "version", "model_note",
+    "assumption", "itl", "memory", "version", "model_note", "context", "extra_args",
 ]
 
 
@@ -108,6 +121,9 @@ class Decision(_Frozen):
     default: Any = None
     emitted: bool = True
     omitted_reason: str | None = None
+    # Renseignés pour un flag hors du catalogue de la version (arguments supplémentaires).
+    cli: str | None = None
+    cli_kind: Literal["value", "bool_optional", "store_true", "json"] | None = None
 
 
 class Warning(_Frozen):
@@ -164,6 +180,9 @@ class SloCheck(_Frozen):
     status: CheckStatus
     target: float | None = None
     estimate: float | None = None
+    # Plage de l'estimation (incertitude du modèle de latence), quand elle s'applique.
+    estimate_low: float | None = None
+    estimate_high: float | None = None
     measured: float | None = None
     unit: str | None = None
     detail: str
@@ -187,6 +206,38 @@ class Recommendation(_Frozen):
     addresses: list[str] = []
 
 
+class TestStep(_Frozen):
+    """One load step of the validation plan: deploy this setting, inject this load, compare to the SLOs."""
+
+    index: int
+    max_num_seqs: int
+    max_num_batched_tokens: int
+    long_prefill_token_threshold: int
+    capture_size: int
+    inflight_per_instance: int
+    # Plages attendues (bas, haut) ; None si le modèle de latence est indisponible.
+    itl_ms: tuple[float, float] | None = None
+    tpot_ms: tuple[float, float] | None = None
+    ttft_ms: tuple[float, float] | None = None
+    output_tokens_per_s: tuple[float, float] | None = None
+    kv_usage_pct: float | None = None
+    prefill_load_pct: float | None = None
+    expectation: CheckStatus = "unknown"
+    expectation_reason: str = ""
+    # Si ce palier est le dernier validé : instances (et GPU) pour la charge visée.
+    instances_needed: int | None = None
+    gpus_needed: int | None = None
+    is_generated_config: bool = False
+
+
+class TestPlan(_Frozen):
+    steps: list[TestStep]
+    summary: str
+    protocol: list[str]
+    pass_criteria: list[str]
+    notes: list[str] = []
+
+
 class SloAnalysis(_Frozen):
     verdict: CheckStatus
     summary: str
@@ -196,6 +247,9 @@ class SloAnalysis(_Frozen):
     # Décomposition du step au point de fonctionnement (ms), si le modèle de latence est disponible.
     step_breakdown: dict[str, Any] | None = None
     calibration: float | None = None
+    # Multiplicateurs d'incertitude appliqués aux durées estimées (bas, haut).
+    uncertainty: tuple[float, float] | None = None
+    test_plan: TestPlan | None = None
     notes: list[str] = []
     confidence: Status = "unverified"
 
@@ -207,6 +261,8 @@ class GenerationResult(_Frozen):
     indicators: list[Indicator]
     assumptions: list[Assumption]
     facts: DeploymentFacts
+    # Variables d'environnement à poser sur le conteneur vLLM (ex. VLLM_ALLOW_LONG_MAX_MODEL_LEN=1).
+    env: dict[str, str] = {}
     analysis: SloAnalysis | None = None
     blocking_errors: list[str] = []
 

@@ -91,6 +91,27 @@ performance:
   dense_bytes_per_param: 2.0
   compute_dtype: bf16
 
+
+context_extension:
+  status: verified
+  source: "https://huggingface.co/Qwen/Qwen3.8-Flash-Next (model card à la révision épinglée, « Processing Ultra-Long Texts »)"
+  method: yarn
+  native_max_model_len: 262144
+  max_model_len: 1000000
+  # Chemin de l'override dans config.json, et bloc complet à passer : vLLM remplace rope_parameters en bloc.
+  override_path: [text_config, rope_parameters]
+  rope_parameters:
+    mrope_interleaved: true
+    mrope_section: [11, 11, 10]
+    rope_type: yarn
+    rope_theta: 10000000
+    partial_rotary_factor: 0.25
+    original_max_position_embeddings: 262144
+  note: >-
+    YaRN statique : le facteur s'applique quelle que soit la longueur, ce qui peut dégrader les textes courts. La model
+    card conseille de n'activer l'extension que si nécessaire et d'ajuster factor à la longueur visée (2,0 pour
+    524 288, 4,0 pour 1 000 000).
+
 notes:
   - "Recette vLLM : sur 4× GB300, TEP4 (--enable-expert-parallel) est recommandé ; l'expert parallelism est « consistently faster » que TP4 seul."
   - "Recette vLLM : --attention-config.indexer_kv_dtype fp8 en plus de --kv-cache-dtype fp8."

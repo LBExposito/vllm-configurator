@@ -55,6 +55,21 @@ defaults:
     source: vllm/config/speculative.py (SpeculativeConfig.enable_adaptive_verification)
 
 behaviors:
+  max_model_len.yarn_factor_extends_derived:
+    value: false
+    status: verified
+    source: "vllm/config/model.py au tag v0.31.0, _get_and_verify_max_len : rope_type yarn exclu du facteur (« YaRN variants leave max_position_embeddings already scaled »)"
+    note: >-
+      Avec un override YaRN, le max dérivé reste max_position_embeddings : un --max-model-len supérieur exige
+      VLLM_ALLOW_LONG_MAX_MODEL_LEN=1 (sinon ValueError au démarrage), ou un override de max_position_embeddings.
+  max_model_len.allow_long_env:
+    value: VLLM_ALLOW_LONG_MAX_MODEL_LEN
+    status: verified
+    source: "vllm/envs.py au tag v0.31.0 (VLLM_ALLOW_LONG_MAX_MODEL_LEN, « 1 » ou « true »)"
+  hf_overrides.nested_merge:
+    value: true
+    status: verified
+    source: "vllm/config/model.py au tag v0.31.0, _apply_dict_overrides : une clé dont la valeur est un sous-config (text_config) est fusionnée récursivement ; un dict ordinaire (rope_parameters) est remplacé en bloc"
   long_prefill.single_request_bypass:
     value: true
     status: verified
@@ -126,6 +141,7 @@ flags:
   gpu_memory_utilization: {cli: --gpu-memory-utilization, kind: value}
   block_size: {cli: --block-size, kind: value}
   max_model_len: {cli: --max-model-len, kind: value}
+  hf_overrides: {cli: --hf-overrides, kind: json}
   kv_offloading_size: {cli: --kv-offloading-size, kind: value}
   kv_offloading_backend: {cli: --kv-offloading-backend, kind: value}
   speculative_config: {cli: --speculative-config, kind: json}

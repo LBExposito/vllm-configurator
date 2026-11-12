@@ -25,6 +25,7 @@ def test_behaviors_used_by_the_engine_exist(catalog, version):
         "spec_decode.extra_draft_slots", "spec_decode.dspark_active_seq_cap", "spec_decode.fly",
         "spec_decode.adaptive_verification", "spec_decode.draft_lm_head_quantization",
         "cudagraph.default_max_capture_size", "cudagraph.capped_by_max_num_batched_tokens", "cudagraph.multiple_of_k_plus_1",
+        "max_model_len.yarn_factor_extends_derived", "max_model_len.allow_long_env", "hf_overrides.nested_merge",
     }
     assert required <= set(catalog.vllm_versions[version].behaviors)
 

@@ -126,10 +126,9 @@ class TestBottlenecks:
         assert "kv_capacity" in bottlenecks(a)
         titles = " ".join(r.title for r in a.recommendations)
         assert "--gpu-memory-utilization" in titles and "DP-attention" in titles
-        tune = next(r for r in a.recommendations if r.kind == "param" and "--max-num-seqs" in r.changes)
-        # Moins de séquences : le KV redescend sous le seuil, la capture suit (k + 1) × max_num_seqs.
-        assert tune.changes["--max-num-seqs"] < 208
-        assert tune.changes["--compilation-config"]["max_cudagraph_capture_size"] == 4 * tune.changes["--max-num-seqs"]
+        # Les paliers ne dépassent pas ce que le KV loge (90 % au contexte moyen) ; la capture suit (k + 1) × S.
+        assert all(s.kv_usage_pct <= 90 for s in a.test_plan.steps)
+        assert all(s.capture_size == min(4 * s.max_num_seqs, s.max_num_batched_tokens) for s in a.test_plan.steps)
 
     def test_itl_floor_cannot_be_fixed_by_more_instances(self):
         a = analysis(workload={"target_concurrency": 100}, slo={"itl_p95_ms": 5})
@@ -145,8 +144,9 @@ class TestBottlenecks:
         assert wider.changes["GPU"] < scale.changes["GPU"]
 
     def test_parameter_fix_without_extra_gpu_when_one_exists(self):
-        # 500 séquences par instance, sorties courtes : le prefill sature le budget de 8192 ; 12288 suffit.
-        a = analysis(workload={"target_concurrency": 1000, "osl": {"p50": 250}}, slo={"ttft_p95_ms": 2000, "itl_p95_ms": 40})
+        # 500 séquences par instance, sorties courtes : le prefill sature le budget de 8192 ; 12288 suffit, même dans
+        # le cas pessimiste (×2,5) avec des cibles lâches.
+        a = analysis(workload={"target_concurrency": 1000, "osl": {"p50": 250}}, slo={"ttft_p95_ms": 5000, "itl_p95_ms": 100})
         assert a.verdict == "ko" and bottlenecks(a)[0] == "prefill"
         tune = a.recommendations[0]
         assert tune.kind == "param"
@@ -160,3 +160,73 @@ def test_every_catalog_model_gets_an_analysis():
         a = generate(DeploymentRequest(**data)).analysis
         assert a.verdict in ("ok", "at_risk", "ko")
         assert a.step_breakdown is not None
+
+
+
+class TestRangesAndMetric:
+    def test_uncalibrated_estimates_are_ranges(self):
+        a = analysis(slo={"itl_p95_ms": 50, "ttft_p95_ms": 2000})
+        itl = checks(a)["itl"]
+        assert a.uncertainty == (0.8, 2.5)
+        assert itl.estimate_low == pytest.approx(itl.estimate * 0.8, rel=0.01)
+        assert itl.estimate_high == pytest.approx(itl.estimate * 2.5, rel=0.01)
+
+    def test_calibration_tightens_the_range(self):
+        a = analysis(slo={"itl_p95_ms": 50}, observed_perf={"itl_p95_ms": 30})
+        assert a.uncertainty == (0.85, 1.15)
+
+    def test_tpot_target_divides_the_step_by_the_acceptance_length(self):
+        itl = checks(analysis(slo={"itl_p95_ms": 50}))["itl"]
+        tpot = checks(analysis(slo={"itl_p95_ms": 50, "itl_metric": "tpot"}))["itl"]
+        assert tpot.label == "TPOT p95"
+        assert tpot.estimate < itl.estimate / 2.5  # a = 3 avec DSpark k = 3
+
+    def test_spec_decoding_lowers_tpot_but_not_itl(self):
+        on = analysis(slo={"itl_p95_ms": 50, "itl_metric": "tpot"})
+        off = analysis(slo={"itl_p95_ms": 50, "itl_metric": "tpot"}, spec={"enabled": False})
+        assert checks(on)["itl"].estimate < checks(off)["itl"].estimate / 2
+
+    def test_mean_context_from_percentiles(self):
+        a = analysis(workload={"isl": {"p50": 23000, "p95": 76600, "p99": 666000}})
+        assert any("ISL 35" in n for n in a.notes)  # moyenne ≈ 35 452, bien au-delà du P50
+
+    def test_kv_is_rescaled_to_the_generated_memory_fraction(self):
+        # KV lu à 0,92, config à 0,8 (grosse capture avec spec decoding) : moins de mémoire libre, moins de KV.
+        a = analysis(observed_kv={"kv_cache_tokens": 86_225_864, "gpu_memory_utilization": 0.92})
+        assert any(n.startswith("KV ramené") for n in a.notes)
+
+
+class TestTestPlan:
+    def test_plan_brackets_the_expected_limit(self):
+        a = analysis(workload={"target_concurrency": 1700, "isl": {"p50": 23000, "p95": 76600, "p99": 666000},
+                               "osl": {"p50": 4500, "p95": 11500, "p99": 24000}, "prefix_cache_hit_rate": 0.87},
+                     slo={"itl_p95_ms": 50, "ttft_p95_ms": 60000}, spec={"enabled": False})
+        plan = a.test_plan
+        seqs = [s.max_num_seqs for s in plan.steps]
+        assert seqs == sorted(seqs) and 2 <= len(seqs) <= 8
+        assert max(seqs) <= 850  # inutile de tester au-delà des requêtes en vol par instance
+        assert any(s.is_generated_config for s in plan.steps)
+        assert plan.steps[0].expectation == "ok"
+        assert all(s.instances_needed == -(-1700 // s.max_num_seqs) for s in plan.steps)
+        assert "requêtes en vol" in plan.summary
+        assert any("vllm:inter_token_latency_seconds" in c for c in plan.pass_criteria)
+        assert any("Spec decoding désactivé" in n for n in plan.notes)
+
+    def test_plan_without_latency_model_still_lists_steps(self):
+        from vllm_configurator.catalog import load_catalog
+
+        catalog = load_catalog()
+        model = catalog.models["deepseek-v4.1-flash-1017"]
+        catalog.models[model.id] = model.model_copy(update={"performance": None})
+        try:
+            plan = generate(req(workload={"target_concurrency": 600}), catalog).analysis.test_plan
+        finally:
+            catalog.models[model.id] = model
+        assert plan.steps and all(s.itl_ms is None and s.expectation == "unknown" for s in plan.steps)
+        assert "la mesure tranche" in plan.summary
+
+    def test_step_budget_is_raised_when_its_prefill_load_needs_it(self):
+        a = analysis(workload={"target_concurrency": 1000, "osl": {"p50": 250}}, slo={"itl_p95_ms": 100})
+        big = [s for s in a.test_plan.steps if s.max_num_seqs >= 384]
+        assert big and all(s.prefill_load_pct <= 80 for s in big)
+        assert any(s.max_num_batched_tokens > 8192 for s in big)

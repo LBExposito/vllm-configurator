@@ -1,6 +1,7 @@
 """Rules of the vLLM target. Each rule is a pure function (RuleContext, state) -> RuleOutput."""
 
 from .context import RuleContext, RuleOutput
+from .extra import decide_extra_args
 from .diagnostics import check_support, decide_parallelism, itl_watch, resolve_workload, version_notes
 from .kv_cache import (
     decide_block_size,
@@ -42,6 +43,7 @@ PIPELINE = [
     indicate_scheduler,
     itl_watch,
     version_notes,
+    decide_extra_args,
 ]
 
 __all__ = ["PIPELINE", "RuleContext", "RuleOutput"]

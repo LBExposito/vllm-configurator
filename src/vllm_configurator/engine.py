@@ -15,7 +15,7 @@ DECISION_ORDER = [
     "max_num_seqs", "max_num_batched_tokens", "long_prefill_token_threshold", "long_prefill_token_threshold_adaptive",
     "enable_chunked_prefill",
     "enable_prefix_caching", "kv_cache_dtype", "gpu_memory_utilization", "block_size", "kv_offloading_size",
-    "max_model_len",
+    "max_model_len", "hf_overrides",
     "speculative_config", "compilation_config",
 ]
 
@@ -63,7 +63,13 @@ def generate(request: DeploymentRequest, catalog: Catalog | None = None) -> Gene
         out = _run_pipeline(ctx, chosen)
 
     order = {key: i for i, key in enumerate(DECISION_ORDER)}
-    decisions = sorted(out.decisions, key=lambda d: order.get(d.key, len(order)))
+    overridden = out.state.get("overridden_by_extra", {})
+    decisions = [
+        d.model_copy(update={"emitted": False, "omitted_reason": f"remplacé par l'argument supplémentaire {overridden[d.key]}"})
+        if d.key in overridden else d
+        for d in out.decisions
+    ]
+    decisions = sorted(decisions, key=lambda d: order.get(d.key, len(order)))
     severity = {"critical": 0, "warning": 1, "info": 2}
     warnings = sorted(out.warnings, key=lambda w: severity[w.severity])
     s: dict[str, Any] = out.state
@@ -80,6 +86,7 @@ def generate(request: DeploymentRequest, catalog: Catalog | None = None) -> Gene
     blocking = list(s.get("blocking", []))
     return GenerationResult(
         request=request, decisions=decisions, warnings=warnings, indicators=out.indicators,
-        assumptions=out.assumptions, facts=facts, analysis=None if blocking else analyze(ctx, s),
+        assumptions=out.assumptions, facts=facts, env=dict(s.get("env", {})),
+        analysis=None if blocking else analyze(ctx, s),
         blocking_errors=blocking,
     )
