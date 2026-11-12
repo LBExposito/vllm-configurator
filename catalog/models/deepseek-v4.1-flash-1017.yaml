@@ -1,0 +1,84 @@
+id: deepseek-v4.1-flash-1017
+display_name: DeepSeek V4.1 Flash (build 1017)
+hf_repo: deepseek-ai/DeepSeek-V4.1-Flash-1017
+hf_revision: 08c8657f02291e11b6f6b63e0e16014f8e748518
+verified_on: "2026-11-12"
+
+architecture:
+  status: verified
+  source: https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash-1017/blob/08c8657f02291e11b6f6b63e0e16014f8e748518/config.json
+  hf_architecture: DeepseekV41ForCausalLM
+  model_type: deepseek_v41
+  family: moe
+  attention: [compressed_sparse, sliding_window, kv_sharing]
+  num_hidden_layers: 40
+  hidden_size: 5120
+  num_attention_heads: 64
+  num_key_value_heads: 1
+  head_dim: 512
+  max_position_embeddings: 1048576
+  moe: {n_routed_experts: 384, num_experts_per_tok: 6, n_shared_experts: 1}
+  raw:
+    sliding_window: 128
+    compress_ratios_distinct: [0, 1, 2]
+    kv_source_layer_ids: [2, 8, 14, 20]
+    index_topk: 512
+    candidate_topk_blocks: 2048
+    candidate_block_size: 8
+    num_nextn_predict_layers: 3
+    dspark_block_size: 5
+    engram_layer_ids: [1, 14]
+
+weights:
+  status: verified
+  source: "API Hugging Face, somme des fichiers .safetensors à la révision épinglée"
+  checkpoint_bytes: 510296708312
+  quantization: "fp8 (experts fp4), weight_block_size 32×32, scale ue8m0"
+
+kv_cache:
+  status: unverified
+  source: https://recipes.vllm.ai/deepseek-ai/DeepSeek-V4.1-Flash-1017
+  bytes_per_token: 890
+  bytes_per_token_dtype: fp8
+  replicated_across_tp: true
+  per_sequence_state_bytes: null
+  method: >-
+    Valeur annoncée par DeepSeek (« 890 bytes per token » de KV global) et citée par la recette vLLM, à laquelle
+    s'ajoute une fenêtre glissante fixe de 128 tokens par couche, non chiffrée. Non dérivable de config.json
+    (compression par couche, KV partagé entre couches, indexeur, engram). Réplication sur les rangs TP déduite
+    d'une seule tête KV. Préférer la valeur « GPU KV cache size » des logs de démarrage.
+  recommended_dtype: fp8
+
+block_size:
+  status: verified
+  source: >-
+    Log de démarrage du cas de référence (vLLM 0.33.0, TP4 sur 4× B300) : « Setting kv cache block size to 128
+    for FLASHMLA_MEGA_ATTN_DSV41/DEEPSEEK_SPARSE_SWA/DEEPSEEK_V41_INDEXER/CompressorBackend »
+  forced_by_backend: 128
+  note: "Imposée par le backend d'attention : ne pas passer --block-size."
+
+speculative:
+  status: verified
+  source:
+    - "config.json (champs dspark_*)"
+    - https://recipes.vllm.ai/deepseek-ai/DeepSeek-V4.1-Flash-1017
+  native_method: dspark
+  recommended_num_speculative_tokens: 5
+  fixed_k: false
+  note: >-
+    La recette vLLM recommande k = 5 et indique que DSpark est la seule méthode de ce checkpoint (« the MTP module
+    was dropped in V4.1 »), alors que config.json contient encore num_nextn_predict_layers = 3. Le cas de référence
+    utilise k = 3.
+
+serving:
+  status: verified
+  source: https://recipes.vllm.ai/deepseek-ai/DeepSeek-V4.1-Flash-1017
+  min_vllm_version: "0.31.0"
+  requires_custom_image: null
+  note: "Architecture livrée en 0.30.0 ; la 0.31.0 apporte le correctif d'offload KV."
+
+notes:
+  - "Recette vLLM : la validation B300 a porté sur le checkpoint 0909, pas sur 1017."
+  - "Recette vLLM : --kv-cache-dtype fp8 sur Blackwell ; préréglage B300 avec --max-cudagraph-capture-size 8190, --max-num-batched-tokens 8192 et --max-num-seqs 256 (k = 5)."
+  - "Recette vLLM : le drafter ajoute environ 14 milliards de paramètres (experts) au chargement."
+  - "Recette vLLM : thinking activé par défaut ; un max_tokens trop petit peut renvoyer un content vide (finish_reason=length)."

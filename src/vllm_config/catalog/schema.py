@@ -1,0 +1,176 @@
+"""Pydantic schemas of the versioned catalogs (catalog/**/*.yaml).
+
+Every block that carries facts has a `status` and a `source`. `verified` means
+read in a primary source (vLLM source code at a tag, Hugging Face config.json
+at a pinned revision, vendor datasheet, real startup logs). Anything else is
+`unverified` and is surfaced by the engine as a "à vérifier" warning.
+"""
+
+from __future__ import annotations
+
+from typing import Any, Literal
+
+from pydantic import BaseModel, ConfigDict, Field, model_validator
+
+Status = Literal["verified", "unverified"]
+
+
+class _Strict(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+
+class Provenance(_Strict):
+    status: Status
+    source: str | list[str]
+    note: str | None = None
+
+
+# --- GPU -------------------------------------------------------------------
+
+class GpuMemory(Provenance):
+    hbm_gb: float = Field(gt=0, description="Capacité HBM par GPU, en Go (10^9 octets)")
+    hbm_type: str | None = None
+
+
+class GpuBandwidth(Provenance):
+    hbm_tb_s: float | None = Field(default=None, gt=0)
+    nvlink_gpu_to_gpu_tb_s: float | None = Field(default=None, gt=0)
+
+
+class GpuComputeCapability(Provenance):
+    value: str
+
+
+class Gpu(_Strict):
+    id: str
+    display_name: str
+    vendor: Literal["nvidia", "amd", "other"]
+    generation: str
+    # Clé de cudagraph.default_max_capture_size dans le catalogue vLLM.
+    cudagraph_family: Literal["blackwell_dc", "other"]
+    compute_capability: GpuComputeCapability
+    memory: GpuMemory
+    bandwidth: GpuBandwidth | None = None
+    verified_on: str
+    notes: list[str] = []
+
+
+# --- Model -----------------------------------------------------------------
+
+class MoeSpec(_Strict):
+    n_routed_experts: int = Field(gt=0)
+    num_experts_per_tok: int = Field(gt=0)
+    n_shared_experts: int = Field(default=0, ge=0)
+
+
+class Architecture(Provenance):
+    hf_architecture: str
+    model_type: str
+    family: Literal["dense", "moe"]
+    attention: list[str] = Field(min_length=1, description="Types d'attention, ex. gqa, mla, sparse, sliding_window, linear")
+    num_hidden_layers: int = Field(gt=0)
+    hidden_size: int = Field(gt=0)
+    num_attention_heads: int = Field(gt=0)
+    num_key_value_heads: int | None = Field(default=None, gt=0)
+    head_dim: int | None = Field(default=None, ge=0)
+    max_position_embeddings: int = Field(gt=0)
+    moe: MoeSpec | None = None
+    # Champs bruts de config.json utiles mais non interprétés par le moteur.
+    raw: dict[str, Any] = {}
+
+    @model_validator(mode="after")
+    def _moe_consistency(self) -> "Architecture":
+        if (self.family == "moe") != (self.moe is not None):
+            raise ValueError("family='moe' exige un bloc moe, et réciproquement")
+        return self
+
+
+class Weights(Provenance):
+    checkpoint_bytes: int | None = Field(default=None, gt=0)
+    quantization: str | None = None
+
+
+class KvCache(Provenance):
+    # null = non dérivable de façon fiable : l'app exige alors la taille lue dans les logs.
+    bytes_per_token: float | None = Field(default=None, gt=0)
+    bytes_per_token_dtype: str | None = None
+    # Sommes « par token » répliquées sur chaque rang TP (MLA, MQA) ou partagées.
+    replicated_across_tp: bool | None = None
+    # État fixe par séquence (attention linéaire, fenêtre glissante), si connu.
+    per_sequence_state_bytes: float | None = Field(default=None, ge=0)
+    method: str = Field(description="Formule ou raison de l'absence de valeur")
+    recommended_dtype: str | None = None
+
+
+class BlockSize(Provenance):
+    # null = laissé au backend ; ne jamais forcer sans raison.
+    forced_by_backend: int | None = Field(default=None, gt=0)
+
+
+class Speculative(Provenance):
+    native_method: str | None
+    recommended_num_speculative_tokens: int | None = Field(default=None, gt=0)
+    fixed_k: bool = False
+
+
+class Serving(Provenance):
+    min_vllm_version: str | None = None
+    requires_custom_image: str | None = None
+
+
+class Model(_Strict):
+    id: str
+    display_name: str
+    hf_repo: str
+    hf_revision: str = Field(min_length=40, max_length=40)
+    verified_on: str
+    architecture: Architecture
+    weights: Weights
+    kv_cache: KvCache
+    block_size: BlockSize
+    speculative: Speculative
+    serving: Serving
+    notes: list[str] = []
+
+
+# --- vLLM version ----------------------------------------------------------
+
+class Behavior(Provenance):
+    value: Any
+
+
+class FlagSpec(_Strict):
+    cli: str = Field(pattern=r"^--[a-z0-9][a-z0-9-]*$")
+    kind: Literal["value", "bool_optional", "store_true", "json"]
+
+
+class ReleaseItem(_Strict):
+    id: str
+    text: str
+    status: Status
+
+
+class VllmVersion(_Strict):
+    version: str
+    release_date: str | None = None
+    source_tag: str
+    verified_on: str
+    defaults: dict[str, Behavior]
+    behaviors: dict[str, Behavior]
+    flags: dict[str, FlagSpec]
+    breaking_changes: list[ReleaseItem] = []
+    notes: list[ReleaseItem] = []
+
+
+class ExtractedVersion(BaseModel):
+    """Generated by tools/extract_vllm_flags.py."""
+
+    version: str
+    source: dict[str, Any]
+    cli_flags: list[str]
+    speculative_config_keys: list[str]
+    speculative_methods: list[str]
+    rejection_sample_methods: list[str]
+    draft_sample_methods: list[str]
+    compilation_config_keys: list[str]
+    architectures: list[str]

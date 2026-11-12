@@ -1,0 +1,152 @@
+# Catalogue vLLM 0.33.0 (édité à la main).
+# La liste exhaustive des flags et des clés JSON est dans extracted/0.33.0.yaml (générée).
+# status: verified = lu dans le code source au tag v0.33.0 ; unverified = 🔶 à vérifier.
+version: "0.33.0"
+release_date: "2026-11"
+source_tag: v0.33.0
+verified_on: "2026-11-12"
+
+# Valeurs par défaut utilisées par le moteur (pour l'affichage « défaut → choisi »).
+defaults:
+  gpu_memory_utilization:
+    value: 0.92
+    status: verified
+    source: vllm/config/cache.py (CacheConfig.gpu_memory_utilization)
+  max_num_seqs:
+    value: null
+    status: verified
+    source: vllm/engine/arg_utils.py (--max-num-seqs, default=None, résolu selon le contexte d'usage)
+    note: "Le défaut dépend du contexte d'usage et du matériel (EngineArgs.create_engine_config)."
+  max_num_batched_tokens:
+    value: null
+    status: verified
+    source: vllm/engine/arg_utils.py (--max-num-batched-tokens, default=None)
+    note: "Le défaut dépend du contexte d'usage et du matériel (EngineArgs.create_engine_config)."
+  long_prefill_token_threshold:
+    value: 0
+    status: verified
+    source: vllm/config/scheduler.py (SchedulerConfig.long_prefill_token_threshold, 0 = désactivé)
+  long_prefill_token_threshold_adaptive:
+    value: false
+    status: verified
+    source: vllm/config/scheduler.py (SchedulerConfig.long_prefill_token_threshold_adaptive)
+  enable_prefix_caching:
+    value: true
+    status: verified
+    source: vllm/config/cache.py (CacheConfig.enable_prefix_caching)
+  enable_chunked_prefill:
+    value: true
+    status: verified
+    source: vllm/config/scheduler.py (SchedulerConfig.enable_chunked_prefill)
+  kv_cache_dtype:
+    value: auto
+    status: verified
+    source: vllm/config/cache.py (CacheConfig.cache_dtype)
+  draft_sample_method:
+    value: greedy
+    status: verified
+    source: vllm/config/speculative.py (SpeculativeConfig.draft_sample_method)
+  rejection_sample_method:
+    value: standard
+    status: verified
+    source: vllm/config/speculative.py (SpeculativeConfig.rejection_sample_method)
+  enable_adaptive_verification:
+    value: false
+    status: verified
+    source: vllm/config/speculative.py (SpeculativeConfig.enable_adaptive_verification)
+
+behaviors:
+  long_prefill.single_request_bypass:
+    value: true
+    status: verified
+    source: "vllm/v1/core/sched/scheduler.py (schedule : seuil = 0 si running + waiting ≤ 1) ; PR #57951"
+    note: "Une requête seule n'est jamais plafonnée par --long-prefill-token-threshold."
+  long_prefill.adaptive_floor:
+    value: opt_in
+    status: verified
+    source: "vllm/v1/core/sched/scheduler.py : seuil_effectif = max(seuil, max_num_batched_tokens // (running + waiting)) si --long-prefill-token-threshold-adaptive ; PR #58459"
+    note: >-
+      Le plafond dynamique de #58459 n'est PAS actif par défaut : il faut --long-prefill-token-threshold-adaptive.
+      C'est un plancher (max), pas un plafond, et le diviseur compte toutes les requêtes running,
+      decode compris.
+  spec_decode.verification_tokens_in_budget:
+    value: true
+    status: verified
+    source: "vllm/v1/core/sched/scheduler.py (num_new_tokens = num_tokens_with_spec - num_computed_tokens) ; PR #59468 (« charged 6 tokens instead of 10 » pour K=5)"
+    note: "En decode, chaque séquence consomme 1 + k tokens du budget (tokens de vérification), quelle que soit la méthode."
+  spec_decode.extra_draft_slots:
+    # Slots supplémentaires réservés par requête dans le budget d'entrée, en plus de 1 + k.
+    value: {dspark: "0", dflash: "0", mtp: "0", eagle3: "0", eagle3_parallel: "k-1", draft_model: "1", pard: "k", ngram: "0"}
+    status: verified
+    source: "vllm/config/speculative.py (SpeculativeConfig.max_num_new_slots_for_drafting) ; PR #59468"
+  spec_decode.dspark_active_seq_cap:
+    value: true
+    status: verified
+    source: "vllm/config/vllm.py : max_num_active_seqs plafonné à max_num_batched_tokens // num_lookahead_tokens pour DSpark/DFlash ; PR #59468"
+    note: "num_lookahead_tokens vaut k (DSpark anchor-sampling) ou k + 1 (DFlash, DSpark fill-in). Le moteur retient k + 1, le cas le plus contraignant."
+  spec_decode.fly:
+    value: {available: true, default_enabled: false, min_k: 2, default_window: "min(6, k-1)", default_entropy_threshold: 0.3, default_entropy_top_k: 3}
+    status: verified
+    source: "vllm/config/speculative.py (rejection_sample_method='fly', validations FLy) ; PR #53987"
+  spec_decode.adaptive_verification:
+    value: {available: true, default: false, methods: [dspark]}
+    status: verified
+    source: "vllm/config/speculative.py (enable_adaptive_verification: « Currently only supported for method=dspark »)"
+  spec_decode.draft_lm_head_quantization:
+    value: {available: true, values: [fp8, nvfp4]}
+    status: verified
+    source: "vllm/config/speculative.py (draft_lm_head_quantization) ; PR #59973"
+  cudagraph.default_max_capture_size:
+    value: {blackwell_dc: 1024, other: 512, formula: "min(max_num_seqs × (k+1) × 2, plafond)"}
+    status: verified
+    source: "vllm/config/vllm.py (_set_cudagraph_sizes) ; vllm/config/compilation.py (max_cudagraph_capture_size)"
+  cudagraph.capped_by_max_num_batched_tokens:
+    value: true
+    status: verified
+    source: "vllm/config/vllm.py : max_cudagraph_capture_size = min(max_num_batched_tokens, max_cudagraph_capture_size)"
+  cudagraph.multiple_of_k_plus_1:
+    value: true
+    status: verified
+    source: "vllm/config/compilation.py (adjust_cudagraph_sizes_for_spec_decode)"
+    note: "Avec spec decoding, les tailles de capture sont arrondies à un multiple de k + 1."
+  frontend.rejects_unknown_flags:
+    value: true
+    status: verified
+    source: "Notes de version 0.33.0, PR #62431 (comportement du frontend Rust non relu dans le code)"
+    note: "Le frontend Rust renvoie une erreur sur un flag non supporté au lieu de l'ignorer."
+
+# Flags et clés JSON que le moteur peut émettre. Chaque nom est validé contre extracted/0.33.0.yaml.
+flags:
+  tensor_parallel_size: {cli: --tensor-parallel-size, kind: value}
+  data_parallel_size: {cli: --data-parallel-size, kind: value}
+  max_num_seqs: {cli: --max-num-seqs, kind: value}
+  max_num_batched_tokens: {cli: --max-num-batched-tokens, kind: value}
+  long_prefill_token_threshold: {cli: --long-prefill-token-threshold, kind: value}
+  long_prefill_token_threshold_adaptive: {cli: --long-prefill-token-threshold-adaptive, kind: bool_optional}
+  enable_chunked_prefill: {cli: --enable-chunked-prefill, kind: bool_optional}
+  enable_prefix_caching: {cli: --enable-prefix-caching, kind: bool_optional}
+  kv_cache_dtype: {cli: --kv-cache-dtype, kind: value}
+  gpu_memory_utilization: {cli: --gpu-memory-utilization, kind: value}
+  block_size: {cli: --block-size, kind: value}
+  max_model_len: {cli: --max-model-len, kind: value}
+  kv_offloading_size: {cli: --kv-offloading-size, kind: value}
+  kv_offloading_backend: {cli: --kv-offloading-backend, kind: value}
+  speculative_config: {cli: --speculative-config, kind: json}
+  compilation_config: {cli: --compilation-config, kind: json}
+
+breaking_changes:
+  - {id: "#62575", text: "Wheels et images en CUDA 13.0 uniquement.", status: verified}
+  - {id: "#61032", text: "NIXL ≥ 1.5 requis.", status: verified}
+  - {id: "#62431", text: "Le frontend Rust renvoie une erreur sur les flags `vllm serve` non supportés au lieu de les ignorer.", status: verified}
+  - {id: "#63060", text: "`tools: []` vide → HTTP 400.", status: verified}
+  - {id: "#62673", text: "Les chat templates envoyés côté requête exigent `--trust-request-chat-template`.", status: verified}
+  - {id: "#51488", text: "HTTP 503 quand la génération est en pause.", status: verified}
+  - {id: "#61701", text: "Speculators Medusa et MLP supprimés.", status: verified}
+  - {id: "deprecations", text: "`--mamba-cache-mode` déprécié ; LM Format Enforcer déprécié (opt-in en 0.34, supprimé en 0.35).", status: verified}
+
+notes:
+  - {id: "#59468", text: "DSpark/DFlash ne réservent plus de slots de drafting supplémentaires ; les 1 + k tokens de vérification restent comptés.", status: verified}
+  - {id: "#54448", text: "Raffineur XPress pour les drafts DSpark/DFlash.", status: verified}
+  - {id: "#61589", text: "Lookahead block hashes activés par défaut pour les hits de prefix cache EAGLE/MTP.", status: verified}
+  - {id: "#59857", text: "PCP + prefix caching combinables sur DeepSeek-V4.1.", status: verified}
+  - {id: "#55866", text: "FA4 sparse MLA decode activé par défaut sur Blackwell.", status: verified}

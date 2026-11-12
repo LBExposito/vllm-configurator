@@ -1,0 +1,37 @@
+id: b300
+display_name: NVIDIA B300 (Blackwell Ultra, HGX)
+vendor: nvidia
+generation: blackwell_ultra
+# vLLM applique le plafond de capture CUDA graphs « Blackwell datacenter » (1024) à toute la famille
+# de compute capability 10.x : is_device_capability_family(100) dans vllm/config/vllm.py.
+cudagraph_family: blackwell_dc
+verified_on: "2026-11-12"
+
+compute_capability:
+  value: "10.3"
+  status: unverified
+  source: "Non relu dans une source primaire (https://developer.nvidia.com/cuda-gpus à consulter)"
+  note: "Seule la famille 10.x compte pour vLLM ; la valeur exacte n'influe pas sur le moteur."
+
+memory:
+  hbm_gb: 288
+  hbm_type: HBM3e
+  status: unverified
+  source:
+    - "https://www.theregister.com/2025/03/18/nvidia_blackwell_ultra/ (288 Go de HBM3e par GPU Blackwell Ultra)"
+    - "https://www.nvidia.com/en-us/data-center/hgx/ (HGX B300 : « Total Memory 2.1 TB » pour 8 GPU)"
+  note: >-
+    NVIDIA ne publie pas la valeur par GPU sur la page HGX ; 8 × 288 Go = 2 304 Go ≈ 2,1 Tio, ce qui est cohérent.
+    La mémoire visible par CUDA est un peu inférieure à la capacité nominale.
+
+bandwidth:
+  hbm_tb_s: 8
+  nvlink_gpu_to_gpu_tb_s: 1.8
+  status: unverified
+  source:
+    - "https://www.nvidia.com/en-us/data-center/hgx/ (NVLink GPU-to-GPU 1.8 TB/s, vérifié)"
+    - "https://www.cudocompute.com/products/nvidia-b300 (HBM ~8 TB/s, source secondaire)"
+  note: "NVLink confirmé par NVIDIA ; bande passante HBM uniquement par des sources secondaires."
+
+notes:
+  - "Le moteur n'utilise la HBM que pour estimer le KV cache en l'absence de logs de démarrage."
