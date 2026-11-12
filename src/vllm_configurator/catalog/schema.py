@@ -41,6 +41,15 @@ class GpuComputeCapability(Provenance):
     value: str
 
 
+ComputeDtype = Literal["fp4", "fp8", "bf16"]
+
+
+class GpuCompute(Provenance):
+    """Dense tensor-core peak per GPU, in TFLOPS (no sparsity)."""
+
+    dense_tflops: dict[ComputeDtype, float]
+
+
 class Gpu(_Strict):
     id: str
     display_name: str
@@ -51,6 +60,8 @@ class Gpu(_Strict):
     compute_capability: GpuComputeCapability
     memory: GpuMemory
     bandwidth: GpuBandwidth | None = None
+    # Utilisé seulement par le modèle de latence de l'analyse SLO (roofline).
+    compute: GpuCompute | None = None
     verified_on: str
     notes: list[str] = []
 
@@ -116,6 +127,24 @@ class Speculative(Provenance):
     fixed_k: bool = False
 
 
+class ModelPerformance(Provenance):
+    """Inputs of the roofline latency model used by the SLO analysis (analysis.py)."""
+
+    method: str = Field(description="Comment les valeurs ont été obtenues")
+
+    # Paramètres activés par token (FLOPs ≈ 2 × paramètres activés), hors tables de lookup (engram, n-gram).
+    active_params_per_output_token: float = Field(gt=0)
+    active_params_per_prompt_token: float | None = Field(default=None, gt=0)
+    # MoE : taille des experts routés, pour estimer les octets de poids lus par step selon le nombre de tokens.
+    moe_layers: int | None = Field(default=None, gt=0)
+    moe_intermediate_size: int | None = Field(default=None, gt=0)
+    routed_expert_bytes_per_param: float | None = Field(default=None, gt=0)
+    # Octets par paramètre des poids non routés (attention, expert partagé, couches denses, lm_head).
+    dense_bytes_per_param: float = Field(gt=0)
+    # Type des tensor cores utilisés par les GEMM (débit crête du GPU pris pour ce type).
+    compute_dtype: ComputeDtype
+
+
 class Serving(Provenance):
     min_vllm_version: str | None = None
     requires_custom_image: str | None = None
@@ -133,7 +162,16 @@ class Model(_Strict):
     block_size: BlockSize
     speculative: Speculative
     serving: Serving
+    performance: ModelPerformance | None = None
     notes: list[str] = []
+
+    @model_validator(mode="after")
+    def _performance_moe(self) -> "Model":
+        perf = self.performance
+        if perf is not None and self.architecture.moe is not None:
+            if None in (perf.moe_layers, perf.moe_intermediate_size, perf.routed_expert_bytes_per_param):
+                raise ValueError("performance d'un MoE : moe_layers, moe_intermediate_size et routed_expert_bytes_per_param requis")
+        return self
 
 
 # --- vLLM version ----------------------------------------------------------

@@ -77,6 +77,20 @@ serving:
   requires_custom_image: null
   note: "« Stable ≥0.30.0 runs the model, but this recipe is tuned and verified on nightly »."
 
+
+performance:
+  status: verified
+  source:
+    - "https://huggingface.co/Qwen/Qwen3.8-Flash-Next (model card à la révision épinglée : « 125B with 6B activated, plus 51B n-gram embedding and 4B MTP »)"
+    - "config.json à la révision épinglée (moe_intermediate_size 640, num_experts 512, 10 actifs)"
+  method: "Experts routés : 48 × 512 × 3 × 2560 × 640 ≈ 120,8 G paramètres, en BF16 (2 o par paramètre). Les tables n-gram sont des lookups, exclues."
+  active_params_per_output_token: 6.0e9
+  moe_layers: 48
+  moe_intermediate_size: 640
+  routed_expert_bytes_per_param: 2.0
+  dense_bytes_per_param: 2.0
+  compute_dtype: bf16
+
 notes:
   - "Recette vLLM : sur 4× GB300, TEP4 (--enable-expert-parallel) est recommandé ; l'expert parallelism est « consistently faster » que TP4 seul."
   - "Recette vLLM : --attention-config.indexer_kv_dtype fp8 en plus de --kv-cache-dtype fp8."

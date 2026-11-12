@@ -28,6 +28,7 @@ version à l'autre. L'app applique ces règles de façon reproductible et montre
 | Modèle et version | Modèle du catalogue, version de vLLM |
 | Profil de charge | Type d'usage (chat, agentique, RAG, extraction, résumé, scoring, batch), mode interactif ou batch, ISL et OSL en P50 / P95 / P99, taux de prefix cache hit attendu, concurrence cible |
 | SLO | TTFT p95 et ITL p95 cibles (optionnels) |
+| Mesures en production (optionnel) | ITL p95 et TTFT p95 mesurés avec la config générée : ils priment sur l'estimation, et l'ITL recalibre le modèle de latence |
 | Speculative decoding | Activation, `k`, méthode d'échantillonnage du draft, longueur d'acceptation mesurée, tolérance à une vérification lossy (FLy) |
 | Logs de démarrage (optionnel) | `GPU KV cache size`, taille de bloc et `gpu-memory-utilization` lus dans les logs d'une instance |
 
@@ -45,6 +46,10 @@ l'app la demande explicitement si elle est indispensable.
 - **Des indicateurs calculés** : ratio ISL_eff/OSL réel comparé au ratio nécessaire pour remplir le budget,
   contextes que le KV peut loger aux P50/P95/P99, tokens consommés par step de decode, tokens par expert MoE,
   plafond de séquences imposé par vLLM avec DSpark.
+- **L'interprétation SLO** : un verdict (✅ OK, ⚠️ à risque, 🛑 KO), le goulot d'étranglement (prefill, KV cache,
+  places de séquence, decode, interférence du prefill sur le decode, plancher d'ITL) et les corrections chiffrées :
+  réglage de paramètres à capacité constante, nombre d'instances à ajouter, passage à un TP plus large, ou piste
+  d'architecture (prefix cache, désagrégation P/D, DP-attention…). Voir [l'interprétation SLO](#linterprétation-slo).
 - **Les hypothèses** retenues quand une entrée manque.
 - **La vérification** : une commande pour contrôler que chaque flag existe sur l'image déployée, et la liste des
   métriques Prometheus à surveiller.
@@ -62,8 +67,9 @@ l'app la demande explicitement si elle est indispensable.
 
 ### Limites
 
-- L'app ne mesure rien : elle applique des règles. TTFT et ITL ne sont pas prédits ; elle indique quoi surveiller
-  et comment corriger si une cible est dépassée.
+- L'app ne mesure rien : elle applique des règles. L'ITL et le TTFT de l'interprétation SLO sont des **ordres de
+  grandeur** issus d'un modèle roofline dont les rendements sont supposés (🔶). Saisissez l'ITL p95 mesurée après
+  déploiement pour recaler le modèle.
 - Sans logs de démarrage, la taille du KV est une estimation grossière (borne haute) : relancez le calcul avec la
   valeur réelle après le premier déploiement.
 - La configuration de llm-d (EPP) n'est pas encore générée. Elle est prévue pour une v2, qui réutilisera la taille
@@ -167,7 +173,8 @@ Remplissez la barre latérale de haut en bas. Les résultats se recalculent à c
 | **Matériel** | « GPU par instance » est le tensor parallel d'un pod ; « Instances » est le nombre de pods indépendants. |
 | **Modèle et version** | Choisissez la version de vLLM réellement déployée : plusieurs règles en dépendent. |
 | **Profil de charge** | Mesurez ISL et OSL **par appel au modèle**, pas par tour de conversation ni par session. Laissez le hit rate vide si vous ne l'avez pas mesuré : l'app prend la valeur publiée pour votre type d'usage et l'affiche dans « Hypothèses ». La concurrence cible est un total sur toutes les instances. |
-| **SLO** | Optionnels. Ils n'entrent pas dans le calcul, mais ajoutent des consignes de surveillance. |
+| **SLO** | Optionnels. Ils ne changent pas la config générée ; ils alimentent l'interprétation SLO (verdict, goulot, correction). Renseignez aussi la concurrence cible : sans elle, l'analyse suppose des instances pleines et ne peut pas chiffrer les GPU à ajouter. |
+| **Mesures en production** | ITL p95 et TTFT p95 relevés avec la config générée. La mesure tranche le verdict ; l'ITL recalibre toutes les durées estimées. |
 | **Speculative decoding** | Laissez `k` vide pour utiliser la valeur recommandée pour le modèle. Ne cochez « Tolérer une vérification lossy » qu'en A/B : FLy peut modifier les sorties, ce qui est risqué pour les tool calls. |
 | **Logs de démarrage** | Si une instance tourne déjà, recopiez `GPU KV cache size: N tokens`, la taille de bloc (`Setting kv cache block size to N`) et la `gpu-memory-utilization` utilisée. C'est la donnée qui fiabilise le plus la configuration. |
 | **Avancé** | Forcer `gpu-memory-utilization`, ou indiquer une réserve mémoire par GPU pour affiner l'estimation du KV sans logs. |
@@ -180,6 +187,7 @@ avertissements critiques s'affichent juste en dessous.
 | Onglet | Contenu |
 |---|---|
 | **Configuration** | Bloc `args:` (téléchargeable en `vllm-args.yaml`) et commande `vllm serve`. |
+| **Interprétation SLO** | Verdict, contrôles (KV, charge de prefill, places, ITL, TTFT), goulots, recommandations avec les flags à changer, décomposition du step. |
 | **Justifications** | Une fiche par paramètre : valeur, émis ou non, règle, formule, calcul, défaut de vLLM, sources, statut. |
 | **Avertissements** | Classés en critique / avertissement / info. Les points 🔶 « À vérifier » viennent de données non confirmées. |
 | **Indicateurs** | Valeurs calculées et leur lecture. Le plus utile : le ratio ISL_eff/OSL réel comparé au ratio nécessaire pour remplir le budget de tokens. |
@@ -209,6 +217,43 @@ change donc avec la nouvelle configuration.
    de 1536).
 4. Mesurez la longueur d'acceptation `a = 1 + spec_decode_num_accepted_tokens / spec_decode_num_drafts` et
    saisissez-la : elle remplace l'hypothèse a = 3.
+
+### L'interprétation SLO
+
+L'analyse (`src/vllm_configurator/analysis.py`) évalue le point de fonctionnement de la config générée, puis cherche
+comment le corriger.
+
+**Contrôles de capacité**, sans modèle matériel :
+
+| Contrôle | Calcul | Seuil |
+|---|---|---|
+| Occupation du KV | S × (ISL P50 + OSL P50 / 2) / KV par instance | 90 % (au-delà : préemptions) |
+| Charge de prefill du budget | prefill non caché demandé par step (S·a/OSL × ISL_eff) / (B − S·d), en régime stable (§3.1) | 80 % (au-delà : file d'attente avant prefill) |
+| Places de séquence | concurrence cible par instance vs `max-num-seqs` | file d'attente comptée dans le TTFT |
+
+**Latences**, par un modèle roofline d'un step du scheduler (`src/vllm_configurator/perf.py`) : le step dure le maximum
+entre la lecture mémoire (poids non routés, experts MoE touchés par au moins un token, KV des séquences en decode)
+et le calcul (2 × paramètres activés par token), plus un surcoût fixe par couche. L'**ITL p95** est la durée d'un
+step chargé en prefill ; le **TTFT p95** additionne l'attente d'une place, l'attente du prefill (file M/D/1) et le
+prefill du prompt P95 non caché, découpé selon le seuil de long prefill. Une reprise à froid (ISL P95 sans cache)
+est affichée hors verdict.
+
+**Verdict.** Une estimation sous 85 % de la cible est ✅, entre 85 et 115 % ⚠️, au-delà 🛑. Une mesure fournie est
+comparée strictement à la cible.
+
+**Corrections**, dans l'ordre affiché :
+
+1. Le réglage de `--max-num-seqs`, `--max-num-batched-tokens` et `--long-prefill-token-threshold` qui tient tous les
+   contrôles avec le moins de changements, à capacité GPU constante (la capture des CUDA graphs suit).
+2. Le nombre minimal d'instances (avec leur réglage) si la concurrence cible est fournie.
+3. Le passage à un TP deux fois plus large (jusqu'à 8), quand il coûte moins de GPU : c'est le levier quand l'ITL
+   est bornée par la lecture des poids, ce qui est fréquent avec les MoE.
+4. Les pistes propres au goulot : `gpu-memory-utilization`, DP-attention, offload du KV, prefix cache hit rate,
+   désagrégation prefill/decode, PCP.
+
+Les rendements du modèle (`perf_hbm_efficiency`, `perf_mfu`, `perf_overhead_per_layer_ms`) et les seuils sont des
+heuristiques de `catalog/workload_profiles.yaml`, toutes 🔶. Le modèle exige le bloc `performance` de la fiche
+modèle et les blocs `bandwidth` et `compute` de la fiche GPU ; sans eux, seuls les contrôles de capacité sont faits.
 
 ### 9. Dépannage
 
@@ -248,6 +293,8 @@ catalog/                    Données versionnées (YAML), séparées de la logiq
 src/vllm_configurator/
   catalog/                  Schémas pydantic et chargement + validation croisée
   formulas.py               Formules de la §3, fonctions pures
+  perf.py                   Modèle roofline d'un step du scheduler (latence)
+  analysis.py               Interprétation SLO : verdict, goulot, recherche de la correction
   rules/                    Règles : une fonction pure (RuleContext, state) -> RuleOutput par décision
   engine.py                 Exécute le pipeline de règles, produit un GenerationResult
   render.py                 YAML `args` (KServe/K8s), ligne de commande, commande de vérification
@@ -286,7 +333,9 @@ celle des modèles. À la main :
    diviser, mais marquer `status: unverified` et expliquer le recoupement dans `note`.
 3. `cudagraph_family` : `blackwell_dc` pour une compute capability 10.x, sinon `other`. C'est la seule
    information que vLLM utilise pour le plafond de capture des CUDA graphs.
-4. Valider (voir plus bas).
+4. `bandwidth.hbm_tb_s` et `compute.dense_tflops` (fp4, fp8, bf16, valeurs **denses** par GPU) : facultatifs, ils
+   servent au modèle de latence de l'interprétation SLO.
+5. Valider (voir plus bas).
 
 La HBM ne sert qu'à estimer le KV quand les logs de démarrage ne sont pas fournis.
 
@@ -305,6 +354,8 @@ La HBM ne sert qu'à estimer le KV quand les logs de démarrage ne sont pas four
      voulu. Une formule standard (GQA, MLA simple) se met dans `method`, avec `status: unverified`.
    - `block_size.forced_by_backend` : seulement d'après un log réel ou une consigne explicite de la recette.
    - `speculative.native_method` doit figurer dans `speculative_methods` du fichier `extracted` de la version visée.
+   - `performance` (facultatif, pour l'interprétation SLO) : paramètres activés par token d'après la model card ou
+     la recette, taille des experts routés d'après `config.json`, octets par paramètre selon la quantization.
 4. Valider.
 
 Le détail champ par champ est dans `.claude/skills/vllm-configurator-catalog/references/fields.md`.

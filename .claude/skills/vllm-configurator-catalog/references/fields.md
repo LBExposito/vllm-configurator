@@ -18,6 +18,7 @@ Le schéma `src/vllm_configurator/catalog/schema.py` fait foi ; ce guide expliqu
 | `block_size.forced_by_backend` | Logs de démarrage ou recette (NVIDIA) | `null` par défaut. |
 | `speculative.*` | `config.json` (champs `mtp*`, `dspark_*`, `num_nextn_predict_layers`), README, recette | `fixed_k: true` si le checkpoint impose la profondeur du draft. |
 | `serving.*` | Recette vLLM | `requires_custom_image` si aucune release ne prend le modèle en charge. |
+| `performance.*` | Model card ou recette (paramètres activés), `config.json` (`moe_intermediate_size`, `first_k_dense_replace`) | Facultatif ; sans lui, l'analyse SLO ne fait que les contrôles de capacité. `moe_layers` = couches − couches denses. Octets par paramètre selon la quantization des experts (MXFP4 ≈ 0,53 avec les échelles) et du reste. Les tables de lookup (engram, n-gram) ne comptent pas dans les paramètres activés. `method` explique le calcul. |
 
 ### Formules KV standard (uniquement sans champ exotique)
 
@@ -44,3 +45,4 @@ leur présence, `bytes_per_token: null`, sauf chiffre explicite d'une source cit
 | `compute_capability` | `https://developer.nvidia.com/cuda-gpus` | `unverified` si la valeur ne vient pas de cette page. |
 | `memory.hbm_gb` | Fiche technique, en Go décimaux | Les sources secondaires et les totaux divisés restent `unverified`. |
 | `bandwidth.*` | Fiche technique | Champs facultatifs. Un bloc qui mélange des valeurs confirmées et non confirmées est `unverified`, avec une `note`. |
+| `compute.dense_tflops` | Fiche technique, valeurs **denses** par GPU (fp4, fp8, bf16) | Facultatif, utilisé par l'analyse SLO. Diviser un total système par le nombre de GPU et une valeur sparse par 2, en le disant dans `source`. |

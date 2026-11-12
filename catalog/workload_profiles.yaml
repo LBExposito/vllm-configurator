@@ -113,6 +113,34 @@ heuristics:
     status: unverified
     source: "Choix de l'app : P99/P95 > 5 signale une queue à expliquer (mesure par appel ou cumul par tour, §6)"
 
+  # --- Analyse SLO (modèle de latence roofline, src/vllm_configurator/perf.py) ---
+  perf_hbm_efficiency:
+    value: 0.7
+    status: unverified
+    source: "Choix de l'app : fraction de la bande passante HBM nominale atteinte par les GEMM et l'attention en decode"
+    note: "Ordre de grandeur. Saisir l'ITL p95 mesurée recalibre tout le modèle."
+  perf_mfu:
+    value: 0.4
+    status: unverified
+    source: "Choix de l'app : fraction du débit crête dense des tensor cores atteinte sur un step chargé en prefill"
+  perf_overhead_per_layer_ms:
+    value: 0.1
+    status: unverified
+    source: "Choix de l'app : coût fixe par couche et par step (lancements de kernels, all-reduce TP, scheduler)"
+    note: "Domine à faible concurrence : c'est lui qui fixe le plancher d'ITL d'une séquence seule."
+  slo_margin:
+    value: {ok_below: 0.85, ko_above: 1.15}
+    status: unverified
+    source: "Choix de l'app : une estimation à ±15 % de la cible est classée « à risque », faute de précision du modèle"
+  prefill_load_max:
+    value: 0.8
+    status: unverified
+    source: "Choix de l'app : au-delà de 80 % de charge du budget de prefill, l'attente avant prefill explose (file M/D/1)"
+  kv_usage_max:
+    value: 0.9
+    status: unverified
+    source: "Choix de l'app : au-delà de 90 % d'occupation moyenne du KV, les pointes provoquent des préemptions"
+
 metrics:
   - name: "vllm:iteration_tokens_total"
     usage: "Histogramme des tokens par step : le budget est-il rempli ?"

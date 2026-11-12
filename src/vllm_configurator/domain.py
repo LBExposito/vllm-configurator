@@ -62,6 +62,13 @@ class ObservedKv(_Frozen):
     block_size: int | None = Field(default=None, gt=0, description="« Setting kv cache block size to N »")
 
 
+class ObservedPerf(_Frozen):
+    """Latencies measured in production with the generated configuration (Prometheus)."""
+
+    itl_p95_ms: float | None = Field(default=None, gt=0)
+    ttft_p95_ms: float | None = Field(default=None, gt=0)
+
+
 class DeploymentRequest(_Frozen):
     gpu_id: str
     gpus_per_instance: int = Field(gt=0)
@@ -73,6 +80,7 @@ class DeploymentRequest(_Frozen):
     allow_lossy: bool = False
     spec: SpecOptions = SpecOptions()
     observed_kv: ObservedKv | None = None
+    observed_perf: ObservedPerf | None = None
     gpu_memory_utilization: float | None = Field(default=None, gt=0, le=1)
     # Réserve par GPU (activations, CUDA graphs, drafter) pour l'estimation du KV sans logs.
     kv_estimate_reserve_gib_per_gpu: float | None = Field(default=None, ge=0)
@@ -147,6 +155,51 @@ class DeploymentFacts(_Frozen):
     gpu_memory_utilization: float | None
 
 
+CheckStatus = Literal["ok", "at_risk", "ko", "unknown"]
+
+
+class SloCheck(_Frozen):
+    key: str
+    label: str
+    status: CheckStatus
+    target: float | None = None
+    estimate: float | None = None
+    measured: float | None = None
+    unit: str | None = None
+    detail: str
+    # False : affiché, mais n'entre pas dans le verdict global (cas pire, information).
+    in_verdict: bool = True
+
+
+class Bottleneck(_Frozen):
+    key: str
+    label: str
+    status: CheckStatus
+    explanation: str
+
+
+class Recommendation(_Frozen):
+    kind: Literal["none", "param", "capacity", "architecture", "measure"]
+    title: str
+    rationale: str
+    # Flag CLI → nouvelle valeur, quand la reco est un réglage.
+    changes: dict[str, Any] = {}
+    addresses: list[str] = []
+
+
+class SloAnalysis(_Frozen):
+    verdict: CheckStatus
+    summary: str
+    checks: list[SloCheck]
+    bottlenecks: list[Bottleneck]
+    recommendations: list[Recommendation]
+    # Décomposition du step au point de fonctionnement (ms), si le modèle de latence est disponible.
+    step_breakdown: dict[str, Any] | None = None
+    calibration: float | None = None
+    notes: list[str] = []
+    confidence: Status = "unverified"
+
+
 class GenerationResult(_Frozen):
     request: DeploymentRequest
     decisions: list[Decision]
@@ -154,6 +207,7 @@ class GenerationResult(_Frozen):
     indicators: list[Indicator]
     assumptions: list[Assumption]
     facts: DeploymentFacts
+    analysis: SloAnalysis | None = None
     blocking_errors: list[str] = []
 
     def decision(self, key: str) -> Decision:

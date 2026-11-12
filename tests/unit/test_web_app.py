@@ -20,3 +20,12 @@ def test_reference_case_renders_the_config():
     yaml_block = next(code.value for code in at.code if code.value.startswith("args:"))
     assert '- "512"' in yaml_block and '{"max_cudagraph_capture_size":2048}' in yaml_block
     assert not [w for w in at.warning if "Session State" in w.value]
+
+
+def test_reference_case_shows_the_slo_interpretation():
+    at = AppTest.from_file(APP, default_timeout=30).run()
+    at.sidebar.button[0].click().run()
+    at.number_input(key="itl").set_value(10.0).run()
+    assert not at.exception
+    assert any("Interprétation SLO" in e.value for e in at.error)
+    assert any("Goulots" in h.value for h in at.subheader)

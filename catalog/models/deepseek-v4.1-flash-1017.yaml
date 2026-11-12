@@ -79,6 +79,24 @@ serving:
   requires_custom_image: null
   note: "Architecture livrée en 0.30.0 ; la 0.31.0 apporte le correctif d'offload KV."
 
+
+performance:
+  status: verified
+  source:
+    - "https://recipes.vllm.ai/deepseek-ai/DeepSeek-V4.1-Flash-1017 (« 8B active per prompt token, 16B per output token » ; experts MXFP4, attention et projections FP8)"
+    - https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash-1017/blob/08c8657f02291e11b6f6b63e0e16014f8e748518/config.json
+  method: >-
+    Experts routés : 40 couches × 384 × 3 × 5120 × 2304 ≈ 543,6 G paramètres (la recette donne 557,2 G avec ceux du
+    drafter DSpark). MXFP4 : 0,5 o par paramètre + 1 échelle UE8M0 par bloc de 32, soit ~0,53 o. Les tables engram
+    (196,6 G entrées) sont des lookups : elles ne sont pas relues à chaque step et sont exclues.
+  active_params_per_output_token: 16.0e9
+  active_params_per_prompt_token: 8.0e9
+  moe_layers: 40
+  moe_intermediate_size: 2304
+  routed_expert_bytes_per_param: 0.53
+  dense_bytes_per_param: 1.0
+  compute_dtype: fp8
+
 notes:
   - "Recette vLLM : la validation B300 a porté sur le checkpoint 0909, pas sur 1017."
   - "Recette vLLM : --kv-cache-dtype fp8 sur Blackwell ; préréglage B300 avec --max-cudagraph-capture-size 8190, --max-num-batched-tokens 8192 et --max-num-seqs 256 (k = 5)."

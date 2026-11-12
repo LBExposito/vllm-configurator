@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from .analysis import analyze
 from .catalog import Catalog, default_catalog
 from .domain import DeploymentFacts, DeploymentRequest, GenerationError, GenerationResult
 from .rules import PIPELINE, RuleContext, RuleOutput
@@ -76,7 +77,9 @@ def generate(request: DeploymentRequest, catalog: Catalog | None = None) -> Gene
         max_num_seqs=s.get("max_num_seqs"), max_num_batched_tokens=s.get("max_num_batched_tokens"),
         num_speculative_tokens=s.get("num_speculative_tokens", 0), gpu_memory_utilization=s.get("gpu_memory_utilization"),
     )
+    blocking = list(s.get("blocking", []))
     return GenerationResult(
         request=request, decisions=decisions, warnings=warnings, indicators=out.indicators,
-        assumptions=out.assumptions, facts=facts, blocking_errors=list(s.get("blocking", [])),
+        assumptions=out.assumptions, facts=facts, analysis=None if blocking else analyze(ctx, s),
+        blocking_errors=blocking,
     )

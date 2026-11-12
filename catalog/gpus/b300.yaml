@@ -33,5 +33,13 @@ bandwidth:
     - "https://www.cudocompute.com/products/nvidia-b300 (HBM ~8 TB/s, source secondaire)"
   note: "NVLink confirmé par NVIDIA ; bande passante HBM uniquement par des sources secondaires."
 
+
+compute:
+  # Crête dense par GPU, en TFLOPS : tableau HGX B300 (8 GPU) divisé par 8.
+  dense_tflops: {fp4: 13500, fp8: 4500, bf16: 2250}
+  status: verified
+  source: "https://www.nvidia.com/en-us/data-center/hgx/ (HGX B300 : FP4 « 144 PFLOPS | 108 PFLOPS » sparse | dense ; FP8/FP6 72 PFLOPS et FP16/BF16 36 PFLOPS en sparse, « Dense is ½ sparse spec shown »)"
+  note: "Utilisé seulement par le modèle de latence de l'analyse SLO. Crêtes théoriques : le modèle applique un rendement (heuristique perf_mfu)."
+
 notes:
   - "Le moteur n'utilise la HBM que pour estimer le KV cache en l'absence de logs de démarrage."

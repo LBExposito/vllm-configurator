@@ -106,6 +106,7 @@ def decide_long_prefill(ctx: RuleContext, state: dict[str, Any]) -> RuleOutput:
     bypass = ctx.behavior("long_prefill.single_request_bypass")
     adaptive = ctx.behavior("long_prefill.adaptive_floor")
     threshold = budget // divisor.value
+    out.state["long_prefill_token_threshold"] = threshold
 
     justification = (
         f"Équité entre un gros prefill (reprise de session) et les petits tours : jusqu'à ~{divisor.value} prefills"

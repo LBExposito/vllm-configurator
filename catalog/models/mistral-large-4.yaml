@@ -74,6 +74,20 @@ serving:
     « No vLLM release or nightly wheel includes Mistral Large 4 support yet » (recette). L'architecture
     MistralLarge4ForConditionalGeneration est absente du registre de vLLM 0.31.0, 0.32.0 et 0.33.0.
 
+
+performance:
+  status: verified
+  source:
+    - "https://huggingface.co/mistralai/Mistral-Large-4-1T-A52B (model card à la révision épinglée : « 49 billion active parameters per token (52 billion including embeddings and output layers) »)"
+    - "config.json à la révision épinglée (moe_intermediate_size 6144, first_k_dense_replace 1)"
+  method: "Experts routés : (72 − 1) × 128 × 3 × 6144 × 6144 ≈ 1 029 G paramètres, checkpoint FP8 (1 o par paramètre). Le checkpoint NVFP4 séparé diviserait environ par 2 les octets lus."
+  active_params_per_output_token: 52.0e9
+  moe_layers: 71
+  moe_intermediate_size: 6144
+  routed_expert_bytes_per_param: 1.0
+  dense_bytes_per_param: 1.0
+  compute_dtype: fp8
+
 notes:
   - "Recette vLLM : --tokenizer-mode mistral --config-format mistral --load-format mistral, --tool-call-parser mistral, --reasoning-parser mistral."
   - "Recette vLLM : le KV cache latent est en fp8_ds_mla par défaut sur NVIDIA ; aucun flag d'attention ou de KV cache n'est nécessaire."

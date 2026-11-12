@@ -78,6 +78,20 @@ serving:
     La recette affiche « vLLM 0.29.0+ » mais exige aussi une image avec le support natif de GLM5Next (#62424) et le
     binaire du frontend Rust correspondant. Présence de #62424 dans la 0.33.0 non vérifiée.
 
+
+performance:
+  status: verified
+  source:
+    - "https://huggingface.co/zai-org/GLM-5.3-Flash (model card à la révision épinglée : « 320B total parameters and just 18B active parameters »)"
+    - "config.json à la révision épinglée (moe_intermediate_size 2048, first_k_dense_replace 3)"
+  method: "Experts routés : (45 − 3 couches denses) × 288 × 3 × 4096 × 2048 ≈ 304 G paramètres, en FP8 (1 o par paramètre)."
+  active_params_per_output_token: 18.0e9
+  moe_layers: 42
+  moe_intermediate_size: 2048
+  routed_expert_bytes_per_param: 1.0
+  dense_bytes_per_param: 1.0
+  compute_dtype: fp8
+
 notes:
   - "Recette vLLM : --tokenizer-mode glm5_next, --tool-call-parser glm47, --reasoning-parser glm47."
   - "Recette vLLM : FlashInfer ≥ 0.6.17 requis pour la MLA sparse sans RoPE (la page cite aussi 0.6.18)."
