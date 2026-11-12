@@ -8,7 +8,7 @@ from pathlib import Path
 
 import yaml
 
-from .schema import ExtractedVersion, Gpu, Model, VllmVersion
+from .schema import ExtractedVersion, Gpu, Model, VllmVersion, WorkloadCatalog
 
 DEFAULT_ROOT = Path(__file__).resolve().parents[3] / "catalog"
 
@@ -28,6 +28,7 @@ class Catalog:
     models: dict[str, Model]
     vllm_versions: dict[str, VllmVersion]
     extracted: dict[str, ExtractedVersion]
+    workload: WorkloadCatalog
 
     def sorted_versions(self) -> list[str]:
         return sorted(self.vllm_versions, key=version_key)
@@ -64,7 +65,8 @@ def load_catalog(root: Path = DEFAULT_ROOT) -> Catalog:
     models = {p.stem: Model(**_load_yaml(p)) for p in sorted((root / "models").glob("*.yaml"))}
     versions = {p.stem: VllmVersion(**_load_yaml(p)) for p in sorted((root / "vllm").glob("*.yaml"))}
     extracted = {p.stem: ExtractedVersion(**_load_yaml(p)) for p in sorted((root / "vllm" / "extracted").glob("*.yaml"))}
-    return Catalog(gpus=gpus, models=models, vllm_versions=versions, extracted=extracted)
+    workload = WorkloadCatalog(**_load_yaml(root / "workload_profiles.yaml"))
+    return Catalog(gpus=gpus, models=models, vllm_versions=versions, extracted=extracted, workload=workload)
 
 
 @lru_cache(maxsize=1)

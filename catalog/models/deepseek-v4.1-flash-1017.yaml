@@ -48,6 +48,8 @@ kv_cache:
     (compression par couche, KV partagé entre couches, indexeur, engram). Réplication sur les rangs TP déduite
     d'une seule tête KV. Préférer la valeur « GPU KV cache size » des logs de démarrage.
   recommended_dtype: fp8
+  recommended_dtype_status: verified
+  recommended_dtype_source: "https://recipes.vllm.ai/deepseek-ai/DeepSeek-V4.1-Flash-1017 (« --kv-cache-dtype fp8 » sur Blackwell) ; base de connaissances §5 (disposition fp8_ds_mla)"
 
 block_size:
   status: verified

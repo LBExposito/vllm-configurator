@@ -100,6 +100,9 @@ class KvCache(Provenance):
     per_sequence_state_bytes: float | None = Field(default=None, ge=0)
     method: str = Field(description="Formule ou raison de l'absence de valeur")
     recommended_dtype: str | None = None
+    # Provenance propre au dtype recommandé (souvent une recette vLLM), distincte de celle de bytes_per_token.
+    recommended_dtype_status: Status = "unverified"
+    recommended_dtype_source: str | None = None
 
 
 class BlockSize(Provenance):
@@ -160,6 +163,47 @@ class VllmVersion(_Strict):
     flags: dict[str, FlagSpec]
     breaking_changes: list[ReleaseItem] = []
     notes: list[ReleaseItem] = []
+
+
+# --- Workload profiles, heuristics, metrics ---------------------------------
+
+UsageType = Literal["chat", "agentic", "rag", "extraction", "long_summary", "scoring", "batch_offline"]
+
+
+class SourcedValue(Provenance):
+    value: float
+
+
+class WorkloadProfile(_Strict):
+    label: str
+    isl_typical: str
+    osl_typical: str
+    ratio_range: tuple[float, float] | None = None
+    fills_16k: str
+    recommended_budget: int = Field(gt=0)
+    budget_range: tuple[int, int]
+    source: str
+    reference_ratio: SourcedValue | None = None
+    prefix_cache_hit_rate: SourcedValue | None = None
+    osl_per_call_median: SourcedValue | None = None
+    tool_calls: bool = False
+
+
+class Heuristic(Provenance):
+    value: Any
+
+
+class Metric(_Strict):
+    name: str
+    usage: str
+    note: str | None = None
+
+
+class WorkloadCatalog(_Strict):
+    profiles: dict[UsageType, WorkloadProfile]
+    heuristics: dict[str, Heuristic]
+    metrics: list[Metric]
+    validation_tests: list[str] = []
 
 
 class ExtractedVersion(BaseModel):

@@ -1,0 +1,52 @@
+# Écarts assumés entre la config générée et la §7. Le golden test échoue si un écart n'est pas listé ici,
+# ou si un écart listé ne se produit plus.
+
+flags:
+  - flag: --tensor-parallel-size
+    kind: added
+    value: "4"
+    justification: >-
+      Politique « toujours émettre » (choix de l'utilisateur). La §7 indique « TP4, DP1 (inchangé) » sans l'écrire
+      dans les args.
+  - flag: --data-parallel-size
+    kind: added
+    value: "1"
+    justification: Politique « toujours émettre » ; même remarque que pour le tensor parallel.
+  - flag: --long-prefill-token-threshold-adaptive
+    kind: added
+    value: true
+    justification: >-
+      Vérifié dans vllm/config/scheduler.py et vllm/v1/core/sched/scheduler.py au tag v0.33.0 : le plafond dynamique
+      de #58459, sur lequel repose la justification du seuil de 2048 au §2.5, est opt-in (défaut False). Sans ce flag,
+      le seuil reste fixe à 2048, même quand seules deux requêtes se partagent le budget.
+  - flag: --enable-chunked-prefill
+    kind: added
+    value: true
+    justification: >-
+      Politique « toujours émettre » : c'est le défaut, mais le remplissage du budget et le seuil de long prefill en
+      dépendent.
+
+json_keys:
+  - flag: --speculative-config
+    key: rejection_sample_method
+    kind: added
+    value: standard
+    justification: >-
+      Politique « toujours émettre » : rend explicite le retrait de FLy (« fly » → « standard », défaut vLLM).
+  - flag: --speculative-config
+    key: enable_adaptive_verification
+    kind: added
+    value: false
+    justification: >-
+      Politique « toujours émettre » : flag confirmé dans vllm/config/speculative.py v0.33.0 (défaut False, DSpark
+      uniquement). Résout le point 3 de la §11.
+
+# Valeurs identiques, mais justification corrigée par rapport au document.
+rationale_changes:
+  - decision: max_num_batched_tokens
+    document: "Le ratio agentique (~12–14) ne remplit pas 16K (§7), avec d ≈ 1 pour DSpark en 0.33 (§2.4, §3.1)."
+    engine: >-
+      En 0.33.0, chaque séquence en decode consomme 1 + k = 4 tokens de budget (vérification ; #59468 ne supprime que
+      les slots de drafting). Ratio nécessaire à B = 8192, S = 512, a = 3 : 4,0 ; à B = 16384 : 9,3. Le ratio TraceLab
+      (12,5) les dépasse tous les deux : à pleine concurrence, les deux budgets seraient remplissables. 8192 est retenu
+      pour la règle interactive (ITL plus stable, §5), et non parce que 16K ne se remplirait pas.

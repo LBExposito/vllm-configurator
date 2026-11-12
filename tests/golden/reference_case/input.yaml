@@ -1,0 +1,20 @@
+# Entrées du cas de référence (docs/vllm-config-knowledge-base.md §1).
+gpu_id: b300
+gpus_per_instance: 4          # TP4 / DP1 par pod
+num_instances: 2              # 2 pods indépendants, routés par l'EPP llm-d
+model_id: deepseek-v4.1-flash-1017
+vllm_version: "0.33.0"
+workload:
+  usage_type: agentic         # chat agentique type « Claude Cowork », appels d'outils, multi-tours
+  mode: interactive
+  isl: {p50: 24000, p95: 75000, p99: 666000}
+  osl: {p50: 4000}            # 🔶 OSL suspect (§6)
+  # prefix_cache_hit_rate non mesuré : valeur publiée pour l'agentique (TraceLab)
+  # concurrence cible non fournie dans le §1
+allow_lossy: false            # FLy retiré : lossy, risqué pour les tool calls (§7)
+spec:
+  num_speculative_tokens: 3   # configuration initiale de l'utilisateur
+  draft_sample_method: probabilistic
+observed_kv:
+  kv_cache_tokens: 86225834   # « GPU KV cache size: 86,225,834 tokens »
+  block_size: 128             # « Setting kv cache block size to 128 »

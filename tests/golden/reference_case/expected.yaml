@@ -1,0 +1,17 @@
+# Configuration finale retenue (docs/vllm-config-knowledge-base.md §7), recopiée telle quelle.
+args:
+  - --max-num-seqs
+  - "512"
+  - --max-num-batched-tokens
+  - "8192"
+  - --long-prefill-token-threshold
+  - "2048"
+  - --enable-prefix-caching
+  - --kv-cache-dtype
+  - fp8
+  - --gpu-memory-utilization
+  - "0.8"
+  - --speculative-config
+  - '{"method":"dspark","num_speculative_tokens":3,"draft_sample_method":"probabilistic"}'
+  - --compilation-config
+  - '{"max_cudagraph_capture_size":2048}'

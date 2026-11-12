@@ -53,6 +53,8 @@ kv_cache:
     + (2 × 16 × 128 + 48 × 128) × 3 × 2 o d'état de convolution) = 115 458 048 o. Ignore le cache de l'indexeur
     QSA et l'alignement des pages Mamba de vLLM : estimation basse, à remplacer par les logs.
   recommended_dtype: fp8
+  recommended_dtype_status: verified
+  recommended_dtype_source: "https://recipes.vllm.ai/Qwen/Qwen3.8-Flash-Next (« --kv-cache-dtype fp8 »)"
 
 block_size:
   status: unverified

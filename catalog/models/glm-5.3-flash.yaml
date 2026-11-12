@@ -52,6 +52,8 @@ kv_cache:
     latent sans RoPE n'est pas documentée. Seul repère publié (recette, AMD MI355X, TP4, FP8) : pool KV de
     14,92 M tokens, non transposable au B300. Fournir la valeur « GPU KV cache size » des logs.
   recommended_dtype: fp8
+  recommended_dtype_status: verified
+  recommended_dtype_source: "https://recipes.vllm.ai/zai-org/GLM-5.3-Flash (« --kv-cache-dtype fp8 » sur GB200/GB300)"
 
 block_size:
   status: unverified

@@ -47,6 +47,8 @@ kv_cache:
     publiée. Repère de la recette : 3,60 M tokens de KV en NVFP4 sur 2× GB300 en TP8. Fournir la valeur
     « GPU KV cache size » des logs.
   recommended_dtype: auto
+  recommended_dtype_status: verified
+  recommended_dtype_source: "https://recipes.vllm.ai/mistralai/Mistral-Large-4-1T-A52B (fp8_ds_mla par défaut sur NVIDIA, aucun flag de KV nécessaire)"
 
 block_size:
   status: unverified

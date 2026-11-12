@@ -1,0 +1,135 @@
+# Profils de charge, heuristiques et métriques (docs/vllm-config-knowledge-base.md, §4, §5, §6, §10).
+# status: verified = donnée publiée et sourcée ; unverified = heuristique ou choix de l'app, à valider en production.
+
+profiles:
+  chat:
+    label: Chat classique
+    isl_typical: "~1–6K"
+    osl_typical: "~100–400"
+    ratio_range: [4, 15]
+    fills_16k: "Non"
+    recommended_budget: 8192
+    budget_range: [4096, 8192]
+    source: "Base de connaissances §4"
+    osl_per_call_median:
+      value: 105
+      status: verified
+      source: "GitHub Copilot coding agent traces (Microsoft Research, 2026) : chat, sortie médiane ~105"
+  agentic:
+    label: Agentique multi-tours (type Cowork)
+    isl_typical: "24–68K par appel"
+    osl_typical: "~250 par appel"
+    ratio_range: [12, 14]
+    fills_16k: "Non (sauf rafales)"
+    recommended_budget: 8192
+    budget_range: [8192, 8192]
+    source: "Base de connaissances §4 et §6"
+    tool_calls: true
+    reference_ratio:
+      value: 12.5
+      status: verified
+      source: "TraceLab (UW, 2026) : 2,34 Md de tokens nouveaux / 186,9 M générés"
+    prefix_cache_hit_rate:
+      value: 0.957
+      status: verified
+      source: "TraceLab (UW, 2026) : hit rate global 95,7 %"
+    osl_per_call_median:
+      value: 247
+      status: verified
+      source: "GitHub Copilot coding agent traces (Microsoft Research, 2026) : sortie médiane par appel 247"
+  rag:
+    label: RAG / Q&A sur documents
+    isl_typical: "16K"
+    osl_typical: "~150–400"
+    ratio_range: [40, 100]
+    fills_16k: "Presque"
+    recommended_budget: 8192
+    budget_range: [8192, 16384]
+    source: "Base de connaissances §4"
+  extraction:
+    label: Extraction / classification sur longs documents
+    isl_typical: "32K"
+    osl_typical: "~200–800"
+    ratio_range: [40, 160]
+    fills_16k: "Oui"
+    recommended_budget: 16384
+    budget_range: [16384, 32768]
+    source: "Base de connaissances §4"
+  long_summary:
+    label: Résumé de très longs contextes
+    isl_typical: "128K"
+    osl_typical: "~1K"
+    ratio_range: [128, 128]
+    fills_16k: "Oui"
+    recommended_budget: 16384
+    budget_range: [16384, 32768]
+    source: "Base de connaissances §4"
+  scoring:
+    label: Scoring, rerank, LLM-as-judge, prompt_logprobs
+    isl_typical: "variable"
+    osl_typical: "1–20"
+    fills_16k: "Oui"
+    recommended_budget: 16384
+    budget_range: [16384, 32768]
+    source: "Base de connaissances §4"
+  batch_offline:
+    label: Batch offline en rafale
+    isl_typical: "—"
+    osl_typical: "—"
+    fills_16k: "Oui pendant le remplissage"
+    recommended_budget: 16384
+    budget_range: [16384, 32768]
+    source: "Base de connaissances §4"
+
+heuristics:
+  max_num_seqs_start:
+    value: {large_kv: 512, default: 256}
+    status: unverified
+    source: "Base de connaissances §5 : « Point de départ : 256–512 si le KV est large »"
+  large_kv_min_concurrency:
+    value: 1024
+    status: unverified
+    source: "Choix de l'app : le KV est « large » s'il loge au moins 1024 contextes P50 (2 × le point de départ haut)"
+  long_prefill_threshold_divisor:
+    value: 4
+    status: unverified
+    source: "Base de connaissances §2.5 et §5 : seuil ≈ budget / 4, soit ~4 prefills en parallèle en cas de contention"
+  gpu_memory_utilization_large_capture:
+    value: 0.8
+    status: verified
+    source: "Blog vLLM sur DSpark (base de connaissances §2.4) : 0,8 si la capture des CUDA graphs fait déborder la mémoire"
+    note: "« Grosse capture » = au-delà du plafond par défaut de vLLM pour la famille de GPU (1024 sur Blackwell datacenter, 512 sinon)."
+  assumed_acceptance_length:
+    value: 3.0
+    status: unverified
+    source: "Base de connaissances §3.1 : scénarios a = 2,5 / 3,0 / 3,5 pour DSpark k = 3 ; valeur médiane retenue"
+    note: "À remplacer par la mesure Prometheus a = 1 + spec_decode_num_accepted_tokens / spec_decode_num_drafts."
+  osl_suspect_factor:
+    value: 4
+    status: unverified
+    source: "Choix de l'app : OSL P50 suspect s'il dépasse 4 × la médiane publiée par appel pour ce type d'usage (§6)"
+  isl_tail_ratio_warning:
+    value: 5
+    status: unverified
+    source: "Choix de l'app : P99/P95 > 5 signale une queue à expliquer (mesure par appel ou cumul par tour, §6)"
+
+metrics:
+  - name: "vllm:iteration_tokens_total"
+    usage: "Histogramme des tokens par step : le budget est-il rempli ?"
+  - name: "prompt tokens non cachés / generation tokens (débits)"
+    usage: "Ratio effectif réel ISL_eff/OSL, à comparer au ratio nécessaire (§3.1)"
+  - name: "vllm:prefix_cache_hits / vllm:prefix_cache_queries"
+    usage: "Hit rate par pod : cible > 90 % en agentique, sinon problème de routage ou d'éviction"
+  - name: "TTFT p95 / ITL p95"
+    usage: "Arbitrage du budget de tokens et de max_num_seqs"
+  - name: "num_requests_running / num_requests_waiting, préemptions"
+    usage: "Saturation du KV ou du compute"
+  - name: "spec_decode_num_accepted_tokens / spec_decode_num_drafts"
+    usage: "Longueur d'acceptation a = 1 + acceptés / drafts"
+  - name: "vllm:cache_config_info (labels block_size, num_gpu_blocks)"
+    usage: "Taille de bloc et nombre de blocs réels (lus par l'autoTune de l'EPP llm-d, v2)"
+
+validation_tests:
+  - >-
+    Test du seuil de long prefill : ~100 sessions en decode en fond, puis 1 prompt non caché de 100K, puis
+    immédiatement 5 à 10 prompts de 2K. Comparer le TTFT des petits prompts avec un seuil de 2048 puis de 4096.
