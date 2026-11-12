@@ -29,3 +29,11 @@ def test_reference_case_shows_the_slo_interpretation():
     assert not at.exception
     assert any("Interprétation SLO" in e.value for e in at.error)
     assert any("Goulots" in h.value for h in at.subheader)
+
+
+def test_scenario_export_is_offered():
+    at = AppTest.from_file(APP, default_timeout=30).run()
+    at.sidebar.button[0].click().run()
+    assert not at.exception
+    assert at.session_state["scenario_name"] == "Cas de référence (§1)"
+    assert any(e.label.startswith("💾 Scénarios") for e in at.sidebar.expander)

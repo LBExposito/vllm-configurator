@@ -53,6 +53,8 @@ l'app la demande explicitement si elle est indispensable.
 - **Les hypothèses** retenues quand une entrée manque.
 - **La vérification** : une commande pour contrôler que chaque flag existe sur l'image déployée, et la liste des
   métriques Prometheus à surveiller.
+- **Un fichier de scénario** YAML, exportable et réimportable depuis l'interface : entrées, SLO et mesures, plus un
+  instantané de la config générée. Voir [Sauvegarder et recharger un scénario](#sauvegarder-et-recharger-un-scénario).
 
 ### Ce sur quoi vous pouvez compter
 
@@ -179,6 +181,33 @@ Remplissez la barre latérale de haut en bas. Les résultats se recalculent à c
 | **Logs de démarrage** | Si une instance tourne déjà, recopiez `GPU KV cache size: N tokens`, la taille de bloc (`Setting kv cache block size to N`) et la `gpu-memory-utilization` utilisée. C'est la donnée qui fiabilise le plus la configuration. |
 | **Avancé** | Forcer `gpu-memory-utilization`, ou indiquer une réserve mémoire par GPU pour affiner l'estimation du KV sans logs. |
 
+#### Sauvegarder et recharger un scénario
+
+Le panneau **« 💾 Scénarios »** en haut de la barre latérale exporte le formulaire complet (matériel, modèle, profil
+de charge, SLO, mesures, logs de démarrage) dans un fichier YAML, et réimporte un tel fichier pour remplir le
+formulaire. Donnez un nom au scénario avant l'export : il sert de nom de fichier.
+
+```yaml
+kind: vllm-configurator/scenario
+version: 1
+name: Prod agentique B300
+saved_at: '2026-11-12T10:00:00'
+request:                  # seule partie relue à l'import
+  gpu_id: b300
+  gpus_per_instance: 4
+  num_instances: 2
+  model_id: deepseek-v4.1-flash-1017
+  vllm_version: 0.33.0
+  workload: {usage_type: agentic, mode: interactive, isl: {p50: 24000}, osl: {p50: 250}, target_concurrency: 800}
+  slo: {ttft_p95_ms: 2000.0, itl_p95_ms: 40.0}
+generated:                # instantané informatif (args, verdict SLO), ignoré et recalculé à l'import
+  args: [...]
+```
+
+Les fichiers peuvent être versionnés à côté des manifestes. L'import accepte aussi une requête nue, au format de
+`tests/golden/reference_case/input.yaml`. Il refuse un fichier dont le GPU, le modèle ou la version de vLLM manque
+au catalogue, et indique pourquoi.
+
 ### 6. Lire les résultats
 
 Le bandeau du haut résume `max-num-seqs`, le budget de tokens, la taille du KV et le nombre d'avertissements. Les
@@ -295,6 +324,7 @@ src/vllm_configurator/
   formulas.py               Formules de la §3, fonctions pures
   perf.py                   Modèle roofline d'un step du scheduler (latence)
   analysis.py               Interprétation SLO : verdict, goulot, recherche de la correction
+  scenario.py               Fichiers de scénario YAML (export / import du formulaire)
   rules/                    Règles : une fonction pure (RuleContext, state) -> RuleOutput par décision
   engine.py                 Exécute le pipeline de règles, produit un GenerationResult
   render.py                 YAML `args` (KServe/K8s), ligne de commande, commande de vérification

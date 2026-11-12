@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 
 import streamlit as st
@@ -13,6 +14,7 @@ from vllm_configurator import render
 from vllm_configurator.catalog import default_catalog
 from vllm_configurator.domain import DeploymentRequest, GenerationError
 from vllm_configurator.engine import generate
+from vllm_configurator.scenario import ScenarioError, dump_scenario, load_scenario, request_to_form
 
 REFERENCE_INPUT = Path(__file__).resolve().parents[3] / "tests" / "golden" / "reference_case" / "input.yaml"
 SEVERITY_LABEL = {"critical": "🛑 Critique", "warning": "⚠️ Avertissement", "info": "ℹ️ Info"}
@@ -38,24 +40,46 @@ for _key, _value in DEFAULTS.items():
     st.session_state.setdefault(_key, _value)
 for _key in OPTIONAL:
     st.session_state.setdefault(_key, None)
+st.session_state.setdefault("scenario_name", "")
+
+
+def apply_request(request: DeploymentRequest) -> list[str]:
+    """Fill the form from a request. Returns the problems that prevent it (unknown catalog entries)."""
+    problems = []
+    for label, value, known in (("GPU", request.gpu_id, catalog.gpus), ("Modèle", request.model_id, catalog.models),
+                                ("Version de vLLM", request.vllm_version, catalog.vllm_versions)):
+        if value not in known:
+            problems.append(f"{label} {value!r} absent du catalogue (disponibles : {', '.join(sorted(known))}).")
+    if not problems:
+        st.session_state.update(request_to_form(request))
+    return problems
 
 
 def load_reference() -> None:
-    data = yaml.safe_load(REFERENCE_INPUT.read_text(encoding="utf-8"))
-    wl, spec, kv = data["workload"], data.get("spec", {}), data.get("observed_kv", {})
-    st.session_state.update({
-        "gpu_id": data["gpu_id"], "gpus_per_instance": data["gpus_per_instance"], "num_instances": data["num_instances"],
-        "model_id": data["model_id"], "vllm_version": data["vllm_version"],
-        "usage_type": wl["usage_type"], "mode": wl["mode"],
-        "isl_p50": wl["isl"]["p50"], "isl_p95": wl["isl"].get("p95"), "isl_p99": wl["isl"].get("p99"),
-        "osl_p50": wl["osl"]["p50"], "osl_p95": wl["osl"].get("p95"), "osl_p99": wl["osl"].get("p99"),
-        "hit_rate": None, "target_concurrency": None, "paused_sessions": None,
-        "allow_lossy": data.get("allow_lossy", False), "spec_enabled": True,
-        "k": spec.get("num_speculative_tokens"), "draft_sample_method": spec.get("draft_sample_method", "défaut vLLM"),
-        "acceptance_length": None, "kv_tokens": kv.get("kv_cache_tokens"), "kv_util": kv.get("gpu_memory_utilization"),
-        "kv_block": kv.get("block_size"), "ttft": None, "itl": None, "gpu_util": None, "reserve": None,
-        "itl_measured": None, "ttft_measured": None,
-    })
+    request, _ = load_scenario(REFERENCE_INPUT.read_text(encoding="utf-8"))
+    apply_request(request)
+    st.session_state["scenario_name"] = "Cas de référence (§1)"
+
+
+def import_scenario() -> None:
+    uploaded = st.session_state.get("scenario_file")
+    if uploaded is None:
+        return
+    try:
+        request, name = load_scenario(uploaded.getvalue())
+    except ScenarioError as exc:
+        st.session_state["scenario_message"] = ("error", f"{uploaded.name} : {exc}")
+        return
+    problems = apply_request(request)
+    if problems:
+        st.session_state["scenario_message"] = ("error", f"{uploaded.name} : " + " ".join(problems))
+        return
+    st.session_state["scenario_name"] = name or Path(uploaded.name).stem
+    st.session_state["scenario_message"] = ("success", f"Scénario « {st.session_state['scenario_name']} » importé.")
+
+
+def slug(name: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-") or "scenario"
 
 
 def opt_int(label: str, key: str, help: str | None = None, min_value: int = 1) -> int | None:
@@ -75,6 +99,17 @@ def opt_float(label: str, key: str, min_value: float, max_value: float | None = 
 with st.sidebar:
     st.title("⚙️ Config vLLM")
     st.button("Charger le cas de référence (§1)", on_click=load_reference, use_container_width=True)
+
+    with st.expander("💾 Scénarios (import / export YAML)", expanded=False):
+        st.file_uploader("Importer un scénario", type=["yaml", "yml"], key="scenario_file", on_change=import_scenario,
+                         help="Fichier exporté par l'app, ou requête nue (format de tests/golden/reference_case/input.yaml).")
+        message = st.session_state.pop("scenario_message", None)
+        if message:
+            (st.success if message[0] == "success" else st.error)(message[1])
+        st.text_input("Nom du scénario", key="scenario_name", placeholder="ex. Prod agentique B300")
+        export_slot = st.empty()
+        st.caption("Le fichier contient matériel, modèle, profil de charge, SLO et mesures ; la config générée y est"
+                   " jointe pour information et recalculée à l'import.")
 
     st.header("Matériel")
     gpu_id = st.selectbox("GPU", sorted(catalog.gpus), key="gpu_id", format_func=lambda g: catalog.gpus[g].display_name)
@@ -179,13 +214,26 @@ try:
                        if itl_measured or ttft_measured else None),
         gpu_memory_utilization=gpu_util, kv_estimate_reserve_gib_per_gpu=reserve,
     )
-    result = generate(request, catalog)
 except ValidationError as exc:
     st.error("Entrées invalides :\n\n" + "\n".join(f"- {'.'.join(map(str, e['loc']))} : {e['msg']}" for e in exc.errors()))
     st.stop()
+
+
+def export_button(result=None, args_yaml: str | None = None) -> None:
+    name = st.session_state.get("scenario_name") or ""
+    export_slot.download_button(
+        "Exporter le scénario (.yaml)", dump_scenario(request, name or None, result, args_yaml),
+        file_name=f"{slug(name) if name else 'scenario'}.yaml", mime="application/x-yaml", use_container_width=True,
+    )
+
+
+try:
+    result = generate(request, catalog)
 except GenerationError as exc:
+    export_button()
     st.error("\n\n".join(exc.errors))
     st.stop()
+export_button(result, render.render_k8s_args(result, catalog) if not result.blocking_errors else None)
 
 if result.blocking_errors:
     for error in result.blocking_errors:
