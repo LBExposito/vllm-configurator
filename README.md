@@ -1,24 +1,242 @@
 # vllm-config
 
-Générateur de configuration `vllm serve` à partir du matériel, du modèle, de la version de vLLM, du profil de
-charge et des SLO. Chaque valeur produite est accompagnée de la règle ou de la formule appliquée, de ses sources
-et de son statut (✅ vérifié ou 🔶 à vérifier).
+Application web qui génère une configuration `vllm serve` adaptée à votre déploiement : GPU, modèle, version de
+vLLM, profil de charge et objectifs de latence. Elle explique chaque valeur retenue et signale ce qui reste à
+vérifier.
+
+- [Ce que fait l'app](#ce-que-fait-lapp)
+- [Guide de démarrage](#guide-de-démarrage)
+- [Maintenance : architecture et catalogue](#maintenance--architecture-et-catalogue)
+
+---
+
+## Ce que fait l'app
+
+### Le problème
+
+Les paramètres de vLLM qui pèsent le plus sur les performances (`--max-num-batched-tokens`, `--max-num-seqs`,
+`--long-prefill-token-threshold`, speculative decoding, capture des CUDA graphs, `--gpu-memory-utilization`)
+dépendent les uns des autres, du profil de charge et de la version de vLLM. Leurs règles de dimensionnement
+existent, mais elles sont dispersées entre des PR, des notes de version et des recettes, et elles changent d'une
+version à l'autre. L'app applique ces règles de façon reproductible et montre son raisonnement.
+
+### Entrées
+
+| Groupe | Ce que vous fournissez |
+|---|---|
+| Matériel | Type de GPU, nombre de GPU par instance (tensor parallel), nombre d'instances |
+| Modèle et version | Modèle du catalogue, version de vLLM |
+| Profil de charge | Type d'usage (chat, agentique, RAG, extraction, résumé, scoring, batch), mode interactif ou batch, ISL et OSL en P50 / P95 / P99, taux de prefix cache hit attendu, concurrence cible |
+| SLO | TTFT p95 et ITL p95 cibles (optionnels) |
+| Speculative decoding | Activation, `k`, méthode d'échantillonnage du draft, longueur d'acceptation mesurée, tolérance à une vérification lossy (FLy) |
+| Logs de démarrage (optionnel) | `GPU KV cache size`, taille de bloc et `gpu-memory-utilization` lus dans les logs d'une instance |
+
+Seuls l'ISL P50 et l'OSL P50 sont obligatoires. Une donnée manquante est remplacée par une hypothèse affichée, ou
+l'app la demande explicitement si elle est indispensable.
+
+### Sorties
+
+- **La configuration**, en deux formats : le bloc `args:` à coller dans un manifeste KServe ou Kubernetes, et la
+  commande `vllm serve` équivalente.
+- **Une justification pour chaque valeur** : la règle appliquée, la formule et le calcul chiffré, la valeur par
+  défaut de vLLM, les sources, et un statut ✅ vérifié ou 🔶 à vérifier.
+- **Des avertissements** classés par gravité : modèle non pris en charge par la version, FLy lossy en usage
+  agentique, OSL suspect, KV limitant, données non confirmées, changements cassants de la version.
+- **Des indicateurs calculés** : ratio ISL_eff/OSL réel comparé au ratio nécessaire pour remplir le budget,
+  contextes que le KV peut loger aux P50/P95/P99, tokens consommés par step de decode, tokens par expert MoE,
+  plafond de séquences imposé par vLLM avec DSpark.
+- **Les hypothèses** retenues quand une entrée manque.
+- **La vérification** : une commande pour contrôler que chaque flag existe sur l'image déployée, et la liste des
+  métriques Prometheus à surveiller.
+
+### Ce sur quoi vous pouvez compter
+
+- **Aucun flag inconnu.** Chaque flag et chaque clé JSON émis ont été extraits du code source de vLLM au tag de
+  la version choisie. C'est important à partir de 0.33, dont le frontend Rust refuse de démarrer sur un flag
+  inconnu.
+- **Des règles qui suivent la version.** Par exemple, avec DSpark à k = 3, chaque séquence en decode consomme
+  6 tokens de budget en 0.32 et 4 en 0.33. FLy n'est proposé qu'à partir de 0.33.
+- **Aucune spécification inventée.** Les fiches modèles sont épinglées sur une révision Hugging Face précise.
+  Quand la taille du KV par token n'est pas calculable de façon fiable, l'app demande la valeur des logs au lieu
+  de l'estimer.
+
+### Limites
+
+- L'app ne mesure rien : elle applique des règles. TTFT et ITL ne sont pas prédits ; elle indique quoi surveiller
+  et comment corriger si une cible est dépassée.
+- Sans logs de démarrage, la taille du KV est une estimation grossière (borne haute) : relancez le calcul avec la
+  valeur réelle après le premier déploiement.
+- La configuration de llm-d (EPP) n'est pas encore générée. Elle est prévue pour une v2, qui réutilisera la taille
+  du KV et la taille de bloc calculées ici.
+
+### Catalogue actuel
+
+| Type | Contenu |
+|---|---|
+| GPU | NVIDIA B300 |
+| Modèles | DeepSeek V4.1 Flash (build 1017), Qwen3.8 Flash Next, GLM-5.3 Flash, Mistral Large 4 (image dédiée requise) |
+| Versions de vLLM | 0.31.0, 0.32.0, 0.33.0 |
+
+### Exemple : le cas de référence
+
+DeepSeek V4.1 Flash sur 2 pods de 4 × B300 (TP4), vLLM 0.33.0, chat agentique, ISL P50 24K, KV de 86 M tokens par
+pod lu dans les logs. Configuration générée :
+
+```yaml
+args:
+  # --- Parallélisme ---
+  - --tensor-parallel-size
+  - "4"
+  - --data-parallel-size
+  - "1"
+
+  # --- Scheduler ---
+  - --max-num-seqs
+  - "512"
+  - --max-num-batched-tokens
+  - "8192"
+  - --long-prefill-token-threshold
+  - "2048"
+  - --long-prefill-token-threshold-adaptive
+  - --enable-chunked-prefill
+
+  # --- KV cache / prefix caching ---
+  - --enable-prefix-caching
+  - --kv-cache-dtype
+  - "fp8"
+  - --gpu-memory-utilization
+  - "0.8"
+  # pas de block-size : imposée à 128 par le backend, ne pas la forcer (§5)
+  # pas de kv-offloading-size : 3 592 contextes P50 tiennent dans le KV, offload inutile
+  # pas de max-model-len : défaut = contexte maximal du modèle (1 048 576)
+
+  # --- Speculative decoding ---
+  - --speculative-config
+  - '{"method":"dspark","num_speculative_tokens":3,"draft_sample_method":"probabilistic","rejection_sample_method":"standard","enable_adaptive_verification":false}'
+
+  # --- CUDA graphs ---
+  - --compilation-config
+  - '{"max_cudagraph_capture_size":2048}'
+```
+
+Pour ce cas, l'app signale aussi que l'OSL P50 de 4 000 tokens est environ 16 fois la médiane publiée pour
+l'agentique (247), et que l'ISL P99 de 666K est à qualifier : mesure par appel ou cumul par session ?
+
+---
+
+## Guide de démarrage
+
+### 1. Prérequis
+
+- Python 3.11 ou plus récent.
+- [uv](https://docs.astral.sh/uv/) pour l'environnement et les dépendances.
+- Aucun GPU n'est nécessaire : l'app ne lance pas vLLM.
+
+### 2. Installation
+
+Depuis la racine du projet :
+
+```bash
+uv sync
+```
+
+uv crée un environnement `.venv` et y installe le projet ainsi que ses dépendances (Streamlit, pydantic, PyYAML,
+pytest).
+
+### 3. Lancer l'interface
+
+```bash
+uv run streamlit run src/vllm_config/web/app.py
+```
+
+L'app s'ouvre sur <http://localhost:8501>. Le formulaire est dans la barre latérale et les résultats dans la
+partie centrale.
+
+### 4. Premier essai : le cas de référence
+
+Cliquez sur **« Charger le cas de référence (§1) »** en haut de la barre latérale. Le formulaire se remplit avec
+le déploiement réel décrit dans `docs/vllm-config-knowledge-base.md`, et la configuration s'affiche aussitôt.
+Parcourez les onglets pour voir comment chaque valeur est justifiée.
+
+### 5. Décrire votre propre déploiement
+
+Remplissez la barre latérale de haut en bas. Les résultats se recalculent à chaque modification.
+
+| Section | Conseils |
+|---|---|
+| **Matériel** | « GPU par instance » est le tensor parallel d'un pod ; « Instances » est le nombre de pods indépendants. |
+| **Modèle et version** | Choisissez la version de vLLM réellement déployée : plusieurs règles en dépendent. |
+| **Profil de charge** | Mesurez ISL et OSL **par appel au modèle**, pas par tour de conversation ni par session. Laissez le hit rate vide si vous ne l'avez pas mesuré : l'app prend la valeur publiée pour votre type d'usage et l'affiche dans « Hypothèses ». La concurrence cible est un total sur toutes les instances. |
+| **SLO** | Optionnels. Ils n'entrent pas dans le calcul, mais ajoutent des consignes de surveillance. |
+| **Speculative decoding** | Laissez `k` vide pour utiliser la valeur recommandée pour le modèle. Ne cochez « Tolérer une vérification lossy » qu'en A/B : FLy peut modifier les sorties, ce qui est risqué pour les tool calls. |
+| **Logs de démarrage** | Si une instance tourne déjà, recopiez `GPU KV cache size: N tokens`, la taille de bloc (`Setting kv cache block size to N`) et la `gpu-memory-utilization` utilisée. C'est la donnée qui fiabilise le plus la configuration. |
+| **Avancé** | Forcer `gpu-memory-utilization`, ou indiquer une réserve mémoire par GPU pour affiner l'estimation du KV sans logs. |
+
+### 6. Lire les résultats
+
+Le bandeau du haut résume `max-num-seqs`, le budget de tokens, la taille du KV et le nombre d'avertissements. Les
+avertissements critiques s'affichent juste en dessous.
+
+| Onglet | Contenu |
+|---|---|
+| **Configuration** | Bloc `args:` (téléchargeable en `vllm-args.yaml`) et commande `vllm serve`. |
+| **Justifications** | Une fiche par paramètre : valeur, émis ou non, règle, formule, calcul, défaut de vLLM, sources, statut. |
+| **Avertissements** | Classés en critique / avertissement / info. Les points 🔶 « À vérifier » viennent de données non confirmées. |
+| **Indicateurs** | Valeurs calculées et leur lecture. Le plus utile : le ratio ISL_eff/OSL réel comparé au ratio nécessaire pour remplir le budget de tokens. |
+| **Hypothèses** | Ce que l'app a supposé faute de donnée. Fournir la donnée réelle supprime l'hypothèse. |
+| **Vérification et métriques** | Commande de vérification des flags, métriques à surveiller, test de validation du seuil de prefill. |
+
+### 7. Déployer la configuration
+
+1. **Vérifiez les flags sur l'image réellement déployée**, avec la commande de l'onglet « Vérification et
+   métriques ». Elle liste les flags que l'image reconnaît ; chaque flag de la config doit y apparaître :
+   ```bash
+   vllm serve --help=all | grep -oE -- "--(no-)?(max-num-seqs|max-num-batched-tokens|...)\b" | sort -u
+   ```
+2. **Collez le bloc `args:`** dans la définition du conteneur vLLM de votre manifeste. Ce bloc ne contient pas le
+   nom du modèle, généralement fourni ailleurs par KServe. La commande `vllm serve`, elle, l'inclut.
+3. **Déployez**, puis vérifiez dans les logs que vLLM démarre sans erreur ni OOM pendant la capture des CUDA graphs.
+
+### 8. Après le premier déploiement : boucler
+
+La taille du KV dépend de `gpu-memory-utilization`, de `max-num-seqs` et de la capture des CUDA graphs. Elle
+change donc avec la nouvelle configuration.
+
+1. Relevez dans les logs la nouvelle ligne `GPU KV cache size` et la taille de bloc.
+2. Saisissez-les dans « Logs de démarrage » : l'app recalcule `max-num-seqs` et les indicateurs.
+3. Surveillez les métriques listées, en particulier l'ITL p95 et le hit rate du prefix cache. Si l'ITL dépasse la
+   cible, appliquez la consigne de repli donnée dans les avertissements (par exemple 384 séquences et une capture
+   de 1536).
+4. Mesurez la longueur d'acceptation `a = 1 + spec_decode_num_accepted_tokens / spec_decode_num_drafts` et
+   saisissez-la : elle remplace l'hypothèse a = 3.
+
+### 9. Dépannage
+
+| Symptôme | Solution |
+|---|---|
+| `ModuleNotFoundError: No module named 'vllm_config'` | `uv sync --reinstall-package vllm-config` |
+| « Taille du KV inconnue » | Le modèle a une architecture dont le KV ne se calcule pas de façon fiable : saisissez `GPU KV cache size` lu dans les logs. |
+| Avertissement critique « absente du registre de vLLM » | La version choisie ne prend pas en charge ce modèle. Utilisez l'image dédiée indiquée, puis vérifiez les flags dessus. |
+| Modèle, GPU ou version absent des listes | Ajoutez-le au catalogue (voir ci-dessous). |
+| Caractères accentués illisibles dans un terminal Windows | Préfixez les scripts par `PYTHONUTF8=1`. |
+
+### 10. Lancer les tests
+
+```bash
+uv run pytest
+```
+
+Les tests couvrent les formules (avec les valeurs numériques de la base de connaissances), les règles et leur
+dépendance à la version, la cohérence du catalogue, le golden test et l'interface.
+
+---
+
+## Maintenance : architecture et catalogue
 
 La base de connaissances d'origine est `docs/vllm-config-knowledge-base.md`. Les vérifications faites dans le code
 source de vLLM, dont plusieurs corrections à cette base, sont dans `docs/verification-vllm-0.33.0.md`.
 
-## Démarrage
-
-```bash
-uv sync
-uv run streamlit run src/vllm_config/web/app.py   # interface web
-uv run pytest                                      # tests (formules, règles, catalogue, golden test, UI)
-```
-
-Dans l'interface, le bouton « Charger le cas de référence (§1) » préremplit le cas réel (DeepSeek V4.1 Flash,
-2 pods TP4 sur B300, vLLM 0.33.0).
-
-## Architecture
+### Architecture
 
 ```
 catalog/                    Données versionnées (YAML), séparées de la logique
@@ -36,7 +254,7 @@ src/vllm_config/
   targets/                  Registre des cibles : `vllm` en v1, `llmd_epp` prévu en v2
   web/app.py                Interface Streamlit
 tests/
-  unit/                     Formules (valeurs du document), règles, catalogue, UI
+  unit/                     Formules, règles, catalogue, UI
   golden/reference_case/    Cas de référence : entrées §1, config attendue §7, écarts justifiés
 tools/extract_vllm_flags.py Extraction des flags d'une version de vLLM depuis GitHub
 ```
@@ -45,12 +263,11 @@ Principes :
 
 - **Les règles ne codent aucune version en dur.** Elles lisent les comportements du catalogue de la version
   (`ctx.behavior("spec_decode.extra_draft_slots")`, etc.). Changer de version, c'est changer de fichier.
-- **Aucun flag inconnu n'est émis.** Le rendu refuse un flag absent de `catalog/vllm/extracted/<version>.yaml`,
-  car le frontend Rust de vLLM ≥ 0.33 échoue sur les flags inconnus. Le moteur refuse aussi une clé
-  `--speculative-config` inconnue.
+- **Aucun flag inconnu n'est émis.** Le rendu refuse un flag absent de `catalog/vllm/extracted/<version>.yaml`. Le
+  moteur refuse aussi une clé `--speculative-config` inconnue.
 - **Honnêteté sur l'incertitude.** Toute donnée `unverified` utilisée par une règle produit un avertissement
-  « À vérifier ». Une donnée manquante produit soit une hypothèse affichée (onglet « Hypothèses »), soit une
-  erreur bloquante qui demande la valeur (par exemple la taille du KV des logs quand elle n'est pas dérivable).
+  « À vérifier ». Une donnée manquante produit soit une hypothèse affichée, soit une erreur bloquante qui demande
+  la valeur.
 - **Toujours émettre.** Les flags sur lesquels repose la config sont émis même quand ils valent le défaut. Font
   exception `--block-size` (ne jamais forcer une taille imposée par le backend), `--kv-offloading-size` (sa seule
   présence active l'offload) et `--max-model-len` (défaut = contexte maximal du modèle). Leur raison figure en
@@ -59,10 +276,10 @@ Principes :
   source, la taille de bloc, `max_num_seqs`, etc. Le futur target `llmd_epp` consommera ces faits
   (`lruCapacityPerServer = formulas.lru_capacity_per_server(kv, block)`) sans toucher au moteur vLLM.
 
-## Ajouter un GPU
+### Ajouter un GPU
 
-Le skill Claude Code `vllm-config-catalog` (`.claude/skills/vllm-config-catalog/`) automatise cette procédure
-et celle des modèles. À la main :
+Le skill Claude Code `vllm-config-catalog` (`.claude/skills/vllm-config-catalog/`) automatise cette procédure et
+celle des modèles. À la main :
 
 1. Créer `catalog/gpus/<id>.yaml` (le nom du fichier doit être égal à `id`), sur le modèle de `b300.yaml`.
 2. `memory.hbm_gb` en Go décimaux, d'après la fiche constructeur. Si seule une page système donne un total,
@@ -73,7 +290,7 @@ et celle des modèles. À la main :
 
 La HBM ne sert qu'à estimer le KV quand les logs de démarrage ne sont pas fournis.
 
-## Ajouter un modèle
+### Ajouter un modèle
 
 1. Identifier le dépôt Hugging Face exact et collecter les faits à une révision épinglée :
    ```bash
@@ -92,7 +309,7 @@ La HBM ne sert qu'à estimer le KV quand les logs de démarrage ne sont pas four
 
 Le détail champ par champ est dans `.claude/skills/vllm-config-catalog/references/fields.md`.
 
-## Ajouter une version de vLLM
+### Ajouter une version de vLLM
 
 1. **Extraire les flags** au tag de la version :
    ```bash
@@ -101,8 +318,8 @@ Le détail champ par champ est dans `.claude/skills/vllm-config-catalog/referenc
    L'outil génère `catalog/vllm/extracted/0.34.0.yaml` : flags CLI, clés de `--speculative-config` et de
    `--compilation-config`, méthodes de spec decoding, architectures du registre. Les fichiers sources sont
    téléchargés dans `.cache/vllm-src/` et lus comme du texte, jamais exécutés.
-2. **Copier le catalogue précédent** (`catalog/vllm/0.33.0.yaml` → `0.34.0.yaml`), puis mettre à jour
-   `version`, `source_tag` et `verified_on`.
+2. **Copier le catalogue précédent** (`catalog/vllm/0.33.0.yaml` → `0.34.0.yaml`), puis mettre à jour `version`,
+   `source_tag` et `verified_on`.
 3. **Revérifier chaque comportement dans le code source au nouveau tag** et corriger `value`, `source` et
    `status`. Où regarder :
 
@@ -119,19 +336,19 @@ Le détail champ par champ est dans `.claude/skills/vllm-config-catalog/referenc
    Ce qui n'a pas pu être relu dans le code reste en `status: unverified`, avec la source utilisée (notes de
    version…). L'app l'affichera « à vérifier ».
 4. **Mettre à jour** `breaking_changes` et `notes` d'après les notes de version.
-5. Si une règle a besoin d'un comportement nouveau, ajouter la clé dans **tous** les catalogues de versions, avec
-   la valeur propre à chacune, puis lire la clé dans la règle via `ctx.behavior(...)`. `tests/unit/test_catalog.py`
+5. Si une règle a besoin d'un comportement nouveau, ajouter la clé dans **tous** les catalogues de versions, avec la
+   valeur propre à chacune, puis la lire dans la règle via `ctx.behavior(...)`. `tests/unit/test_catalog.py`
    vérifie que chaque version définit les comportements utilisés.
 6. Valider.
 
-## Valider le catalogue
+### Valider le catalogue
 
 ```bash
 uv run python -c "from vllm_config.catalog import load_catalog; c = load_catalog(); print(c.validate() or 'OK')"
 uv run pytest
 ```
 
-## Golden test
+### Golden test
 
 `tests/golden/reference_case/` contient les entrées du §1 (`input.yaml`), la config du §7 recopiée telle quelle
 (`expected.yaml`) et les écarts assumés (`deviations.yaml`). Le test échoue si la config générée diffère de la §7
