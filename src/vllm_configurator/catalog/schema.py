@@ -268,3 +268,38 @@ class ExtractedVersion(BaseModel):
     draft_sample_methods: list[str]
     compilation_config_keys: list[str]
     architectures: list[str]
+
+
+# --- llm-d / EPP -------------------------------------------------------------
+
+class LlmdParam(Behavior):
+    """A plugin parameter: its EPP default (`value`) and what it does."""
+
+    description: str
+
+
+class LlmdPlugin(Provenance):
+    role: Literal["producer", "scorer", "picker", "filter", "profile_handler"]
+    parameters: dict[str, LlmdParam] = {}
+
+
+class LlmdDefaultProfile(Provenance):
+    handler: str
+    picker: str
+    weights: dict[str, int]
+
+
+class LlmdVersion(_Strict):
+    """An llm-d EPP release (EndpointPickerConfig plugins, defaults, behaviors)."""
+
+    id: str
+    display_name: str
+    api_version: str
+    kind: str
+    verified_on: str
+    placement: Behavior
+    default_profile: LlmdDefaultProfile
+    plugins: dict[str, LlmdPlugin]
+    behaviors: dict[str, Behavior]
+    heuristics: dict[str, Behavior]
+    notes: list[str] = []

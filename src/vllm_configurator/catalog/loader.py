@@ -2,13 +2,13 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import lru_cache
 from pathlib import Path
 
 import yaml
 
-from .schema import ExtractedVersion, Gpu, Model, VllmVersion, WorkloadCatalog
+from .schema import ExtractedVersion, Gpu, LlmdVersion, Model, VllmVersion, WorkloadCatalog
 
 DEFAULT_ROOT = Path(__file__).resolve().parents[3] / "catalog"
 
@@ -29,6 +29,7 @@ class Catalog:
     vllm_versions: dict[str, VllmVersion]
     extracted: dict[str, ExtractedVersion]
     workload: WorkloadCatalog
+    llmd_versions: dict[str, LlmdVersion] = field(default_factory=dict)
 
     def sorted_versions(self) -> list[str]:
         return sorted(self.vllm_versions, key=version_key)
@@ -57,6 +58,12 @@ class Catalog:
         for model_id, model in self.models.items():
             if model.id != model_id:
                 errors.append(f"modèle {model_id}: le nom du fichier doit être <id>.yaml (id={model.id})")
+        for llmd_id, llmd in self.llmd_versions.items():
+            if llmd.id != llmd_id:
+                errors.append(f"llm-d {llmd_id}: le nom du fichier doit être <id>.yaml (id={llmd.id})")
+            for plugin in [*llmd.default_profile.weights, llmd.default_profile.picker]:
+                if plugin not in llmd.plugins:
+                    errors.append(f"llm-d {llmd_id}: plugin {plugin!r} du profil par défaut absent de plugins")
         return errors
 
 
@@ -66,7 +73,9 @@ def load_catalog(root: Path = DEFAULT_ROOT) -> Catalog:
     versions = {p.stem: VllmVersion(**_load_yaml(p)) for p in sorted((root / "vllm").glob("*.yaml"))}
     extracted = {p.stem: ExtractedVersion(**_load_yaml(p)) for p in sorted((root / "vllm" / "extracted").glob("*.yaml"))}
     workload = WorkloadCatalog(**_load_yaml(root / "workload_profiles.yaml"))
-    return Catalog(gpus=gpus, models=models, vllm_versions=versions, extracted=extracted, workload=workload)
+    llmd = {p.stem: LlmdVersion(**_load_yaml(p)) for p in sorted((root / "llmd").glob("*.yaml"))}
+    return Catalog(gpus=gpus, models=models, vllm_versions=versions, extracted=extracted, workload=workload,
+                   llmd_versions=llmd)
 
 
 @lru_cache(maxsize=1)

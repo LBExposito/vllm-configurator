@@ -1,7 +1,8 @@
 # vllm-configurator
 
 Application web qui génère une configuration `vllm serve` adaptée à votre déploiement : GPU, modèle, version de
-vLLM, profil de charge et objectifs de latence. Elle explique chaque valeur retenue et signale ce qui reste à
+vLLM, profil de charge et objectifs de latence. Elle génère aussi la configuration du routage intelligent llm-d (EPP)
+qui répartit les requêtes entre ces instances vLLM. Elle explique chaque valeur retenue et signale ce qui reste à
 vérifier.
 
 - [Ce que fait l'app](#ce-que-fait-lapp)
@@ -32,6 +33,7 @@ version à l'autre. L'app applique ces règles de façon reproductible et montre
 | Speculative decoding | Activation, `k`, méthode d'échantillonnage du draft, longueur d'acceptation mesurée, tolérance à une vérification lossy (FLy) |
 | Contexte et arguments supplémentaires (optionnel) | `max-model-len` cible (avec extension de contexte YaRN quand le modèle en a une), flags vLLM et variables d'environnement additionnels |
 | Logs de démarrage (optionnel) | `GPU KV cache size`, taille de bloc et `gpu-memory-utilization` lus dans les logs d'une instance |
+| Routage llm-d (optionnel) | Version d'llm-d, index de préfixes approximatif ou precise, préfixe commun à toutes les sessions, poids forcés, valeurs lues dans le log de l'EPP et hit rate mesuré par pod |
 
 Seuls l'ISL P50 et l'OSL P50 sont obligatoires. Une donnée manquante est remplacée par une hypothèse affichée, ou
 l'app la demande explicitement si elle est indispensable.
@@ -55,6 +57,9 @@ l'app la demande explicitement si elle est indispensable.
 - **Les hypothèses** retenues quand une entrée manque.
 - **La vérification** : une commande pour contrôler que chaque flag existe sur l'image déployée, et la liste des
   métriques Prometheus à surveiller.
+- **La configuration llm-d** : l'`EndpointPickerConfig` (index de préfixes et poids des scorers) dérivée de la config
+  vLLM, avec ses justifications et les lignes de log de l'EPP à vérifier après déploiement. Voir
+  [Routage llm-d](#routage-llm-d).
 - **Un fichier de scénario** YAML, exportable et réimportable depuis l'interface : entrées, SLO et mesures, plus un
   instantané de la config générée. Voir [Sauvegarder et recharger un scénario](#sauvegarder-et-recharger-un-scénario).
 
@@ -76,8 +81,10 @@ l'app la demande explicitement si elle est indispensable.
   saisir la latence mesurée recale le modèle (±15 %).
 - Sans logs de démarrage, la taille du KV est une estimation grossière (borne haute) : relancez le calcul avec la
   valeur réelle après le premier déploiement.
-- La configuration de llm-d (EPP) n'est pas encore générée. Elle est prévue pour une v2, qui réutilisera la taille
-  du KV et la taille de bloc calculées ici.
+- Les poids des scorers llm-d sont des choix de l'app (🔶), calés sur la configuration proposée par la base de
+  connaissances : c'est le hit rate mesuré par pod qui les valide. Le mode precise ne génère que la partie connue de sa
+  configuration (taille de bloc, `--kv-events-config`) ; l'indexer et le sidecar tokenizer restent à poser d'après le
+  guide llm-d.
 
 ### Catalogue actuel
 
@@ -86,6 +93,7 @@ l'app la demande explicitement si elle est indispensable.
 | GPU | NVIDIA B300 |
 | Modèles | DeepSeek V4.1 Flash (build 1017), Qwen3.8 Flash Next, GLM-5.3 Flash, Mistral Large 4 (image dédiée requise) |
 | Versions de vLLM | 0.31.0, 0.32.0, 0.33.0 |
+| llm-d (EPP) | RHOAI 3.5.x |
 
 ### Exemple : le cas de référence
 
@@ -182,6 +190,7 @@ Remplissez la barre latérale de haut en bas. Les résultats se recalculent à c
 | **Speculative decoding** | Laissez `k` vide pour utiliser la valeur recommandée pour le modèle. Ne cochez « Tolérer une vérification lossy » qu'en A/B : FLy peut modifier les sorties, ce qui est risqué pour les tool calls. |
 | **Logs de démarrage** | Si une instance tourne déjà, recopiez `GPU KV cache size: N tokens`, la taille de bloc (`Setting kv cache block size to N`) et la `gpu-memory-utilization` utilisée. C'est la donnée qui fiabilise le plus la configuration. |
 | **Contexte et arguments supplémentaires** | Voir ci-dessous. |
+| **Routage llm-d (EPP)** | Voir [Routage llm-d](#routage-llm-d). |
 | **Avancé** | Forcer `gpu-memory-utilization`, ou indiquer une réserve mémoire par GPU pour affiner l'estimation du KV sans logs. |
 
 #### Étendre le contexte et ajouter des arguments vLLM
@@ -261,6 +270,7 @@ avertissements critiques s'affichent juste en dessous.
 | Onglet | Contenu |
 |---|---|
 | **Configuration** | Bloc `args:` (téléchargeable en `vllm-args.yaml`) et commande `vllm serve`. |
+| **Routage llm-d** | `EndpointPickerConfig` (téléchargeable en `epp-config.yaml`), args vLLM à ajouter en mode precise, justification de chaque paramètre et poids, indicateurs, lignes de log attendues. |
 | **Paliers et SLO** | Plan de test par paliers (flags, charge, plages attendues, instances si validé), protocole et critères de passage, contrôles au point de la config générée, estimation indicative (goulots, pistes). |
 | **Justifications** | Une fiche par paramètre : valeur, émis ou non, règle, formule, calcul, défaut de vLLM, sources, statut. |
 | **Avertissements** | Classés en critique / avertissement / info. Les points 🔶 « À vérifier » viennent de données non confirmées. |
@@ -290,6 +300,58 @@ change donc avec la nouvelle configuration.
    générée : les plages des autres paliers se resserrent. Surveillez aussi le hit rate du prefix cache.
 4. Mesurez la longueur d'acceptation `a = 1 + spec_decode_num_accepted_tokens / spec_decode_num_drafts` et
    saisissez-la : elle remplace l'hypothèse a = 3.
+
+### Routage llm-d
+
+Avec plusieurs instances indépendantes, aucun cache n'est partagé : une session routée sur un autre pod que celui qui
+détient son préfixe refait tout son prefill. L'EPP d'llm-d choisit le pod de chaque requête en combinant des scorers
+pondérés. L'app règle cet `EndpointPickerConfig` à partir de la config vLLM : elle lit les faits du moteur
+(`DeploymentFacts` : KV par instance, taille de bloc, `max-num-seqs`, nombre d'instances), sans les recalculer. Le code
+est dans `src/vllm_configurator/llmd/`, le catalogue dans `catalog/llmd/<version>.yaml`.
+
+**L'index de préfixes (mode approximatif).** L'EPP garde, par pod, une LRU des hashes de blocs des prompts qu'il a
+routés.
+
+| Paramètre | Règle |
+|---|---|
+| `blockSizeTokens` | Taille de bloc KV de vLLM (un bloc de l'index = un bloc vLLM), au moins 64 : en dessous, l'EPP l'écrase |
+| `lruCapacityPerServer` | KV par instance / `blockSizeTokens`, pour suivre tout le cache d'un pod. Trop petit : faux misses, routage au hasard |
+| `autoTune` | `false` : la capacité est fixée, la correction automatique n'est pas confirmée |
+| `maxPrefixTokensToMatch` | Au moins l'ISL P95 et le préfixe commun, arrondi à une puissance de 2, au moins le défaut (131 072) ; `maxPrefixBlocksToMatch` en est l'équivalent en blocs |
+
+**Les poids du profil.**
+
+| Scorer | Règle |
+|---|---|
+| `prefix-cache-scorer` | Selon le gain de prefill de l'affinité : (1 − h sans affinité) / (1 − h), avec h sans affinité = h commun + (h − h commun) / N. Gain ≥ 3 → 5, ≥ 1,5 → 3, sinon 2 |
+| `kv-cache-utilization-scorer` | Selon l'occupation du KV au palier de la config générée : ≥ 80 % → 3, ≥ 50 % → 2, sinon 1 |
+| `queue-scorer` | 2, ou 3 si les requêtes en vol par pod atteignent 80 % de `max-num-seqs` |
+| `no-hit-lru-scorer` | 2 : répartit les nouvelles sessions, qui n'ont de préfixe connu nulle part |
+
+Le préfixe commun (system prompt, outils) est en cache sur tous les pods : le déclarer réduit le gain attendu de
+l'affinité. Laissé vide, l'app suppose 0, le cas où l'affinité compte le plus.
+
+**Forcer une valeur.** Comme les arguments vLLM supplémentaires, le champ « Paramètres llm-d forcés (YAML) » remplace
+une valeur calculée du plugin de préfixe (une ligne par paramètre, par exemple `lruCapacityPerServer: 700000`). Un nom
+inconnu du catalogue ou une valeur du mauvais type est ignoré, avec un avertissement critique. L'app signale aussi ce
+que la valeur forcée casse : index trop petit pour le KV, bloc sous le minimum, fenêtre plus courte que le préfixe
+commun, taille de bloc precise différente de celle de vLLM. Les poids se forcent dans « Forcer les poids du profil ».
+Le panneau « 📖 Comprendre les paramètres llm-d » de l'onglet explique chaque paramètre et chaque scorer, avec son
+défaut et la valeur proposée.
+
+Pour le cas de référence, l'app retrouve la configuration de la §9.4 de la base de connaissances : bloc 128,
+`lruCapacityPerServer` 673 639, poids 2 / 1 / 5 / 2 (queue / kv / préfixe / no-hit). Sans affinité, le hit rate de
+95,7 % tomberait à ~48 % et le prefill non caché serait multiplié par 12.
+
+**Mode precise.** Les pods publient leurs KV events en ZMQ : l'app génère `--kv-events-config` (à ajouter aux args
+vLLM, avec la variable `POD_IP` sur le conteneur) et `tokenProcessorConfig.blockSize` = taille de bloc vLLM, qu'elle
+exige donc. Elle signale quand ce mode est peu utile (KV peu occupé, évictions rares) ou, à l'inverse, quand l'index
+approximatif risque de diverger (KV occupé à plus de 80 %).
+
+**Boucler après déploiement.** L'onglet donne les lignes attendues dans le log de l'EPP (`Prefix DataProducer
+initialized`, `EPP config after phase two`). Saisissez dans « Mesures llm-d » ce que le log affiche réellement et le hit
+rate du pod le moins bon : l'app calcule la part du cache oubliée par l'index déployé et explique un hit rate trop bas.
+La config EPP est recalculée à chaque changement de la config vLLM, puisque la taille du KV en dépend.
 
 ### Paliers de test et SLO
 
@@ -373,6 +435,7 @@ catalog/                    Données versionnées (YAML), séparées de la logiq
   models/<id>.yaml          Modèles : config.json épinglé, KV, taille de bloc, spec decoding natif, support vLLM
   vllm/<version>.yaml       Versions de vLLM : défauts, comportements, flags émis, changements cassants
   vllm/extracted/*.yaml     Flags et clés JSON extraits du code source au tag (générés)
+  llmd/<version>.yaml       llm-d (EPP) : plugins, défauts lus dans les logs, comportements, heuristiques des poids
   workload_profiles.yaml    Profils de charge, heuristiques, métriques
 src/vllm_configurator/
   catalog/                  Schémas pydantic et chargement + validation croisée
@@ -383,7 +446,8 @@ src/vllm_configurator/
   rules/                    Règles : une fonction pure (RuleContext, state) -> RuleOutput par décision
   engine.py                 Exécute le pipeline de règles, produit un GenerationResult
   render.py                 YAML `args` (KServe/K8s), ligne de commande, commande de vérification
-  targets/                  Registre des cibles : `vllm` en v1, `llmd_epp` prévu en v2
+  llmd/                     Cible llm-d : règles de l'EndpointPickerConfig et rendu YAML
+  targets/                  Registre des cibles : `vllm` et `llmd_epp`
   web/app.py                Interface Streamlit
 tests/
   unit/                     Formules, règles, catalogue, UI
@@ -404,9 +468,16 @@ Principes :
   exception `--block-size` (ne jamais forcer une taille imposée par le backend), `--kv-offloading-size` (sa seule
   présence active l'offload) et `--max-model-len` (défaut = contexte maximal du modèle). Leur raison figure en
   commentaire dans le YAML.
-- **Préparation de la v2 (llm-d).** `GenerationResult.facts` (`DeploymentFacts`) expose le KV par instance et sa
-  source, la taille de bloc, `max_num_seqs`, etc. Le futur target `llmd_epp` consommera ces faits
+- **Cibles découplées.** `GenerationResult.facts` (`DeploymentFacts`) expose le KV par instance et sa source, la
+  taille de bloc, `max_num_seqs`, etc. La cible `llmd_epp` consomme ces faits
   (`lruCapacityPerServer = formulas.lru_capacity_per_server(kv, block)`) sans toucher au moteur vLLM.
+
+### Ajouter une version d'llm-d
+
+Copier `catalog/llmd/rhoai-3.5.yaml` en `catalog/llmd/<id>.yaml` (le nom du fichier doit être égal à `id`). Relever
+les défauts dans le log de démarrage de l'EPP (`Prefix DataProducer initialized`, `EPP config after phase two`) et les
+passer en `status: verified` avec ce log pour source. Garder en `unverified` ce qui n'a pas été lu (emplacement des
+paramètres, effet de l'autoTune, paramètres du mode precise).
 
 ### Ajouter un GPU
 

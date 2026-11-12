@@ -1,0 +1,176 @@
+# Catalogue llm-d / EPP livré avec RHOAI 3.5.x (édité à la main, docs/vllm-config-knowledge-base.md §9).
+# status: verified = lu dans les logs réels de l'EPP (§9.3) ou dans la doc RHOAI 3.5 ; unverified = 🔶 à vérifier.
+id: rhoai-3.5
+display_name: "llm-d (EPP) de RHOAI 3.5.x"
+api_version: inference.networking.x-k8s.io/v1alpha1
+kind: EndpointPickerConfig
+verified_on: "2026-11-12"
+
+placement:
+  value: "Config inline du scheduler du LLMInferenceService (KServe)"
+  status: unverified
+  source: "RHOAI 3.5 – Configuring scheduler settings for LLM inference services (section 10.5)"
+  note: "Champ exact du LLMInferenceService à relire dans la doc RHOAI de la version déployée."
+
+# Profil appliqué par RHOAI sans configuration (log « EPP config after phase two »).
+default_profile:
+  status: verified
+  source: "Logs réels de l'EPP, cas de référence (base de connaissances §9.3) ; doc RHOAI 3.5 (§9.1)"
+  handler: single-profile-handler
+  picker: max-score-picker
+  weights:
+    queue-scorer: 2
+    kv-cache-utilization-scorer: 2
+    prefix-cache-scorer: 3
+    no-hit-lru-scorer: 2
+
+plugins:
+  approx-prefix-cache-producer:
+    role: producer
+    status: unverified
+    source: "Log « auto-created default producer: approx-prefix-cache-producer » (§9.3) ; base de connaissances §11 point 4"
+    note: >-
+      Porte l'index LRU des préfixes routés. Selon la version d'llm-d, les paramètres se posent sur ce producer ou sur
+      prefix-cache-scorer : vérifier dans le log « Prefix DataProducer initialized » qu'ils sont bien pris en compte.
+    parameters:
+      autoTune:
+        value: true
+        status: verified
+        source: "Log « Prefix DataProducer initialized » (§9.3)"
+        description: >-
+          Laisse l'EPP ajuster lui-même la capacité de l'index d'après les métriques des pods vLLM
+          (vllm:cache_config_info : taille et nombre de blocs). Si la correction n'a pas lieu, la capacité reste au
+          défaut, bien trop petit pour un gros KV.
+      blockSizeTokens:
+        value: 16
+        status: verified
+        source: "Log « Prefix DataProducer initialized » (§9.3)"
+        description: >-
+          Taille, en tokens, des blocs dans lesquels l'EPP découpe chaque prompt routé. Chaque bloc reçoit un hash
+          chaîné (il dépend de tous les blocs qui le précèdent) : deux requêtes partagent un bloc si tout leur début
+          est identique jusque-là. C'est l'unité de l'index ; l'EPP impose un minimum de 64.
+      maxPrefixBlocksToMatch:
+        value: 2048
+        status: verified
+        source: "Log « Prefix DataProducer initialized » (§9.3)"
+        description: >-
+          Nombre maximal de blocs comparés en tête de prompt pour calculer le score de préfixe d'un pod. Même limite
+          que maxPrefixTokensToMatch, exprimée en blocs.
+      maxPrefixTokensToMatch:
+        value: 131072
+        status: verified
+        source: "Log « Prefix DataProducer initialized » (§9.3)"
+        description: >-
+          Longueur maximale, en tokens, de la comparaison. Au-delà, l'EPP ne regarde plus. Elle doit dépasser le
+          préfixe commun à toutes les requêtes (system prompt, outils), sinon tous les pods ont le même score et
+          l'affinité de session est perdue.
+      lruCapacityPerServer:
+        value: 31250
+        status: verified
+        source: "Log « Prefix DataProducer initialized » (§9.3)"
+        description: >-
+          Nombre maximal de blocs que l'EPP retient pour chaque pod, dans une LRU (les moins récemment vus sont
+          oubliés en premier). Tokens suivis = capacité × blockSizeTokens. Trop petit, l'EPP oublie des préfixes
+          encore en cache dans vLLM (faux misses : prefill complet, cache dupliqué) ; trop grand, il croit à des
+          préfixes déjà évincés (faux hits, moins grave) et consomme plus de mémoire.
+  token-producer:
+    role: producer
+    status: verified
+    source: "Log « auto-created default producer: token-producer (consumer: approx-prefix-cache-producer) » (§9.3)"
+    note: "Créé automatiquement : le scorer de préfixe travaille en tokens, pas en caractères."
+  queue-scorer:
+    role: scorer
+    status: verified
+    source: "Log « EPP config after phase two » (§9.3)"
+    note: "Favorise le pod qui a le moins de requêtes en file : protège le TTFT."
+  kv-cache-utilization-scorer:
+    role: scorer
+    status: verified
+    source: "Log « EPP config after phase two » (§9.3)"
+    note: "Favorise le pod dont le KV est le moins occupé : évite les préemptions."
+  prefix-cache-scorer:
+    role: scorer
+    status: verified
+    source: "Log « EPP config after phase two » (§9.3)"
+    note: "Score = blocs de préfixe consécutifs déjà routés vers le pod : l'affinité de session."
+  no-hit-lru-scorer:
+    role: scorer
+    status: verified
+    source: "Logs « EPP config after phase two » et « consumer: no-hit-lru-scorer » (§9.3)"
+    note: "Envoie une requête sans préfixe connu vers le pod le moins récemment choisi : répartit les nouvelles sessions."
+  max-score-picker:
+    role: picker
+    status: verified
+    source: "Log « EPP config after phase two » (§9.3)"
+  precise-prefix-cache-scorer:
+    role: scorer
+    status: unverified
+    source: "llm-d – Precise prefix cache routing (well-lit path) ; base de connaissances §9.1"
+    note: >-
+      Les pods publient leurs KV events en ZMQ (--kv-events-config). Demande un sidecar tokenizer (UDS), un accès
+      internet au démarrage de l'EPP et tokenProcessorConfig.blockSize = taille de bloc KV de vLLM. Le reste de la
+      configuration (indexer, tokenizer) est à compléter d'après le guide llm-d.
+    parameters:
+      tokenProcessorConfig.blockSize:
+        value: null
+        status: unverified
+        source: "Base de connaissances §9.1"
+        description: >-
+          Taille de bloc avec laquelle le scorer precise retokenise les prompts et recalcule les hashes publiés par
+          vLLM dans ses KV events. Elle doit être égale à la taille de bloc KV de vLLM, sinon aucun hash ne
+          correspond.
+
+behaviors:
+  min_block_size_tokens:
+    value: 64
+    status: verified
+    source: "Log « configured blockSizeTokens is below the recommended minimum, overriding it. (16 → 64) », issue llm-d-router#1158 (§9.3)"
+  lru_bytes_per_entry:
+    value: 64
+    status: unverified
+    source: "Base de connaissances §9.2 : « quelques dizaines d'octets par entrée » (ordre de grandeur)"
+  auto_tune_reads_cache_config_info:
+    value: true
+    status: unverified
+    source: "GIE PR #1888 (autoTune du prefix cache scorer) ; base de connaissances §11 point 5 : correction effective non confirmée"
+  flow_control_default:
+    value: disabled
+    status: verified
+    source: "Log « FlowControlConfig: nil » (§9.3)"
+
+# Choix de l'app pour les poids du profil (aucune source publiée ne les fixe : à valider par la mesure).
+heuristics:
+  prefix_weight_by_prefill_gain:
+    value: [[3.0, 5], [1.5, 3], [0.0, 2]]
+    status: unverified
+    source: >-
+      Choix de l'app, calé sur la base de connaissances §9.4 (poids 5 en agentique, où sans affinité le prefill réel est
+      multiplié par ~10) : [gain minimal, poids]. Gain = prefill non caché sans affinité / avec affinité.
+  kv_weight_by_occupancy:
+    value: [[0.8, 3], [0.5, 2], [0.0, 1]]
+    status: unverified
+    source: >-
+      Choix de l'app : [occupation minimale du KV au palier de la config, poids]. Base de connaissances §9.4 : poids 1
+      quand le KV est énorme (« ce scorer ne départage presque rien »).
+  queue_weight:
+    value: {default: 2, saturated: 3}
+    status: unverified
+    source: "Choix de l'app : défaut RHOAI (2), relevé à 3 quand la charge par pod approche max-num-seqs"
+  queue_saturation_ratio:
+    value: 0.8
+    status: unverified
+    source: "Choix de l'app : charge par pod ≥ 80 % de max-num-seqs → des files se forment, l'affinité doit céder"
+  no_hit_lru_weight:
+    value: 2
+    status: verified
+    source: "Défaut RHOAI (§9.1) et configuration proposée (§9.4)"
+  hit_rate_gap_alert:
+    value: 0.1
+    status: unverified
+    source: "Choix de l'app : hit rate mesuré par pod inférieur de plus de 10 points à l'attendu → problème de routage ou d'éviction"
+  kv_occupancy_precise_advice:
+    value: 0.8
+    status: unverified
+    source: >-
+      Base de connaissances §9.1 : le mode precise est peu utile quand les évictions sont rares. Choix de l'app : au-delà
+      de 80 % d'occupation du KV, les évictions deviennent fréquentes et l'index approximatif diverge.
