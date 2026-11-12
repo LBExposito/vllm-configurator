@@ -2,7 +2,7 @@
 
 import pytest
 
-from vllm_config import formulas as f
+from vllm_configurator import formulas as f
 
 KV_REF = 86_225_834  # « GPU KV cache size » du cas de référence (§1)
 

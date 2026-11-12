@@ -1,6 +1,6 @@
 # Fiches du catalogue : guide champ par champ
 
-Le schéma `src/vllm_config/catalog/schema.py` fait foi ; ce guide explique d'où tirer chaque valeur.
+Le schéma `src/vllm_configurator/catalog/schema.py` fait foi ; ce guide explique d'où tirer chaque valeur.
 
 ## Fiche modèle (`catalog/models/<id>.yaml`)
 

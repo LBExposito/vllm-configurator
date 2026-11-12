@@ -1,5 +1,5 @@
 [project]
-name = "vllm-config"
+name = "vllm-configurator"
 version = "0.1.0"
 description = "Générateur de configuration vLLM à partir du profil de charge, du matériel et du modèle"
 readme = "README.md"
@@ -18,7 +18,7 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/vllm_config"]
+packages = ["src/vllm_configurator"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

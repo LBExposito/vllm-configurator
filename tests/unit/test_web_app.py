@@ -4,7 +4,7 @@ from pathlib import Path
 
 from streamlit.testing.v1 import AppTest
 
-APP = str(Path(__file__).resolve().parents[2] / "src" / "vllm_config" / "web" / "app.py")
+APP = str(Path(__file__).resolve().parents[2] / "src" / "vllm_configurator" / "web" / "app.py")
 
 
 def test_empty_form_asks_for_inputs():

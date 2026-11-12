@@ -8,10 +8,10 @@ from pathlib import Path
 import pytest
 import yaml
 
-from vllm_config import formulas as f
-from vllm_config import render
-from vllm_config.domain import DeploymentRequest
-from vllm_config.engine import generate
+from vllm_configurator import formulas as f
+from vllm_configurator import render
+from vllm_configurator.domain import DeploymentRequest
+from vllm_configurator.engine import generate
 
 CASE = Path(__file__).parent / "reference_case"
 

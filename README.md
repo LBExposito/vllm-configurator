@@ -1,4 +1,4 @@
-# vllm-config
+# vllm-configurator
 
 Application web qui génère une configuration `vllm serve` adaptée à votre déploiement : GPU, modèle, version de
 vLLM, profil de charge et objectifs de latence. Elle explique chaque valeur retenue et signale ce qui reste à
@@ -146,7 +146,7 @@ pytest).
 ### 3. Lancer l'interface
 
 ```bash
-uv run streamlit run src/vllm_config/web/app.py
+uv run streamlit run src/vllm_configurator/web/app.py
 ```
 
 L'app s'ouvre sur <http://localhost:8501>. Le formulaire est dans la barre latérale et les résultats dans la
@@ -214,7 +214,7 @@ change donc avec la nouvelle configuration.
 
 | Symptôme | Solution |
 |---|---|
-| `ModuleNotFoundError: No module named 'vllm_config'` | `uv sync --reinstall-package vllm-config` |
+| `ModuleNotFoundError: No module named 'vllm_configurator'` | `uv sync --reinstall-package vllm-configurator` |
 | « Taille du KV inconnue » | Le modèle a une architecture dont le KV ne se calcule pas de façon fiable : saisissez `GPU KV cache size` lu dans les logs. |
 | Avertissement critique « absente du registre de vLLM » | La version choisie ne prend pas en charge ce modèle. Utilisez l'image dédiée indiquée, puis vérifiez les flags dessus. |
 | Modèle, GPU ou version absent des listes | Ajoutez-le au catalogue (voir ci-dessous). |
@@ -245,7 +245,7 @@ catalog/                    Données versionnées (YAML), séparées de la logiq
   vllm/<version>.yaml       Versions de vLLM : défauts, comportements, flags émis, changements cassants
   vllm/extracted/*.yaml     Flags et clés JSON extraits du code source au tag (générés)
   workload_profiles.yaml    Profils de charge, heuristiques, métriques
-src/vllm_config/
+src/vllm_configurator/
   catalog/                  Schémas pydantic et chargement + validation croisée
   formulas.py               Formules de la §3, fonctions pures
   rules/                    Règles : une fonction pure (RuleContext, state) -> RuleOutput par décision
@@ -278,7 +278,7 @@ Principes :
 
 ### Ajouter un GPU
 
-Le skill Claude Code `vllm-config-catalog` (`.claude/skills/vllm-config-catalog/`) automatise cette procédure et
+Le skill Claude Code `vllm-configurator-catalog` (`.claude/skills/vllm-configurator-catalog/`) automatise cette procédure et
 celle des modèles. À la main :
 
 1. Créer `catalog/gpus/<id>.yaml` (le nom du fichier doit être égal à `id`), sur le modèle de `b300.yaml`.
@@ -294,7 +294,7 @@ La HBM ne sert qu'à estimer le KV quand les logs de démarrage ne sont pas four
 
 1. Identifier le dépôt Hugging Face exact et collecter les faits à une révision épinglée :
    ```bash
-   PYTHONUTF8=1 uv run python .claude/skills/vllm-config-catalog/scripts/hf_model_facts.py <org/repo>
+   PYTHONUTF8=1 uv run python .claude/skills/vllm-configurator-catalog/scripts/hf_model_facts.py <org/repo>
    ```
 2. Lire la recette `https://recipes.vllm.ai/<org/repo>` : méthode et `k` de spec decoding, dtype du KV, version
    minimale, image dédiée.
@@ -307,7 +307,7 @@ La HBM ne sert qu'à estimer le KV quand les logs de démarrage ne sont pas four
    - `speculative.native_method` doit figurer dans `speculative_methods` du fichier `extracted` de la version visée.
 4. Valider.
 
-Le détail champ par champ est dans `.claude/skills/vllm-config-catalog/references/fields.md`.
+Le détail champ par champ est dans `.claude/skills/vllm-configurator-catalog/references/fields.md`.
 
 ### Ajouter une version de vLLM
 
@@ -344,7 +344,7 @@ Le détail champ par champ est dans `.claude/skills/vllm-config-catalog/referenc
 ### Valider le catalogue
 
 ```bash
-uv run python -c "from vllm_config.catalog import load_catalog; c = load_catalog(); print(c.validate() or 'OK')"
+uv run python -c "from vllm_configurator.catalog import load_catalog; c = load_catalog(); print(c.validate() or 'OK')"
 uv run pytest
 ```
 

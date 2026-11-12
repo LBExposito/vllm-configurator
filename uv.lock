@@ -1388,7 +1388,7 @@ wheels = [
 ]
 
 [[package]]
-name = "vllm-config"
+name = "vllm-configurator"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [

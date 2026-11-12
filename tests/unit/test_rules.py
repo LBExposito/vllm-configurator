@@ -4,9 +4,9 @@ from __future__ import annotations
 
 import pytest
 
-from vllm_config import render
-from vllm_config.domain import DeploymentRequest, GenerationError
-from vllm_config.engine import generate
+from vllm_configurator import render
+from vllm_configurator.domain import DeploymentRequest, GenerationError
+from vllm_configurator.engine import generate
 
 BASE = {
     "gpu_id": "b300", "gpus_per_instance": 4, "num_instances": 2, "model_id": "deepseek-v4.1-flash-1017",

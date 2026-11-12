@@ -2,7 +2,7 @@
 
 import pytest
 
-from vllm_config.catalog import load_catalog
+from vllm_configurator.catalog import load_catalog
 
 
 @pytest.fixture(scope="module")

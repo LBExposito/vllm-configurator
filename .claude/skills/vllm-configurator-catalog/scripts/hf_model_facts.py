@@ -1,7 +1,7 @@
 """Collect the facts needed for a catalog/models/<id>.yaml entry from Hugging Face.
 
 Usage (from the repo root):
-    uv run python .claude/skills/vllm-config-catalog/scripts/hf_model_facts.py <org/repo> [--revision <sha>]
+    uv run python .claude/skills/vllm-configurator-catalog/scripts/hf_model_facts.py <org/repo> [--revision <sha>]
 
 Prints a report: pinned revision, checkpoint size, the config.json fields the
 engine uses, the fields that make the KV cache non-standard, spec decoding
@@ -35,7 +35,7 @@ SPEC_KEYS = ["num_nextn_predict_layers", "mtp_num_hidden_layers", "mtp", "dspark
 
 
 def get(url: str) -> bytes:
-    req = urllib.request.Request(url, headers={"User-Agent": "vllm-config-catalog"})
+    req = urllib.request.Request(url, headers={"User-Agent": "vllm-configurator-catalog"})
     with urllib.request.urlopen(req, timeout=60) as resp:
         return resp.read()
 

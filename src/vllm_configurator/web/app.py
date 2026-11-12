@@ -1,4 +1,4 @@
-"""Streamlit UI. Run with: uv run streamlit run src/vllm_config/web/app.py"""
+"""Streamlit UI. Run with: uv run streamlit run src/vllm_configurator/web/app.py"""
 
 from __future__ import annotations
 
@@ -9,10 +9,10 @@ import streamlit as st
 import yaml
 from pydantic import ValidationError
 
-from vllm_config import render
-from vllm_config.catalog import default_catalog
-from vllm_config.domain import DeploymentRequest, GenerationError
-from vllm_config.engine import generate
+from vllm_configurator import render
+from vllm_configurator.catalog import default_catalog
+from vllm_configurator.domain import DeploymentRequest, GenerationError
+from vllm_configurator.engine import generate
 
 REFERENCE_INPUT = Path(__file__).resolve().parents[3] / "tests" / "golden" / "reference_case" / "input.yaml"
 SEVERITY_LABEL = {"critical": "🛑 Critique", "warning": "⚠️ Avertissement", "info": "ℹ️ Info"}

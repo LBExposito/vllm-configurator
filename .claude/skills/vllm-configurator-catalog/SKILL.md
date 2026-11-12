@@ -1,17 +1,17 @@
 ---
-name: vllm-config-catalog
-description: Ajoute ou met à jour un modèle (catalog/models/<id>.yaml) ou un GPU (catalog/gpus/<id>.yaml) dans le catalogue du projet vllm-config, en vérifiant chaque valeur à la source (config.json Hugging Face à révision épinglée, API HF, recettes vLLM, fiches constructeur) et en marquant verified/unverified sans jamais inventer de spécification. À utiliser dès que l'utilisateur veut supporter un nouveau modèle ou un nouveau GPU dans vllm-config, même formulé vaguement (« ajoute Llama 5 », « on passe sur H200 », « mets à jour la fiche Qwen avec la nouvelle révision », « le catalogue ne connaît pas ce modèle »), ou quand l'app signale un modèle ou un GPU inconnu.
+name: vllm-configurator-catalog
+description: Ajoute ou met à jour un modèle (catalog/models/<id>.yaml) ou un GPU (catalog/gpus/<id>.yaml) dans le catalogue du projet vllm-configurator, en vérifiant chaque valeur à la source (config.json Hugging Face à révision épinglée, API HF, recettes vLLM, fiches constructeur) et en marquant verified/unverified sans jamais inventer de spécification. À utiliser dès que l'utilisateur veut supporter un nouveau modèle ou un nouveau GPU dans vllm-configurator, même formulé vaguement (« ajoute Llama 5 », « on passe sur H200 », « mets à jour la fiche Qwen avec la nouvelle révision », « le catalogue ne connaît pas ce modèle »), ou quand l'app signale un modèle ou un GPU inconnu.
 ---
 
-# Ajouter un modèle ou un GPU au catalogue vllm-config
+# Ajouter un modèle ou un GPU au catalogue vllm-configurator
 
-Le moteur de vllm-config calcule une configuration `vllm serve` à partir de ces fiches. Une valeur fausse
+Le moteur de vllm-configurator calcule une configuration `vllm serve` à partir de ces fiches. Une valeur fausse
 y devient une recommandation fausse en production, présentée avec l'autorité d'un calcul. D'où la règle
 centrale : **chaque fait vient d'une source citée, et ce qui n'est pas confirmé est marqué `unverified`
 ou laissé à `null`**. Une valeur absente fait demander une donnée à l'utilisateur, ce qui est bien
 préférable à une valeur plausible mais inventée.
 
-Les schémas font foi : `src/vllm_config/catalog/schema.py` (classes `Gpu` et `Model`). Les fiches
+Les schémas font foi : `src/vllm_configurator/catalog/schema.py` (classes `Gpu` et `Model`). Les fiches
 existantes servent d'exemples : `catalog/models/deepseek-v4.1-flash-1017.yaml` (architecture exotique,
 KV non dérivable), `catalog/models/qwen3.8-flash-next.yaml` (KV calculé avec sa formule) et
 `catalog/gpus/b300.yaml`. Le détail champ par champ est dans `references/fields.md` ; lis-le avant
@@ -39,7 +39,7 @@ Un bloc n'est `verified` que si **toutes** ses valeurs le sont. S'il mélange le
    correspond à la demande.
 2. **Collecter les faits** avec le script fourni, depuis la racine du repo :
    ```bash
-   PYTHONUTF8=1 uv run python .claude/skills/vllm-config-catalog/scripts/hf_model_facts.py <org/repo> [--revision <sha>]
+   PYTHONUTF8=1 uv run python .claude/skills/vllm-configurator-catalog/scripts/hf_model_facts.py <org/repo> [--revision <sha>]
    ```
    Il affiche la révision à épingler, la taille du checkpoint, les champs utiles de `config.json`, les
    champs qui rendent le KV non standard, les indices de spec decoding natif (config et README), et le
@@ -81,7 +81,7 @@ Un bloc n'est `verified` que si **toutes** ses valeurs le sont. S'il mélange le
 ## Valider
 
 ```bash
-uv run python -c "from vllm_config.catalog import load_catalog; c = load_catalog(); print(c.validate() or 'OK')"
+uv run python -c "from vllm_configurator.catalog import load_catalog; c = load_catalog(); print(c.validate() or 'OK')"
 uv run pytest tests -q
 ```
 
