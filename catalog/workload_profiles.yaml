@@ -1,5 +1,5 @@
-# Profils de charge, heuristiques et métriques (docs/vllm-config-knowledge-base.md, §4, §5, §6, §10).
-# status: verified = donnée publiée et sourcée ; unverified = heuristique ou choix de l'app, à valider en production.
+# Workload profiles, heuristics and metrics (docs/vllm-config-knowledge-base.md, §4, §5, §6, §10).
+# status: verified = published and sourced data; unverified = heuristic or choice of the app, to validate in production.
 
 profiles:
   chat:
@@ -116,7 +116,7 @@ heuristics:
     status: unverified
     source: "Choix de l'app : P99/P95 > 5 signale une queue à expliquer (mesure par appel ou cumul par tour, §6)"
 
-  # --- Analyse SLO (modèle de latence roofline, src/vllm_configurator/perf.py) ---
+  # --- SLO analysis (roofline latency model, src/vllm_configurator/perf.py) ---
   perf_hbm_efficiency:
     value: 0.6
     status: unverified

@@ -105,10 +105,10 @@ def test_reference_indicators(result):
 
 def test_expected_warnings(result):
     categories = {w.category for w in result.warnings}
-    assert "osl_suspect" in categories  # OSL P50 de 4K ≈ 15× la médiane par appel (§6)
-    assert "isl_tail" in categories  # P99 666K à qualifier (§6)
-    assert "memory" in categories  # KV mesuré avec une gpu-memory-utilization différente
-    assert "lossy" not in categories  # FLy retiré
+    assert "osl_suspect" in categories  # OSL P50 of 4K ≈ 15× the median per call (§6)
+    assert "isl_tail" in categories  # P99 of 666K to qualify (§6)
+    assert "memory" in categories  # KV measured at another gpu-memory-utilization
+    assert "lossy" not in categories  # FLy removed
 
 
 def test_facts_for_v2(result):

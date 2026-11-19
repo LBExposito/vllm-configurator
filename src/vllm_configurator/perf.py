@@ -217,7 +217,7 @@ def quantile_of_sum(q: float, points: list[tuple[float, float]], p_wait: float, 
     for prob, _ in pts:
         mids.append(acc + prob / 2)
         acc += prob
-    # cum[j] = Σ_{i ≤ j} p_i exp((v_i − v_j) / θ), sans dépassement (exposants ≤ 0).
+    # cum[j] = Σ_{i ≤ j} p_i exp((v_i − v_j) / θ), without overflow (exponents ≤ 0).
     cum, prev = [], None
     for prob, value in pts:
         cum.append(prob if prev is None else cum[-1] * math.exp((prev - value) / wait_scale_s) + prob)

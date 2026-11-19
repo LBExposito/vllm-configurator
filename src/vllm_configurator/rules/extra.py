@@ -8,7 +8,7 @@ from typing import Any
 from ..domain import Decision, Warning
 from .context import RuleContext, RuleOutput
 
-# Flags dont l'app tire des conséquences : les passer en argument supplémentaire contourne ces calculs.
+# Flags the app draws consequences from: passing them as extra arguments bypasses these computations.
 ENGINE_DRIVEN = {
     "--max-model-len": "utiliser plutôt le champ « max-model-len cible », qui adapte l'extension de contexte et les contrôles",
     "--max-num-seqs": "l'analyse SLO et la capture des CUDA graphs restent calculées sur la valeur générée",

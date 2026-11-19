@@ -32,7 +32,9 @@ from . import frontend as fe
 from . import perf as p
 from . import traces
 from .catalog.loader import version_key
-from .domain import Bottleneck, CheckStatus, Recommendation, SloAnalysis, SloCheck, TestPlan, TestStep
+from .domain import (
+    Bottleneck, CheckStatus, Recommendation, SessionCapacity, SloAnalysis, SloCheck, TestPlan, TestStep,
+)
 from .rules.context import KB, RuleContext, fmt_int
 
 GIB = 1024**3
@@ -62,20 +64,20 @@ class Env:
     kv_tokens: int | None
     model: p.PerfModel | None
     dspark_cap: bool
-    # Tokens à prefiller par requête : (probabilité, tokens non cachés U, ISL), triés par U.
+    # Tokens to prefill per request: (probability, uncached tokens U, ISL), sorted by U.
     dist: tuple[tuple[float, float, float], ...] = ((1.0, 0.0, 0.0),)
     hit_effective: float = 0.0
     cold_fraction: float = 0.0
-    # Longueur d'acceptation des 5 % de requêtes les moins acceptées (TPOT p95).
+    # Acceptance length of the 5 % least accepted requests (TPOT p95).
     a_low: float = 1.0
-    # Frontal Python : coûts CPU (None : non modélisé, frontend Rust), processus API et threads du renderer configurés.
-    # frontend_autosize : redimensionnés point par point (recherche de réglages : le CPU suit la charge).
+    # Python frontend: CPU costs (None: not modelled, Rust frontend), configured API processes and renderer threads.
+    # frontend_autosize: re-sized point by point (settings search: the CPU follows the load).
     frontend_costs: fe.FrontendCosts | None = None
     api_servers: int = 1
     renderer_workers: int = 1
     frontend_autosize: bool = False
     max_api_servers: int = 64
-    # Incertitude multiplicative (bas, haut) sur la partie decode et sur la partie prefill des durées.
+    # Multiplicative uncertainty (low, high) on the decode part and on the prefill part of the durations.
     spread: tuple[float, float] = (1.0, 1.0)
     spread_prefill: tuple[float, float] = (1.0, 1.0)
 
@@ -93,7 +95,7 @@ class Env:
 
     @property
     def context_tokens(self) -> float:
-        # Contexte moyen d'une séquence en decode : prompt moyen + moitié de la sortie moyenne.
+        # Mean context of a decoding sequence: mean prompt + half the mean output.
         return self.isl_mean + self.osl_mean / 2
 
     @cached_property
@@ -173,10 +175,10 @@ class Env:
 @dataclass(frozen=True)
 class Evaluation:
     point: Point
-    per_instance: int | None        # concurrence cible par instance
-    active: int                     # séquences en decode
-    capacity: float                 # tokens de prefill disponibles par step
-    rho: float                      # charge de prefill du budget
+    per_instance: int | None        # target concurrency per instance
+    active: int                     # sequences in decode
+    capacity: float                 # prefill tokens available per step
+    rho: float                      # prefill load of the budget
     kv_usage: float | None
     slot_wait_s: float
     decode: p.StepTime | None = None
@@ -184,14 +186,14 @@ class Evaluation:
     average: p.StepTime | None = None
     chunk: float = 0
     chunk_step: p.StepTime | None = None
-    servers: int = 1                # prefills menés de front dans le budget
-    p_wait: float = 0.0             # probabilité d'attendre avant son prefill
-    prefill_wait_s: float = 0.0     # attente avant prefill, moyenne
+    servers: int = 1                # prefills run side by side in the budget
+    p_wait: float = 0.0             # probability of waiting before its prefill
+    prefill_wait_s: float = 0.0     # wait before prefill, mean
     prefill_wait_p95_s: float = 0.0
-    own_prefill_s: float = 0.0      # prefill d'un prompt au p95 des tokens non cachés
-    frontend_s: float = 0.0         # frontal (tokenisation…) pour l'ISL P95, attentes comprises
+    own_prefill_s: float = 0.0      # prefill of a prompt at the p95 of the uncached tokens
+    frontend_s: float = 0.0         # frontend (tokenization…) for the ISL P95, waits included
     frontend: fe.FrontendLoad | None = None
-    ttft_s: float | None = None     # TTFT p95 (quantile de la somme des composantes)
+    ttft_s: float | None = None     # TTFT p95 (quantile of the sum of the components)
     ttft_cold_s: float | None = None
     tpot_s: float | None = None     # TPOT p95
 
@@ -366,7 +368,7 @@ def _load(env: Env, pt: Point, inflight: int | None) -> tuple[int | None, int, f
         per_instance = math.ceil(wl.target_concurrency / pt.instances) if wl.target_concurrency else None
     active = min(pt.max_num_seqs, per_instance) if per_instance else pt.max_num_seqs
     capacity = pt.budget - active * env.d
-    # Régime stable : S·a/OSL requêtes finissent par step et sont remplacées (§3.1), longueurs moyennes.
+    # Steady state: S·a/OSL requests finish per step and are replaced (§3.1), mean lengths.
     arrivals = active * env.a / env.osl_mean
     rho = math.inf if capacity <= 0 else arrivals * env.isl_eff_mean / capacity
     kv_usage = active * env.context_tokens / env.kv_tokens if env.kv_tokens else None
@@ -389,9 +391,9 @@ def evaluate(env: Env, pt: Point, inflight: int | None = None) -> Evaluation:
     decode = p.step_time(m, active, tokens_per_seq, ctx_tokens, 0)
     average = p.step_time(m, active, tokens_per_seq, ctx_tokens, min(rho, 1.0) * capacity, pf_ctx)
 
-    # Prefills en cours dans un step : Poisson de moyenne arrivées × steps de prefill par requête (loi de Little ;
-    # chaque requête occupe au moins un step, les longues un par morceau), chacun apportant en moyenne τ tokens. L'ITL p95
-    # est celle du step au 95e centile de ce nombre (0 si moins de 5 % des steps portent du prefill).
+    # Prefills in progress in a step: Poisson of mean arrivals × prefill steps per request (Little's law; each request
+    # takes at least one step, long ones one per chunk), each bringing τ tokens on average. The ITL p95 is the step at
+    # the 95th percentile of that count (0 if fewer than 5 % of the steps carry prefill).
     steps_per_prefill = sum(prob * max(1, math.ceil(u / chunk)) for prob, u, _ in env.dist)
     in_progress = arrivals * steps_per_prefill
     n95 = _poisson_quantile(in_progress, 0.95)
@@ -409,9 +411,9 @@ def evaluate(env: Env, pt: Point, inflight: int | None = None) -> Evaluation:
         duration = env.osl_mean / env.a * average.seconds
         slot_wait = (per_instance - pt.max_num_seqs) / pt.max_num_seqs * duration
 
-    # Attente avant prefill : M/G/c. Une requête en prefill occupe le budget pendant n = ⌈U / morceau⌉ steps, en y
-    # prenant τ tokens en moyenne (une petite requête ne prend que ses tokens, le reste sert les suivantes) : le budget
-    # mène de front c = capacité / τ prefills. Service = n steps, de variance celle de n (requêtes froides comprises).
+    # Wait before prefill: M/G/c. A request in prefill holds the budget for n = ⌈U / chunk⌉ steps, taking τ tokens of it
+    # on average (a small request only takes its own tokens, the rest serves the next ones): the budget runs c =
+    # capacity / τ prefills side by side. Service = n steps, with the variance of n (cold requests included).
     second = sum(prob * max(1, math.ceil(u / chunk)) ** 2 for prob, u, _ in env.dist)
     scv = max(second / steps_per_prefill**2 - 1.0, 0.0) if steps_per_prefill else 0.0
     tau = min(chunk, env.isl_eff_mean / steps_per_prefill) if steps_per_prefill else chunk
@@ -422,15 +424,15 @@ def evaluate(env: Env, pt: Point, inflight: int | None = None) -> Evaluation:
     cs = chunk_step.seconds
 
     def own_prefill(u: float, isl: float) -> float:
-        # Morceaux au rythme d'un step chargé (contexte moyen du prefill), corrigés du contexte propre au prompt.
+        # Chunks at the pace of a loaded step (mean prefill context), corrected for the prompt's own context.
         correction = p.prefill_attention_seconds(m, u, isl - u / 2) - p.prefill_attention_seconds(m, u, pf_ctx)
         return max(max(1, math.ceil(u / chunk)) * cs + correction, cs)
 
-    # Frontal : requêtes et sorties streamées par seconde au rythme du step moyen.
+    # Frontend: requests and streamed outputs per second at the pace of the mean step.
     front = env.frontend_at(arrivals / average.seconds, active / average.seconds)
     front_wait = (front.loop_wait_s + front.pool_wait_s) if front else 0.0
 
-    # Une requête arrive en cours de step : elle attend en moyenne un demi-step avant d'être ordonnancée.
+    # A request arrives in the middle of a step: it waits half a step on average before being scheduled.
     fixed = slot_wait + 0.5 * average.seconds + front_wait
     per_flop = m.prefill_factor / (m.tp * m.flops_per_s)
     points = [(prob, fixed + env.frontend_s(isl) + max(max(1, math.ceil(u / chunk)) * cs + corr * per_flop, cs))
@@ -452,7 +454,7 @@ def _poisson_quantile(mean: float, q: float) -> int:
     """Smallest n with P(N ≤ n) ≥ q for N ~ Poisson(mean)."""
     if mean <= 0:
         return 0
-    if mean > 50:  # approximation normale (exp(−mean) sous-déborderait)
+    if mean > 50:  # normal approximation (exp(−mean) would underflow)
         return math.ceil(mean + f.normal_ppf(q) * math.sqrt(mean))
     term = cdf = math.exp(-mean)
     n = 0
@@ -559,7 +561,9 @@ def checks_for(env: Env, ev: Evaluation, observed=None) -> list[SloCheck]:
                        " une place, ce qui s'ajoute au TTFT." if queued else f"≤ max-num-seqs {ev.point.max_num_seqs}.")),
         ))
 
-    itl_measured = observed.itl_p95_ms if observed else None
+    same_load = not (observed and observed.inflight_per_instance and ev.per_instance
+                     and round(observed.inflight_per_instance) != ev.per_instance)
+    itl_measured = observed.itl_p95_ms if observed and same_load else None
     gen_label = "ITL p95" if env.metric == "itl" else "TPOT p95"
     central, low, high = gen_latency_ms(env, ev), gen_latency_ms(env, lo), gen_latency_ms(env, hi)
     if slo.itl_p95_ms or central is not None:
@@ -580,7 +584,7 @@ def checks_for(env: Env, ev: Evaluation, observed=None) -> list[SloCheck]:
                             estimate_low=None if low is None else round(low, 1),
                             estimate_high=None if high is None else round(high, 1),
                             measured=itl_measured, unit="ms", detail=detail))
-    ttft_measured = observed.ttft_p95_ms if observed else None
+    ttft_measured = observed.ttft_p95_ms if observed and same_load else None
     if slo.ttft_p95_ms or ev.ttft_ms is not None:
         status = (_measured_status(ttft_measured, slo.ttft_p95_ms) if ttft_measured
                   else _status(lo.ttft_ms, hi.ttft_ms, slo.ttft_p95_ms))
@@ -977,8 +981,8 @@ def build_env(ctx: RuleContext, state: dict[str, Any], kv_tokens: int | None,
     elif wl.cold_request_fraction is not None:
         cold = wl.cold_request_fraction
     else:
-        # Défaut plafonné : les requêtes froides ne portent pas plus d'une part donnée du prefill non caché, sans quoi le
-        # hit rate déclaré serait intenable (les premiers tours de session sont souvent plus courts que la moyenne).
+        # Capped default: cold requests carry no more than a given share of the uncached prefill, otherwise the declared
+        # hit rate could not hold (first session turns are often shorter than the mean).
         ceiling = cold_h["max_share_of_uncached_tokens"] * (1 - hit) * mean_isl / mean_cold if mean_cold else 0.0
         cold = min(cold_h["value"], ceiling)
         notes.append(
@@ -1042,9 +1046,9 @@ def build_env(ctx: RuleContext, state: dict[str, Any], kv_tokens: int | None,
 @dataclass(frozen=True)
 class FrontendCaps:
     rust: bool
-    api_servers: int        # valeur en vigueur : décision de l'app, argument supplémentaire ou défaut vLLM
+    api_servers: int        # value in force: decision of the app, extra argument or vLLM default
     renderer_workers: int
-    max_servers: int        # plafond des processus API (frontend Rust, LoRA à chaud, Elastic EP, CPU du pod)
+    max_servers: int        # cap on the API processes (Rust frontend, runtime LoRA, Elastic EP, pod CPU)
     reasons: tuple[str, ...]
     notes: tuple[str, ...] = ()
 
@@ -1108,8 +1112,17 @@ def calibrate(env: Env, base: Point, observed, uncertainty: dict) -> tuple[Env, 
     the gap does not come from the speed of the GPU but from the shape of the load. Returns (env, decode factor,
     prefill factor, notes)."""
     model = env.model
-    if model is None or not observed or not (observed.itl_p95_ms or observed.ttft_p95_ms):
+    if model is None or not observed or not (observed.itl_p95_ms or observed.ttft_p95_ms or observed.tpot_p95_ms):
         return env, None, None, []
+    # Measured generation latency: the target's metric, else the TPOT (working-set does not measure the ITL).
+    if observed.itl_p95_ms:
+        gen_metric, gen_value = env.metric, observed.itl_p95_ms
+    elif observed.tpot_p95_ms:
+        gen_metric, gen_value = "tpot", observed.tpot_p95_ms
+    else:
+        gen_metric, gen_value = None, None
+    # Load point of the measurement: measured requests in flight (replay), else the target concurrency.
+    inflight = max(1, round(observed.inflight_per_instance)) if observed.inflight_per_instance else None
     lo_bound, hi_bound = CALIBRATION_BOUNDS
     notes: list[str] = []
     decode = prefill = 1.0
@@ -1117,23 +1130,28 @@ def calibrate(env: Env, base: Point, observed, uncertainty: dict) -> tuple[Env, 
     spread, spread_prefill = env.spread, env.spread_prefill
 
     def at(decode_factor: float, prefill_factor: float) -> Evaluation:
-        return evaluate(replace(env, model=model.calibrated(decode_factor, prefill_factor)), base)
+        return evaluate(replace(env, model=model.calibrated(decode_factor, prefill_factor)), base, inflight)
+
+    def gen_ms(ev: Evaluation) -> float | None:
+        if ev.loaded is None:
+            return None
+        return ev.itl_ms if gen_metric == "itl" else ev.tpot_ms
 
     def solve_decode(prefill_factor: float | None) -> float | None:
         """Decode factor matching the measured generation latency (prefill_factor None: tied to it)."""
         ev = at(1.0, 1.0 if prefill_factor is None else prefill_factor)
         if ev.loaded is None:
             return None
-        step = ev.loaded if env.metric == "itl" else ev.average
-        lag = ev.frontend.loop_wait_p95_s if (ev.frontend and env.metric == "itl") else 0.0
-        target = (observed.itl_p95_ms / 1e3 - lag) * (1.0 if env.metric == "itl" else env.a_low)
+        step = ev.loaded if gen_metric == "itl" else ev.average
+        lag = ev.frontend.loop_wait_p95_s if (ev.frontend and gen_metric == "itl") else 0.0
+        target = (gen_value / 1e3 - lag) * (1.0 if gen_metric == "itl" else env.a_low)
         if prefill_factor is None:
             factor = target / step.seconds
         else:
             factor = (target - (step.seconds - step.decode_s)) / step.decode_s if step.decode_s > 0 else lo_bound
         return min(max(factor, lo_bound), hi_bound)
 
-    if observed.itl_p95_ms:
+    if gen_value:
         found = solve_decode(None)
         if found:
             decode = prefill = calibration = found
@@ -1151,36 +1169,43 @@ def calibrate(env: Env, base: Point, observed, uncertainty: dict) -> tuple[Env, 
                 lo, hi = (mid, hi) if value is not None and value < observed.ttft_p95_ms else (lo, mid)
             prefill = calibration_prefill = math.sqrt(lo * hi)
             spread_prefill = tuple(uncertainty["calibrated"])
-            if observed.itl_p95_ms:
+            if gen_value:
                 found = solve_decode(prefill)
                 if found:
                     decode = calibration = found
             reached = at(decode, prefill)
             gap_ttft = reached.ttft_ms / observed.ttft_p95_ms if reached.ttft_ms else 1.0
-            gap_gen = (gen_latency_ms(env, reached) or observed.itl_p95_ms) / observed.itl_p95_ms if observed.itl_p95_ms else 1.0
+            gap_gen = (gen_ms(reached) or gen_value) / gen_value if gen_value else 1.0
             if not (0.85 <= gap_ttft <= 1.15 and 0.85 <= gap_gen <= 1.15):
                 notes.append(
                     f"Mesures non conciliables par la seule vitesse du GPU (au mieux, TTFT {reached.ttft_ms:.0f} ms pour"
-                    f" {observed.ttft_p95_ms:g} mesurés" + (f", latence de génération {gen_latency_ms(env, reached):.1f} ms"
-                                                            f" pour {observed.itl_p95_ms:g}" if observed.itl_p95_ms else "")
+                    f" {observed.ttft_p95_ms:g} mesurés" + (f", latence de génération {gen_ms(reached):.1f} ms"
+                                                            f" pour {gen_value:g}" if gen_value else "")
                     + "). Dans le modèle, le TTFT ≈ morceaux × step chargé + frontal + attente, et le step chargé est"
                     " fixé par la latence de génération : l'écart vient de la forme de la charge (requêtes froides, hit"
                     " rate réel, file d'attente, rafales), pas du prefill. Le prefill n'est pas recalé (le TTFT mesuré"
                     " prime pour le verdict) : mesurer le hit rate et la part de requêtes froides et les saisir."
                 )
-                if observed.itl_p95_ms and calibration is not None:
+                if gen_value and calibration is not None:
                     decode = prefill = calibration = solve_decode(None)
-                elif not observed.itl_p95_ms:
+                elif not gen_value:
                     decode = prefill = 1.0
                 calibration_prefill, spread_prefill = None, env.spread_prefill
     env = replace(env, model=model.calibrated(decode, prefill), spread=spread, spread_prefill=spread_prefill)
-    label = "ITL" if env.metric == "itl" else "TPOT"
+    label = "ITL" if gen_metric == "itl" else "TPOT"
+    if gen_metric == "tpot" and env.metric == "itl":
+        notes.append("Cible en ITL, mesure en TPOT (working-set ne mesure pas l'intervalle entre deux sorties) : l'ITL p95,"
+                     " que font les steps chargés de prefill, reste extrapolée. La lire sur"
+                     " vllm:inter_token_latency_seconds pendant le rejeu et la saisir pour la recaler.")
+    if inflight is not None:
+        notes.append(f"Mesure faite à {inflight} requêtes en vol par instance (rejeu) : le modèle est recalé à ce point de"
+                     " charge, puis extrapolé aux autres.")
     if calibration is not None:
         notes.append(
-            f"Partie decode recalée sur la {label} p95 mesurée ({observed.itl_p95_ms:g} ms) : × {calibration:.2f}."
+            f"Partie decode recalée sur la {label} p95 mesurée ({gen_value:g} ms) : × {calibration:.2f}."
             + (" Écart important : vérifier que la mesure porte bien sur cette config." if not 0.5 <= calibration <= 2 else "")
             + (" En TPOT, le facteur absorbe aussi l'erreur sur la longueur d'acceptation : saisir a mesuré."
-               if env.metric == "tpot" and env.k else "")
+               if gen_metric == "tpot" and env.k else "")
         )
     if calibration_prefill is not None:
         notes.append(f"Partie prefill recalée sur le TTFT p95 mesuré ({observed.ttft_p95_ms:g} ms) : × {calibration_prefill:.2f}.")
@@ -1232,7 +1257,7 @@ def analyze(ctx: RuleContext, state: dict[str, Any]) -> SloAnalysis:
             + " Valider en production avec les métriques de l'onglet Vérification.",
         ))
     else:
-        # Le frontal se redimensionne point par point : un réglage ou des instances de plus n'en sont pas bloqués.
+        # The frontend is re-sized point by point: a setting or more instances are not blocked by it.
         search = replace(env, frontend_autosize=True)
         tune = best_point(search, candidate_points(search, base, base.instances), base)
         if tune is not None:
@@ -1283,7 +1308,7 @@ def analyze(ctx: RuleContext, state: dict[str, Any]) -> SloAnalysis:
                 rationale="Sans elles, l'analyse suppose des instances pleines et ne peut pas chiffrer la capacité GPU à ajouter.",
             ))
         recos.extend(specific)
-    if model is not None and not (observed and observed.itl_p95_ms and observed.ttft_p95_ms):
+    if model is not None and not (observed and (observed.itl_p95_ms or observed.tpot_p95_ms) and observed.ttft_p95_ms):
         recos.append(Recommendation(
             kind="measure", title="Valider par paliers, puis saisir la latence mesurée pour recaler l'analyse",
             rationale=("Le modèle de latence est un ordre de grandeur (×"
@@ -1293,6 +1318,7 @@ def analyze(ctx: RuleContext, state: dict[str, Any]) -> SloAnalysis:
 
     summary = _summary(verdict, bottlenecks, slo_given, model is not None)
     plan = build_test_plan(env, base, state.get("block_size"))
+    capacity = session_capacity(env, base, observed)
     breakdown = None
     if ev.loaded is not None:
         breakdown = {
@@ -1323,7 +1349,8 @@ def analyze(ctx: RuleContext, state: dict[str, Any]) -> SloAnalysis:
     return SloAnalysis(verdict=verdict, summary=summary, checks=checks, bottlenecks=bottlenecks, recommendations=recos,
                        step_breakdown=breakdown, calibration=calibration, calibration_prefill=calibration_prefill,
                        uncertainty=env.spread if model is not None else None,
-                       uncertainty_ttft=env.spread_prefill if model is not None else None, test_plan=plan, notes=notes)
+                       uncertainty_ttft=env.spread_prefill if model is not None else None, test_plan=plan,
+                       session_capacity=capacity, notes=notes)
 
 
 def adjusted_kv_tokens(ctx: RuleContext, state: dict[str, Any]) -> tuple[int | None, str | None]:
@@ -1397,13 +1424,173 @@ def session_equivalent(env: Env, inflight: int, fast: Evaluation, slow: Evaluati
     return (low, high), kv
 
 
+def _session_kv_limit(env: Env) -> int | None:
+    """Most sessions per instance whose contexts (active and waiting, shared prefix once) fit the KV threshold."""
+    if not env.kv_tokens:
+        return None
+    routing = env.ctx.request.routing
+    shared = min((routing.shared_prefix_tokens or 0) if routing else 0, env.isl_mean)
+    per_session = max(env.isl_mean + env.osl_mean - shared, 1.0)
+    return max(0, math.floor((env.kv_tokens * env.ctx.heuristic("kv_usage_max").value - shared) / per_session))
+
+
+def _first_failure(env: Env, ev: Evaluation) -> str:
+    """The check an operating point misses first, as a short label."""
+    h = env.ctx.heuristic
+    if ev.capacity <= 0:
+        return "le budget, saturé par le decode"
+    if ev.kv_usage is not None and ev.kv_usage > h("kv_usage_max").value:
+        return "le KV des séquences actives"
+    if ev.rho >= 1 or ev.rho > h("prefill_load_max").value:
+        return "la charge de prefill"
+    if not _frontend_ok(env, ev):
+        return "le frontal (CPU)"
+    slo = env.ctx.request.slo
+    hi = evaluate(with_factor(env, 1), ev.point, ev.per_instance)
+    if hi.loaded is not None:
+        if slo.itl_p95_ms and gen_latency_ms(env, hi) > slo.itl_p95_ms:
+            return "l'ITL p95" if env.metric == "itl" else "le TPOT p95"
+        if slo.ttft_p95_ms and hi.ttft_ms is not None and hi.ttft_ms > slo.ttft_p95_ms:
+            return "le TTFT p95"
+    if ev.per_instance and ev.per_instance > ev.point.max_num_seqs:
+        return "les places de séquence (max-num-seqs)"
+    return "la borne de la recherche"
+
+
+def _max_inflight(env: Env, budget: int, threshold: int, seqs: int | None, cap: int) -> int:
+    """Largest number of requests in flight per instance, up to `cap`, whose operating point passes every check at the
+    pessimistic end (assumed monotone). `seqs` None: --max-num-seqs follows the load."""
+    def ok(n: int) -> bool:
+        pt = Point(max_num_seqs=seqs or n, budget=budget, threshold=threshold, instances=1)
+        return passes(env, evaluate(env, pt, n))
+
+    if cap <= 0 or not ok(1):
+        return 0
+    if ok(cap):
+        return cap
+    lo, hi = 1, cap
+    while hi - lo > 1:
+        mid = (lo + hi) // 2
+        lo, hi = (mid, hi) if ok(mid) else (lo, mid)
+    return lo
+
+
+@dataclass(frozen=True)
+class _Capacity:
+    sessions: int
+    inflight: int
+    binding: str
+    point: Point
+    evaluation: Evaluation | None
+
+
+def _capacity_at(env: Env, budget: int, threshold: int, seqs: int | None, cap: int, kv_sessions: int | None) -> _Capacity:
+    """Sessions per instance an operating point holds within the SLOs (pessimistic end of the estimate)."""
+    n = _max_inflight(env, budget, threshold, seqs, cap)
+    point = Point(max_num_seqs=seqs or max(n, 1), budget=budget, threshold=threshold, instances=1)
+    if n == 0:
+        return _Capacity(0, 0, _first_failure(env, evaluate(env, point, 1)), point, None)
+    ev = evaluate(env, point, n)
+    found = session_equivalent(env, n, evaluate(with_factor(env, 0), point, n), evaluate(with_factor(env, 1), point, n))
+    sessions = found[0][0] if found else n
+    if n >= cap:
+        binding = "le KV des séquences actives" if cap == kv_seq_cap(env) else "la borne de la recherche"
+    else:
+        binding = _first_failure(env, evaluate(env, replace(point, max_num_seqs=seqs or n + 1), n + 1))
+    if kv_sessions is not None and kv_sessions < sessions:
+        # Waiting sessions keep their context: the KV caps the sessions before the latency does.
+        n = max(1, math.floor(n * kv_sessions / sessions)) if sessions else n
+        sessions, binding = kv_sessions, "le KV des sessions (actives et en attente d'un outil)"
+    return _Capacity(sessions, n, binding, point, ev)
+
+
+CAPACITY_LEVERS = {
+    "le KV des sessions (actives et en attente d'un outil)": (
+        "garder les sessions en attente en RAM hôte (--kv-offloading-size), relever --gpu-memory-utilization, ou un TP"
+        " plus large ou plus d'instances"),
+    "le KV des séquences actives": "relever --gpu-memory-utilization, un TP plus large ou plus d'instances",
+    "l'ITL p95": "plus d'instances, un TP plus large, ou le spec decoding (k)",
+    "le TPOT p95": "plus d'instances, un TP plus large, ou le spec decoding (k)",
+    "le TTFT p95": "plus d'instances, ou la désagrégation prefill/decode ; vérifier le hit rate et le routage",
+    "la charge de prefill": "plus d'instances, ou la désagrégation prefill/decode ; vérifier le hit rate et le routage",
+    "le frontal (CPU)": "plus de CPU par pod ou plus d'instances",
+    "le budget, saturé par le decode": "plus d'instances ou un TP plus large",
+}
+
+
+def session_capacity(env: Env, base: Point, observed) -> SessionCapacity | None:
+    """Agentic sessions per instance within the SLOs: the generated configuration, then the best setting of
+    --max-num-seqs, --max-num-batched-tokens, --long-prefill-token-threshold and the frontend."""
+    if env.wl.session_gap_s is None or env.model is None:
+        return None
+    cap = kv_seq_cap(env) or 4 * base.max_num_seqs
+    kv_sessions = _session_kv_limit(env)
+    current = _capacity_at(env, base.budget, base.threshold, base.max_num_seqs, cap, kv_sessions)
+    search = replace(env, frontend_autosize=True)
+    best, best_key, best_changes = current, None, {}
+    for budget in sorted(set(BUDGET_GRID) | {base.budget}):
+        cap_b = min(cap, budget // (env.k + 1)) if env.dspark_cap else cap
+        for threshold in sorted({budget // 4, budget // 2} | ({base.threshold} if base.threshold <= budget else set())):
+            cand = _capacity_at(search, budget, threshold, None, cap_b, kv_sessions)
+            if cand.sessions <= 0:
+                continue
+            seqs = max(cand.inflight, base.max_num_seqs)
+            if env.dspark_cap:
+                seqs = min(seqs, budget // (env.k + 1))
+            point = Point(max_num_seqs=seqs, budget=budget, threshold=threshold, instances=base.instances)
+            changes = changes_between(env, base, point)
+            if cand.evaluation is not None:
+                # Only adding processes or threads serves the capacity; removing some gains nothing.
+                front = frontend_changes(env, evaluate(search, replace(cand.point, max_num_seqs=seqs), cand.inflight))
+                current_front = {"--api-server-count": env.api_servers, "--renderer-num-workers": env.renderer_workers}
+                changes |= {flag: value for flag, value in front.items() if value > current_front[flag]}
+            key = (cand.sessions, -len(changes))
+            if best_key is None or key > best_key:
+                best_key, best, best_changes = key, cand, changes
+    if best.sessions <= current.sessions:
+        best, best_changes = current, {}
+
+    summary = (f"Config générée : ~{current.sessions} sessions par instance ({current.inflight} requêtes en vol),"
+               f" limitée par {current.binding}.")
+    if best_changes:
+        summary += (f" Meilleur réglage trouvé : ~{best.sessions} sessions ({best.inflight} en vol), limité par"
+                    f" {best.binding}, avec {_describe(best_changes)}.")
+    else:
+        summary += " Aucun réglage du scheduler ni du frontal ne fait mieux"
+        lever = CAPACITY_LEVERS.get(current.binding)
+        summary += f" : au-delà, {lever}." if lever else "."
+    if best_changes and CAPACITY_LEVERS.get(best.binding):
+        summary += f" Au-delà : {CAPACITY_LEVERS[best.binding]}."
+    measured = observed.capacity_sessions_per_instance if observed else None
+    if measured:
+        summary += f" working-set a validé {measured:g} sessions par instance avec la config déployée."
+    notes = [
+        f"Sessions = requêtes en vol × (durée d'une requête + {env.wl.session_gap_s:g} s d'attente) / durée, à la borne"
+        f" pessimiste de l'estimation (×{env.spread[1]:g}) : SLO tenus même si le modèle est optimiste dans cette limite.",
+        "Le réglage proposé reste à valider par un rejeu : déployer, rejouer la même trace, importer le résultat.",
+    ]
+    if kv_sessions is not None:
+        notes.append(f"Le KV d'une instance loge ~{kv_sessions} sessions (contexte moyen, préfixe commun compté une fois,"
+                     f" {env.ctx.heuristic('kv_usage_max').value:.0%} du pool).")
+    if measured and current.sessions:
+        ratio = current.sessions / measured
+        if not 0.7 <= ratio <= 1.4:
+            notes.append(f"Écart de ×{ratio:.2f} entre la capacité estimée et la capacité mesurée : recaler sur un palier"
+                         " du rejeu (latences et requêtes en vol mesurées) avant de suivre le réglage proposé.")
+    return SessionCapacity(
+        current_sessions=current.sessions, current_inflight=current.inflight, current_binding=current.binding,
+        best_sessions=best.sessions, best_inflight=best.inflight, best_binding=best.binding, changes=best_changes,
+        measured_sessions=measured, summary=summary, notes=notes,
+    )
+
+
 def _ws_thresholds(env: Env) -> list[str]:
     """`ws replay` pass-rule flags matching the SLOs (approximate: working-set judges other percentiles)."""
     slo, flags = env.ctx.request.slo, []
     if slo.ttft_p95_ms:
         flags.append(f"--max-warm-ttft-s {slo.ttft_p95_ms / 1e3:g}")
     if slo.itl_p95_ms:
-        # Débit de decode d'une requête ≈ tokens par sortie / intervalle entre sorties.
+        # Decode speed of a request ≈ tokens per output / interval between outputs.
         per_output = 1.0 if env.metric == "tpot" else env.a_low
         flags.append(f"--min-decode-tok-s {math.floor(per_output * 1e3 / slo.itl_p95_ms):g}")
     return flags
@@ -1429,7 +1616,7 @@ def build_test_plan(env: Env, base: Point, block_size: int | None = None) -> Tes
         checks = [c for c in checks_for(env, ev) if c.in_verdict and c.key != "slots"]
         status = worst(checks)
         if env.model is None and status == "ok":
-            status = "unknown"  # capacité suffisante, mais latences non estimées : la mesure tranche
+            status = "unknown"  # enough capacity, but latencies not estimated: the measurement decides
         sessions = session_equivalent(env, count, lo, hi)
         kv_max = ctx.heuristic("kv_usage_max").value
         if sessions and sessions[1] is not None and sessions[1] > kv_max and status == "ok":
@@ -1602,7 +1789,7 @@ def build_test_plan(env: Env, base: Point, block_size: int | None = None) -> Tes
     return TestPlan(steps=steps, summary=summary, protocol=protocol, pass_criteria=criteria, notes=notes)
 
 
-MAX_TP = 8  # domaine NVLink d'un nœud HGX
+MAX_TP = 8  # NVLink domain of an HGX node
 
 
 def _wider_tp(env: Env, base: Point) -> tuple[int, int, Point, Evaluation] | None:
@@ -1625,7 +1812,7 @@ def _scale_out(env: Env, base: Point) -> tuple[int, Point, Evaluation] | None:
     def attempt(n: int):
         return best_point(env, candidate_points(env, base, n), base)
 
-    limit = max(base.instances + 1, env.wl.target_concurrency)  # au-delà : moins d'une séquence par instance
+    limit = max(base.instances + 1, env.wl.target_concurrency)  # beyond: less than one sequence per instance
     lo, hi, found = base.instances, base.instances + 1, None
     while True:
         found = attempt(hi)

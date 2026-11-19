@@ -105,7 +105,7 @@ def generate_routing(result: GenerationResult, catalog: Catalog | None = None) -
         out.warn("info", "Une seule instance : l'EPP n'a rien à départager. La configuration reste utile pour le jour où"
                          " les instances se multiplient, et elle est recalculée avec leur nombre.", rule_id="llmd.instances")
 
-    # --- Données d'entrée : hit rate, KV, longueurs --------------------------------------------------------------
+    # --- Inputs: hit rate, KV, lengths ---------------------------------------------------------------------------
     hit = wl.prefix_cache_hit_rate
     if hit is None and profile.prefix_cache_hit_rate is not None:
         hit = profile.prefix_cache_hit_rate.value
@@ -118,7 +118,7 @@ def generate_routing(result: GenerationResult, catalog: Catalog | None = None) -
     isl_mean = formulas.mean_from_percentiles(wl.isl.p50, wl.isl.p95, wl.isl.p99)
     occupancy = _kv_occupancy(result)
 
-    # --- Taille de bloc de l'index ------------------------------------------------------------------------------
+    # --- Index block size ---------------------------------------------------------------------------------------
     block = _block_size(out, facts, precise)
     if block is None:
         return _finish(out, base, routing, precise, result, None, None)
@@ -132,7 +132,7 @@ def generate_routing(result: GenerationResult, catalog: Catalog | None = None) -
     else:
         _precise_vllm_side(out, routing, ctx, request)
 
-    # --- Poids du profil ----------------------------------------------------------------------------------------
+    # --- Profile weights ----------------------------------------------------------------------------------------
     gain = _weights(out, routing, hit, isl_mean, n, occupancy, facts, wl, precise)
     _mode_advice(out, precise, occupancy)
     _overrides(out, routing, precise, kv_tokens, facts)
@@ -307,7 +307,7 @@ def _weights(out: _Out, routing: RoutingRequest, hit: float | None, isl_mean: fl
     defaults = out.llmd.default_profile.weights
     src = [f"{KB} §9.1, §9.4"]
 
-    # Affinité : gain de prefill apporté par le routage par préfixe.
+    # Affinity: prefill saved by prefix-aware routing.
     gain = None
     shared = routing.shared_prefix_tokens
     if hit is not None:
@@ -335,7 +335,7 @@ def _weights(out: _Out, routing: RoutingRequest, hit: float | None, isl_mean: fl
     _weight(out, routing, "prefix-cache-scorer", weight, justification, formula, computation, src,
             "Affinité de préfixe" + (" (precise)" if precise else ""))
 
-    # Occupation du KV.
+    # KV usage.
     if occupancy is not None:
         weight = _tier(out.heuristic("kv_weight_by_occupancy"), occupancy)
         justification = (f"Au palier de la config générée, le KV est occupé à ~{_pct(occupancy)}. "
@@ -349,7 +349,7 @@ def _weights(out: _Out, routing: RoutingRequest, hit: float | None, isl_mean: fl
     _weight(out, routing, "kv-cache-utilization-scorer", weight, justification, "paliers d'occupation du KV", computation,
             src, "Occupation du KV")
 
-    # File d'attente.
+    # Queue.
     q = out.heuristic("queue_weight")
     if wl.target_concurrency and facts.max_num_seqs:
         load = wl.target_concurrency / n / facts.max_num_seqs

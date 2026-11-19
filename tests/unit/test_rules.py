@@ -44,7 +44,7 @@ class TestVersionDependentRules:
         assert indicators(generate(req()))["decode_tokens_per_seq"] == 4
 
     def test_dspark_budget_accounting_0_32_reserves_draft_slots(self):
-        # 0.32.0 : 1 + k (vérification) + k − 1 (slots de drafting DSpark) = 6 pour k = 3.
+        # 0.32.0: 1 + k (verification) + k − 1 (DSpark drafting slots) = 6 for k = 3.
         result = generate(req(vllm_version="0.32.0"))
         assert indicators(result)["decode_tokens_per_seq"] == 6
         assert "dspark_active_seq_cap" not in indicators(result)
@@ -121,7 +121,7 @@ class TestScheduler:
 
     def test_kv_limited_caps_max_num_seqs(self):
         result = generate(req(observed_kv={"kv_cache_tokens": 2_400_000}))
-        assert values(result)["max_num_seqs"] == 100  # 2,4 M / 24 000
+        assert values(result)["max_num_seqs"] == 100  # 2.4 M / 24,000
 
     def test_capture_clamped_to_budget(self):
         result = generate(req(workload={"usage_type": "chat"}, spec={"num_speculative_tokens": 7}))
@@ -133,7 +133,7 @@ class TestKvCapacity:
         result = generate(req(observed_kv=None))
         assert result.facts.kv_tokens_source == "estimate"
         assert result.facts.kv_tokens_per_instance > 0
-        assert sum(w.category == "to_verify" for w in result.warnings) >= 2  # octets/token et HBM
+        assert sum(w.category == "to_verify" for w in result.warnings) >= 2  # bytes/token and HBM
         assert any(a.key == "kv_reserve" for a in result.assumptions)
 
     def test_unknown_kv_blocks_generation(self):
@@ -187,7 +187,7 @@ class TestRender:
 
 class TestGpuMemoryUtilization:
     def test_profiled_cudagraph_memory_keeps_the_vllm_default(self):
-        # Capture de 2048 avec DSpark : vLLM profile la mémoire des graphs, 0,8 la compterait deux fois.
+        # 2048 capture with DSpark: vLLM profiles the graph memory, 0.8 would count it twice.
         result = generate(req())
         decision = values(result)["gpu_memory_utilization"]
         assert decision == 0.92

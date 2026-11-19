@@ -1,5 +1,5 @@
-# Catalogue llm-d / EPP livré avec RHOAI 3.5.x (édité à la main, docs/vllm-config-knowledge-base.md §9).
-# status: verified = lu dans les logs réels de l'EPP (§9.3) ou dans la doc RHOAI 3.5 ; unverified = 🔶 à vérifier.
+# llm-d / EPP catalog shipped with RHOAI 3.5.x (edited by hand, docs/vllm-config-knowledge-base.md §9).
+# status: verified = read in real EPP logs (§9.3) or in the RHOAI 3.5 docs; unverified = 🔶 to verify.
 id: rhoai-3.5
 display_name: "llm-d (EPP) de RHOAI 3.5.x"
 api_version: inference.networking.x-k8s.io/v1alpha1
@@ -12,7 +12,7 @@ placement:
   source: "RHOAI 3.5 – Configuring scheduler settings for LLM inference services (section 10.5)"
   note: "Champ exact du LLMInferenceService à relire dans la doc RHOAI de la version déployée."
 
-# Profil appliqué par RHOAI sans configuration (log « EPP config after phase two »).
+# Profile RHOAI applies without configuration (log « EPP config after phase two »).
 default_profile:
   status: verified
   source: "Logs réels de l'EPP, cas de référence (base de connaissances §9.3) ; doc RHOAI 3.5 (§9.1)"
@@ -138,7 +138,7 @@ behaviors:
     status: verified
     source: "Log « FlowControlConfig: nil » (§9.3)"
 
-# Choix de l'app pour les poids du profil (aucune source publiée ne les fixe : à valider par la mesure).
+# The app's choice for the profile weights (no published source sets them: to validate by measurement).
 heuristics:
   prefix_weight_by_prefill_gain:
     value: [[3.0, 5], [1.5, 3], [0.0, 2]]

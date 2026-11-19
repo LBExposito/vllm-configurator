@@ -41,7 +41,7 @@ def test_generated_snapshot_is_informative_only(request_):
     doc = yaml.safe_load(text)
     assert "--max-num-seqs" in doc["generated"]["args"]
     assert doc["generated"]["slo_verdict"] == result.analysis.verdict
-    doc["generated"]["args"] = ["--bogus"]  # modifié à la main : ignoré à l'import
+    doc["generated"]["args"] = ["--bogus"]  # edited by hand: ignored on import
     loaded, _ = load_scenario(yaml.safe_dump(doc, allow_unicode=True))
     assert loaded == request_
 

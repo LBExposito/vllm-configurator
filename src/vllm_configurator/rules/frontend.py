@@ -21,7 +21,7 @@ def decide_frontend(ctx: RuleContext, state: dict[str, Any]) -> RuleOutput:
     The traffic (requests and streamed outputs per second) comes from the step model of the SLO analysis, at the
     optimistic end of its uncertainty: faster steps mean more traffic for the frontend. vLLM defaults are kept when
     they hold: these flags only cost CPU when the frontend is the bottleneck."""
-    from .. import analysis as A  # import local : analysis importe le paquet rules
+    from .. import analysis as A  # local import: analysis imports the rules package
     from .. import frontend as fe
 
     out = RuleOutput()
@@ -139,7 +139,7 @@ def decide_frontend(ctx: RuleContext, state: dict[str, Any]) -> RuleOutput:
         omitted_reason=None if workers != default_workers else "Défaut de vLLM suffisant.",
     ))
 
-    # --- CPU du pod ---------------------------------------------------------------
+    # --- Pod CPU ----------------------------------------------------------------------
     tp = req.gpus_per_instance
     hv = h.value
     needed = hv["cores_engine_core"] + tp * hv["cores_per_gpu_worker"] + sized.cores

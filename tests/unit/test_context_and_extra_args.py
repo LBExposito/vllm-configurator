@@ -36,7 +36,7 @@ class TestContextExtension:
         d = values(result)
         assert d["max_model_len"].emitted and d["max_model_len"].value == 1_000_000
         rope = d["hf_overrides"].value["text_config"]["rope_parameters"]
-        # Bloc complet de la model card, factor 4.0 pour 1 000 000 tokens.
+        # Complete block of the model card, factor 4.0 for 1,000,000 tokens.
         assert rope == {"mrope_interleaved": True, "mrope_section": [11, 11, 10], "rope_type": "yarn",
                         "rope_theta": 10000000, "partial_rotary_factor": 0.25,
                         "original_max_position_embeddings": 262144, "factor": 4.0}
@@ -58,7 +58,7 @@ class TestContextExtension:
         assert not values(result)["max_model_len"].emitted
         assert "hf_overrides" not in values(result)
         assert result.env == {}
-        assert any("Extension possible jusqu'à" in w.message for w in result.warnings)  # séparateur : espace fine
+        assert any("Extension possible jusqu'à" in w.message for w in result.warnings)  # separator: thin space
 
     def test_shorter_target_is_emitted_without_override(self):
         result = run(max_model_len=131072, workload={**QWEN["workload"], "isl": {"p50": 20000}})
@@ -101,7 +101,7 @@ class TestExtraArgs:
             argv = render.argv(result)
             assert argv.count("--hf-overrides") == 1
             assert json.loads(argv[argv.index("--hf-overrides") + 1]) == override
-            assert result.env["VLLM_ALLOW_LONG_MAX_MODEL_LEN"] == "1"  # override manuel : env posée quand même
+            assert result.env["VLLM_ALLOW_LONG_MAX_MODEL_LEN"] == "1"  # manual override: env set anyway
 
     def test_engine_driven_flag_warns(self):
         result = run(extra_args={"--max-num-seqs": 64})

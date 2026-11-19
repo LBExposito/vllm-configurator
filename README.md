@@ -1,111 +1,112 @@
 # vllm-configurator
 
-Application web qui génère une configuration `vllm serve` adaptée à votre déploiement : GPU, modèle, version de
-vLLM, profil de charge et objectifs de latence. Elle génère aussi la configuration du routage intelligent llm-d (EPP)
-qui répartit les requêtes entre ces instances vLLM. Elle explique chaque valeur retenue et signale ce qui reste à
-vérifier.
+A web app that generates a `vllm serve` configuration for your deployment: GPU, model, vLLM version, workload profile
+and latency targets. It also generates the configuration of the llm-d smart routing (EPP) that spreads the requests
+over those vLLM instances. It explains every value it picks and flags what is left to verify.
 
-- [Ce que fait l'app](#ce-que-fait-lapp)
-- [Guide de démarrage](#guide-de-démarrage)
-- [Maintenance : architecture et catalogue](#maintenance--architecture-et-catalogue)
+The app's interface, justifications and warnings are in French. This README quotes the interface labels as they
+appear on screen.
+
+- [What the app does](#what-the-app-does)
+- [Getting started](#getting-started)
+- [Maintenance: architecture and catalog](#maintenance-architecture-and-catalog)
 
 ---
 
-## Ce que fait l'app
+## What the app does
 
-### Le problème
+### The problem
 
-Les paramètres de vLLM qui pèsent le plus sur les performances (`--max-num-batched-tokens`, `--max-num-seqs`,
-`--long-prefill-token-threshold`, speculative decoding, capture des CUDA graphs, `--gpu-memory-utilization`)
-dépendent les uns des autres, du profil de charge et de la version de vLLM. Leurs règles de dimensionnement
-existent, mais elles sont dispersées entre des PR, des notes de version et des recettes, et elles changent d'une
-version à l'autre. L'app applique ces règles de façon reproductible et montre son raisonnement.
+The vLLM parameters that weigh most on performance (`--max-num-batched-tokens`, `--max-num-seqs`,
+`--long-prefill-token-threshold`, speculative decoding, CUDA graph capture, `--gpu-memory-utilization`) depend on each
+other, on the workload profile and on the vLLM version. Their sizing rules exist, but they are scattered across PRs,
+release notes and recipes, and they change from one version to the next. The app applies these rules reproducibly
+and shows its reasoning.
 
-### Entrées
+### Inputs
 
-| Groupe | Ce que vous fournissez |
+| Group | What you provide |
 |---|---|
-| Matériel | Type de GPU, nombre de GPU par instance (tensor parallel), nombre d'instances |
-| Modèle et version | Modèle du catalogue, version de vLLM |
-| Profil de charge | Type d'usage (chat, agentique, RAG, extraction, résumé, scoring, batch), mode interactif ou batch, ISL et OSL en P50 / P95 / P99, taux de prefix cache hit attendu, part de requêtes froides (préfixe absent du cache), requêtes en vol visées, tokens à prefiller d'une requête chaude, attente entre deux requêtes d'une session ; ou import d'une trace [working-set](https://github.com/T0mSIlver/working-set) qui remplit ces champs |
-| SLO | TTFT p95 et ITL p95 cibles (optionnels) |
-| Mesures en production (optionnel) | ITL (ou TPOT) p95 et TTFT p95 mesurés avec la config générée : ils priment sur l'estimation ; la latence de génération recale la partie decode du modèle, le TTFT sa partie prefill |
-| Speculative decoding | Activation, `k`, méthode d'échantillonnage du draft, longueur d'acceptation mesurée, tolérance à une vérification lossy (FLy) |
-| Contexte et arguments supplémentaires (optionnel) | `max-model-len` cible (avec extension de contexte YaRN quand le modèle en a une), flags vLLM et variables d'environnement additionnels |
-| Logs de démarrage (optionnel) | `GPU KV cache size`, taille de bloc et `gpu-memory-utilization` lus dans les logs d'une instance |
-| Routage llm-d (optionnel) | Version d'llm-d, index de préfixes approximatif ou precise, préfixe commun à toutes les sessions, poids forcés, valeurs lues dans le log de l'EPP et hit rate mesuré par pod |
+| Hardware | GPU type, GPUs per instance (tensor parallel), number of instances |
+| Model and version | Catalog model, vLLM version |
+| Workload profile | Usage type (chat, agentic, RAG, extraction, summary, scoring, batch), interactive or batch mode, ISL and OSL at P50 / P95 / P99, expected prefix cache hit rate, share of cold requests (prefix missing from the cache), target requests in flight, tokens to prefill for a warm request, wait between two requests of a session; or import a [working-set](https://github.com/T0mSIlver/working-set) trace, which fills these fields |
+| SLOs | Target TTFT p95 and ITL p95 (optional) |
+| Production measurements (optional) | ITL (or TPOT) p95 and TTFT p95 measured with the generated config: they take precedence over the estimate; the generation latency recalibrates the decode part of the model, the TTFT its prefill part. Or import a `ws replay` result |
+| Speculative decoding | On/off, `k`, draft sampling method, measured acceptance length, tolerance to a lossy verification (FLy) |
+| Context and extra arguments (optional) | Target `max-model-len` (with YaRN context extension when the model has one), extra vLLM flags and environment variables |
+| Startup logs (optional) | `GPU KV cache size`, block size and `gpu-memory-utilization` read in the logs of one instance |
+| llm-d routing (optional) | llm-d version, approximate or precise prefix index, prefix shared by all sessions, forced weights, values read in the EPP log and hit rate measured per pod |
 
-Seuls l'ISL P50 et l'OSL P50 sont obligatoires. Une donnée manquante est remplacée par une hypothèse affichée, ou
-l'app la demande explicitement si elle est indispensable.
+Only the ISL P50 and the OSL P50 are required. A missing input is replaced by a displayed assumption, or the app asks
+for it explicitly when it cannot do without it.
 
-### Sorties
+### Outputs
 
-- **La configuration**, en deux formats : le bloc `args:` à coller dans un manifeste KServe ou Kubernetes, et la
-  commande `vllm serve` équivalente.
-- **Une justification pour chaque valeur** : la règle appliquée, la formule et le calcul chiffré, la valeur par
-  défaut de vLLM, les sources, et un statut ✅ vérifié ou 🔶 à vérifier.
-- **Des avertissements** classés par gravité : modèle non pris en charge par la version, FLy lossy en usage
-  agentique, OSL suspect, KV limitant, données non confirmées, changements cassants de la version.
-- **Des indicateurs calculés** : ratio ISL_eff/OSL réel comparé au ratio nécessaire pour remplir le budget,
-  contextes que le KV peut loger aux P50/P95/P99, tokens consommés par step de decode, tokens par expert MoE,
-  plafond de séquences imposé par vLLM avec DSpark.
-- **Un plan de test par paliers** : pour chaque valeur de `max-num-seqs` à valider, les flags à poser, la charge à
-  injecter, les plages attendues d'ITL, de TPOT, de TTFT et d'occupation du KV, et le nombre d'instances nécessaire si
-  le palier tient. La mesure des paliers fixe le dimensionnement ; l'estimation sert à choisir où tester. Une
-  estimation indicative au point de la config générée (goulot, pistes de correction) reste disponible. Voir
-  [Paliers de test et SLO](#paliers-de-test-et-slo).
-- **Les hypothèses** retenues quand une entrée manque.
-- **La vérification** : une commande pour contrôler que chaque flag existe sur l'image déployée, et la liste des
-  métriques Prometheus à surveiller.
-- **La configuration llm-d** : l'`EndpointPickerConfig` (index de préfixes et poids des scorers) dérivée de la config
-  vLLM, avec ses justifications et les lignes de log de l'EPP à vérifier après déploiement. Voir
-  [Routage llm-d](#routage-llm-d).
-- **Un fichier de scénario** YAML, exportable et réimportable depuis l'interface : entrées, SLO et mesures, plus un
-  instantané de la config générée. Voir [Sauvegarder et recharger un scénario](#sauvegarder-et-recharger-un-scénario).
+- **The configuration**, in two formats: the `args:` block to paste into a KServe or Kubernetes manifest, and the
+  equivalent `vllm serve` command.
+- **A justification for every value**: the rule applied, the formula and the worked computation, the vLLM default,
+  the sources, and a ✅ verified or 🔶 to-verify status.
+- **Warnings** ranked by severity: model not supported by the version, lossy FLy in agentic use, suspicious OSL,
+  limiting KV, unconfirmed data, breaking changes of the version.
+- **Computed indicators**: actual ISL_eff/OSL ratio compared to the ratio needed to fill the budget, contexts the KV
+  can hold at P50/P95/P99, tokens consumed per decode step, tokens per MoE expert, sequence cap imposed by vLLM with
+  DSpark.
+- **A step-by-step test plan**: for each `max-num-seqs` value to validate, the flags to set, the load to inject, the
+  expected ranges of ITL, TPOT, TTFT and KV usage, and the number of instances needed if the step holds. With agentic
+  sessions, the sessions to replay per step and the `ws replay` command. Measuring the steps settles the sizing; the
+  estimate is there to choose where to test. An indicative estimate at the generated config's operating point
+  (bottleneck, fixes) remains available. See [Test steps and SLOs](#test-steps-and-slos).
+- **The capacity in agentic sessions** per instance, for the generated config and for the best vLLM setting found.
+  See [Capacity in sessions](#capacity-in-sessions).
+- **The assumptions** made when an input is missing.
+- **Verification**: a command to check that every flag exists on the deployed image, and the list of Prometheus
+  metrics to watch.
+- **The llm-d configuration**: the `EndpointPickerConfig` (prefix index and scorer weights) derived from the vLLM
+  config, with its justifications and the EPP log lines to check after deployment. See
+  [llm-d routing](#llm-d-routing).
+- **A YAML scenario file**, exportable from and re-importable into the interface: inputs, SLOs and measurements, plus
+  a snapshot of the generated config. See [Save and reload a scenario](#save-and-reload-a-scenario).
 
-### Ce sur quoi vous pouvez compter
+### What you can rely on
 
-- **Aucun flag inconnu.** Chaque flag et chaque clé JSON émis ont été extraits du code source de vLLM au tag de
-  la version choisie. C'est important à partir de 0.33, dont le frontend Rust refuse de démarrer sur un flag
-  inconnu.
-- **Des règles qui suivent la version.** Par exemple, avec DSpark à k = 3, chaque séquence en decode consomme
-  6 tokens de budget en 0.32 et 4 en 0.33. FLy n'est proposé qu'à partir de 0.33.
-- **Aucune spécification inventée.** Les fiches modèles sont épinglées sur une révision Hugging Face précise.
-  Quand la taille du KV par token n'est pas calculable de façon fiable, l'app demande la valeur des logs au lieu
-  de l'estimer.
+- **No unknown flag.** Every flag and every JSON key emitted was extracted from the vLLM source code at the tag of the
+  chosen version. This matters from 0.33 on, whose Rust frontend refuses to start on an unknown flag.
+- **Rules that follow the version.** For instance, with DSpark at k = 3, each decoding sequence consumes 6 budget
+  tokens in 0.32 and 4 in 0.33. FLy is only offered from 0.33 on.
+- **No invented specification.** Model cards are pinned to an exact Hugging Face revision. When the KV size per token
+  cannot be computed reliably, the app asks for the value from the logs instead of estimating it.
 
-### Limites
+### Limits
 
-- L'app ne mesure rien : elle applique des règles. Les latences des paliers sont des **plages** (×0,8 à ×2,5 sans
-  mesure) issues d'un modèle roofline dont les rendements sont supposés (🔶). C'est la mesure des paliers qui tranche ;
-  saisir la latence de génération et le TTFT mesurés recale chacun sa partie du modèle (±15 %).
-- Le TTFT p95 dépend surtout de la forme de la charge : part de requêtes froides, hit rate réel, rafales. Un test de
-  charge par prompts aléatoires, ou à OSL fixe démarré d'un bloc, ne reproduit pas la production (voir le protocole
-  des paliers).
-- Sans logs de démarrage, la taille du KV est une estimation grossière (borne haute) : relancez le calcul avec la
-  valeur réelle après le premier déploiement.
-- Les poids des scorers llm-d sont des choix de l'app (🔶), calés sur la configuration proposée par la base de
-  connaissances : c'est le hit rate mesuré par pod qui les valide. Le mode precise ne génère que la partie connue de sa
-  configuration (taille de bloc, `--kv-events-config`) ; l'indexer et le sidecar tokenizer restent à poser d'après le
-  guide llm-d.
+- The app measures nothing: it applies rules. The step latencies are **ranges** (×0.8 to ×2.5 without measurement)
+  from a roofline model whose efficiencies are assumed (🔶). Measuring the steps decides; entering the measured
+  generation latency and TTFT recalibrates each its part of the model (±15 %).
+- The TTFT p95 mostly depends on the shape of the load: share of cold requests, actual hit rate, bursts. A load test
+  with random prompts, or with a fixed OSL started all at once, does not reproduce production (see the step protocol).
+- Without startup logs, the KV size is a rough estimate (upper bound): rerun the computation with the real value after
+  the first deployment.
+- The llm-d scorer weights are choices of the app (🔶), set after the configuration proposed by the knowledge base:
+  the hit rate measured per pod is what validates them. The precise mode only generates the known part of its
+  configuration (block size, `--kv-events-config`); the indexer and the tokenizer sidecar are to be set up following
+  the llm-d guide.
 
-### Catalogue actuel
+### Current catalog
 
-| Type | Contenu |
+| Type | Content |
 |---|---|
 | GPU | NVIDIA B300 |
-| Modèles | DeepSeek V4.1 Flash (build 1017), Qwen3.8 Flash Next, GLM-5.3 Flash, Mistral Large 4 (image dédiée requise) |
-| Versions de vLLM | 0.31.0, 0.32.0, 0.33.0 |
+| Models | DeepSeek V4.1 Flash (build 1017), Qwen3.8 Flash Next, GLM-5.3 Flash, Mistral Large 4 (dedicated image required) |
+| vLLM versions | 0.31.0, 0.32.0, 0.33.0 |
 | llm-d (EPP) | RHOAI 3.5.x |
 
-### Exemple : le cas de référence
+### Example: the reference case
 
-DeepSeek V4.1 Flash sur 2 pods de 4 × B300 (TP4), vLLM 0.33.0, chat agentique, ISL P50 24K, KV de 86 M tokens par
-pod lu dans les logs. Configuration générée :
+DeepSeek V4.1 Flash on 2 pods of 4 × B300 (TP4), vLLM 0.33.0, agentic chat, ISL P50 24K, KV of 86 M tokens per pod
+read in the logs. Generated configuration (the app writes its YAML comments in French; translated here):
 
 ```yaml
 args:
-  # --- Parallélisme ---
+  # --- Parallelism ---
   - --tensor-parallel-size
   - "4"
   - --data-parallel-size
@@ -126,10 +127,10 @@ args:
   - --kv-cache-dtype
   - "fp8"
   - --gpu-memory-utilization
-  - "0.8"
-  # pas de block-size : imposée à 128 par le backend, ne pas la forcer (§5)
-  # pas de kv-offloading-size : 3 592 contextes P50 tiennent dans le KV, offload inutile
-  # pas de max-model-len : défaut = contexte maximal du modèle (1 048 576)
+  - "0.92"
+  # no block-size: forced to 128 by the backend, do not force it (§5)
+  # no kv-offloading-size: 3,592 P50 contexts fit in the KV, offload not needed
+  # no max-model-len: default = maximum context of the model (1,048,576)
 
   # --- Speculative decoding ---
   - --speculative-config
@@ -138,69 +139,73 @@ args:
   # --- CUDA graphs ---
   - --compilation-config
   - '{"max_cudagraph_capture_size":2048}'
+
+  # --- Frontend ---
+  - --api-server-count
+  - "2"
+  # no renderer-num-workers: the vLLM default is enough.
 ```
 
-Pour ce cas, l'app signale aussi que l'OSL P50 de 4 000 tokens est environ 16 fois la médiane publiée pour
-l'agentique (247), et que l'ISL P99 de 666K est à qualifier : mesure par appel ou cumul par session ?
+For this case, the app also reports that the OSL P50 of 4,000 tokens is about 16 times the published agentic median
+(247), and that the ISL P99 of 666K needs qualifying: measured per call, or summed per session?
 
 ---
 
-## Guide de démarrage
+## Getting started
 
-### 1. Prérequis
+### 1. Prerequisites
 
-- Python 3.11 ou plus récent.
-- [uv](https://docs.astral.sh/uv/) pour l'environnement et les dépendances.
-- Aucun GPU n'est nécessaire : l'app ne lance pas vLLM.
+- Python 3.11 or later.
+- [uv](https://docs.astral.sh/uv/) for the environment and the dependencies.
+- No GPU needed: the app does not run vLLM.
 
 ### 2. Installation
 
-Depuis la racine du projet :
+From the project root:
 
 ```bash
 uv sync
 ```
 
-uv crée un environnement `.venv` et y installe le projet ainsi que ses dépendances (Streamlit, pydantic, PyYAML,
+uv creates a `.venv` environment and installs the project and its dependencies in it (Streamlit, pydantic, PyYAML,
 pytest).
 
-### 3. Lancer l'interface
+### 3. Start the interface
 
 ```bash
 uv run streamlit run src/vllm_configurator/web/app.py
 ```
 
-L'app s'ouvre sur <http://localhost:8501>. Le formulaire est dans la barre latérale et les résultats dans la
-partie centrale.
+The app opens on <http://localhost:8501>. The form is in the sidebar and the results in the main area.
 
-### 4. Premier essai : le cas de référence
+### 4. First try: the reference case
 
-Cliquez sur **« Charger le cas de référence (§1) »** en haut de la barre latérale. Le formulaire se remplit avec
-le déploiement réel décrit dans `docs/vllm-config-knowledge-base.md`, et la configuration s'affiche aussitôt.
-Parcourez les onglets pour voir comment chaque valeur est justifiée.
+Click **« Charger le cas de référence (§1) »** (load the reference case) at the top of the sidebar. The form fills
+with the real deployment described in `docs/vllm-config-knowledge-base.md`, and the configuration shows up right
+away. Go through the tabs to see how each value is justified.
 
-### 5. Décrire votre propre déploiement
+### 5. Describe your own deployment
 
-Remplissez la barre latérale de haut en bas. Les résultats se recalculent à chaque modification.
+Fill the sidebar from top to bottom. The results are recomputed on every change.
 
-| Section | Conseils |
+| Section | Advice |
 |---|---|
-| **Matériel** | « GPU par instance » est le tensor parallel d'un pod ; « Instances » est le nombre de pods indépendants. |
-| **Modèle et version** | Choisissez la version de vLLM réellement déployée : plusieurs règles en dépendent. |
-| **Profil de charge** | Mesurez ISL et OSL **par appel au modèle**, pas par tour de conversation ni par session. Laissez le hit rate vide si vous ne l'avez pas mesuré : l'app prend la valeur publiée pour votre type d'usage et l'affiche dans « Hypothèses ». Les requêtes en vol visées sont un total sur toutes les instances : requêtes en cours + en file, **pas des utilisateurs** (un utilisateur agentique n'a une requête en cours qu'une partie du temps). Mesure : `vllm:num_requests_running` + `vllm:num_requests_waiting` sommés sur les pods. La part de requêtes froides (préfixe absent du cache : premier appel d'une session au-delà du préfixe commun, éviction, mauvais routage) fait le TTFT p95 : laissée vide, l'app suppose 5 %, plafonnés pour rester compatibles avec le hit rate. |
-| **SLO** | Optionnels. Ils ne changent pas la config générée ; ils fixent les critères de passage des paliers. Choisissez sur quoi porte la cible de génération : **ITL** (`vllm:inter_token_latency_seconds`, intervalle entre deux sorties, soit un step) ou **TPOT** (`vllm:request_time_per_output_token_seconds`, temps par token). Avec le speculative decoding, l'ITL monte un peu mais le TPOT est divisé par ~a (moins pour les requêtes peu acceptées, qui font le TPOT p95) : pour le ressenti utilisateur, c'est le TPOT qui compte. |
-| **Mesures en production** | Latence de génération (même métrique que la cible) et TTFT p95 relevés au palier de la config générée. La mesure tranche ; la latence de génération recale la partie decode des durées estimées, le TTFT leur partie prefill. Si les deux ne se concilient pas, l'app le dit : l'écart vient alors de la forme de la charge, pas du GPU. |
-| **Speculative decoding** | Laissez `k` vide pour utiliser la valeur recommandée pour le modèle. Ne cochez « Tolérer une vérification lossy » qu'en A/B : FLy peut modifier les sorties, ce qui est risqué pour les tool calls. |
-| **Logs de démarrage** | Si une instance tourne déjà, recopiez `GPU KV cache size: N tokens`, la taille de bloc (`Setting kv cache block size to N`) et la `gpu-memory-utilization` utilisée. C'est la donnée qui fiabilise le plus la configuration. |
-| **Contexte et arguments supplémentaires** | Voir ci-dessous. |
-| **Routage llm-d (EPP)** | Voir [Routage llm-d](#routage-llm-d). |
-| **Avancé** | Forcer `gpu-memory-utilization`, ou indiquer une réserve mémoire par GPU pour affiner l'estimation du KV sans logs. |
+| **Matériel** (hardware) | « GPU par instance » is the tensor parallel of one pod; « Instances » is the number of independent pods. |
+| **Modèle et version** | Pick the vLLM version actually deployed: several rules depend on it. |
+| **Profil de charge** (workload) | Measure ISL and OSL **per model call**, not per conversation turn or per session. Leave the hit rate empty if you have not measured it: the app takes the value published for your usage type and shows it under « Hypothèses ». Target requests in flight are a total over all instances: running + queued requests, **not users** (an agentic user only has a request running part of the time). Measurement: `vllm:num_requests_running` + `vllm:num_requests_waiting` summed over the pods. The share of cold requests (prefix missing from the cache: first call of a session past the shared prefix, eviction, misrouting) makes the TTFT p95: left empty, the app assumes 5 %, capped to stay consistent with the hit rate. For agentic sessions, import a working-set trace instead (see [Agentic sessions](#agentic-sessions-working-set-replay)). |
+| **SLO** | Optional. They do not change the generated config; they set the pass criteria of the steps. Choose what the generation target is about: **ITL** (`vllm:inter_token_latency_seconds`, interval between two outputs, i.e. one step) or **TPOT** (`vllm:request_time_per_output_token_seconds`, time per token). With speculative decoding the ITL rises a little but the TPOT is divided by ~a (less for poorly accepted requests, which make the TPOT p95): for the user experience, the TPOT is what counts. |
+| **Mesures en production** | Generation latency (same metric as the target) and TTFT p95 read at the generated config's step, or a `ws replay` result. The measurement decides; the generation latency recalibrates the decode part of the estimated durations, the TTFT their prefill part. If the two cannot be reconciled, the app says so: the gap then comes from the shape of the load, not from the GPU. |
+| **Speculative decoding** | Leave `k` empty to use the value recommended for the model. Only tick « Tolérer une vérification lossy » for an A/B test: FLy can change the outputs, which is risky for tool calls. |
+| **Logs de démarrage** (startup logs) | If an instance is already running, copy `GPU KV cache size: N tokens`, the block size (`Setting kv cache block size to N`) and the `gpu-memory-utilization` used. This is the input that makes the configuration most reliable. |
+| **Contexte et arguments supplémentaires** | See below. |
+| **Routage llm-d (EPP)** | See [llm-d routing](#llm-d-routing). |
+| **Avancé** (advanced) | Force `gpu-memory-utilization`, or give a memory reserve per GPU to refine the KV estimate without logs. |
 
-#### Étendre le contexte et ajouter des arguments vLLM
+#### Extend the context and add vLLM arguments
 
-**`max-model-len` cible.** Vide, le modèle sert son contexte natif et `--max-model-len` n'est pas émis. En dessous du
-natif, la valeur est émise telle quelle. Au-delà, l'app applique l'extension de contexte de la fiche modèle quand
-elle en a une. Exemple avec Qwen3.8 Flash Next (natif 262 144, 1 000 000 via YaRN d'après la model card) :
+**Target `max-model-len`.** Empty, the model serves its native context and `--max-model-len` is not emitted. Below
+the native context, the value is emitted as is. Beyond it, the app applies the context extension of the model card
+when it has one. Example with Qwen3.8 Flash Next (native 262,144, 1,000,000 via YaRN according to the model card):
 
 ```bash
 VLLM_ALLOW_LONG_MAX_MODEL_LEN=1 vllm serve Qwen/Qwen3.8-Flash-Next \
@@ -208,17 +213,17 @@ VLLM_ALLOW_LONG_MAX_MODEL_LEN=1 vllm serve Qwen/Qwen3.8-Flash-Next \
   --hf-overrides '{"text_config":{"rope_parameters":{"mrope_interleaved":true,"mrope_section":[11,11,10],"rope_type":"yarn","rope_theta":10000000,"partial_rotary_factor":0.25,"original_max_position_embeddings":262144,"factor":4.0}}}'
 ```
 
-- `factor` est le plus petit multiple de 0,5 qui couvre `max-model-len / contexte natif`, soit 2,0 pour 524 288 et
-  4,0 pour 1 000 000, comme dans la model card.
-- Le bloc `rope_parameters` est passé en entier : vLLM le remplace en bloc, alors qu'il fusionne `text_config`.
-- `VLLM_ALLOW_LONG_MAX_MODEL_LEN=1` est indispensable de 0.31 à 0.33 : pour YaRN, vLLM n'applique pas le facteur au
-  maximum dérivé de `config.json` et refuse sinon de démarrer. L'onglet Configuration affiche alors un bloc `env:` à
-  poser sur le conteneur, et la commande `vllm serve` le préfixe.
-- YaRN est statique : il s'applique à toutes les requêtes et peut dégrader les textes courts. N'étendez le contexte
-  que si le trafic l'exige.
+- `factor` is the smallest multiple of 0.5 that covers `max-model-len / native context`: 2.0 for 524,288 and 4.0 for
+  1,000,000, as in the model card.
+- The `rope_parameters` block is passed whole: vLLM replaces it as a block, whereas it merges `text_config`.
+- `VLLM_ALLOW_LONG_MAX_MODEL_LEN=1` is required from 0.31 to 0.33: for YaRN, vLLM does not apply the factor to the
+  maximum derived from `config.json` and otherwise refuses to start. The Configuration tab then shows an `env:` block
+  to set on the container, and the `vllm serve` command is prefixed with it.
+- YaRN is static: it applies to every request and can degrade short texts. Only extend the context if the traffic
+  needs it.
 
-**Arguments vLLM supplémentaires.** Un dictionnaire YAML, une entrée par flag. Un `dict` est émis en JSON (une
-chaîne JSON aussi), `true` émet le flag seul, `--no-<flag>: true` désactive un booléen.
+**Extra vLLM arguments.** A YAML mapping, one entry per flag. A `dict` is emitted as JSON (so is a JSON string),
+`true` emits the bare flag, `--no-<flag>: true` disables a boolean.
 
 ```yaml
 --enable-log-requests: true
@@ -226,30 +231,30 @@ chaîne JSON aussi), `true` émet le flag seul, `--no-<flag>: true` désactive u
 --hf-overrides: {text_config: {rope_parameters: {rope_type: yarn, factor: 2.0}}}
 ```
 
-- Chaque flag est vérifié contre `catalog/vllm/extracted/<version>.yaml`. Un flag inconnu est ignoré, avec un
-  avertissement critique : le frontend Rust de vLLM ≥ 0.33 refuserait de démarrer.
-- Un flag que l'app génère déjà est remplacé par la valeur fournie. Pour `--max-num-seqs`, `--max-num-batched-tokens`,
-  `--speculative-config`, `--tensor-parallel-size` et `--max-model-len`, un avertissement rappelle que l'analyse
-  reste calculée sur la valeur générée.
-- Un `--hf-overrides` fourni à la main remplace l'extension du catalogue. Avec un `max-model-len` au-delà du natif,
-  l'app pose quand même `VLLM_ALLOW_LONG_MAX_MODEL_LEN=1`.
+- Each flag is checked against `catalog/vllm/extracted/<version>.yaml`. An unknown flag is dropped, with a critical
+  warning: the Rust frontend of vLLM ≥ 0.33 would refuse to start.
+- A flag the app already generates is replaced by the value given. For `--max-num-seqs`, `--max-num-batched-tokens`,
+  `--speculative-config`, `--tensor-parallel-size` and `--max-model-len`, a warning reminds you that the analysis is
+  still computed on the generated value.
+- A hand-written `--hf-overrides` replaces the catalog's extension. With a `max-model-len` beyond the native context,
+  the app still sets `VLLM_ALLOW_LONG_MAX_MODEL_LEN=1`.
 
-**Variables d'environnement.** Un dictionnaire YAML (`VLLM_LOGGING_LEVEL: DEBUG`), ajouté au bloc `env:`.
+**Environment variables.** A YAML mapping (`VLLM_LOGGING_LEVEL: DEBUG`), added to the `env:` block.
 
-Le contexte, les arguments et les variables sont enregistrés dans les fichiers de scénario.
+The context, the arguments and the variables are saved in the scenario files.
 
-#### Sauvegarder et recharger un scénario
+#### Save and reload a scenario
 
-Le panneau **« 💾 Scénarios »** en haut de la barre latérale exporte le formulaire complet (matériel, modèle, profil
-de charge, SLO, mesures, logs de démarrage) dans un fichier YAML, et réimporte un tel fichier pour remplir le
-formulaire. Donnez un nom au scénario avant l'export : il sert de nom de fichier.
+The **« 💾 Scénarios »** panel at the top of the sidebar exports the whole form (hardware, model, workload profile,
+SLOs, measurements, startup logs) to a YAML file, and re-imports such a file to fill the form. Name the scenario
+before exporting: the name is used for the file name.
 
 ```yaml
 kind: vllm-configurator/scenario
 version: 1
 name: Prod agentique B300
 saved_at: '2026-11-12T10:00:00'
-request:                  # seule partie relue à l'import
+request:                  # the only part read back on import
   gpu_id: b300
   gpus_per_instance: 4
   num_instances: 2
@@ -257,412 +262,449 @@ request:                  # seule partie relue à l'import
   vllm_version: 0.33.0
   workload: {usage_type: agentic, mode: interactive, isl: {p50: 24000}, osl: {p50: 250}, target_concurrency: 800}
   slo: {ttft_p95_ms: 2000.0, itl_p95_ms: 40.0}
-generated:                # instantané informatif (args, verdict SLO), ignoré et recalculé à l'import
+generated:                # informational snapshot (args, SLO verdict), ignored and recomputed on import
   args: [...]
 ```
 
-Les fichiers peuvent être versionnés à côté des manifestes. L'import accepte aussi une requête nue, au format de
-`tests/golden/reference_case/input.yaml`. Il refuse un fichier dont le GPU, le modèle ou la version de vLLM manque
-au catalogue, et indique pourquoi.
+The files can be versioned next to the manifests. The import also accepts a bare request, in the format of
+`tests/golden/reference_case/input.yaml`. It rejects a file whose GPU, model or vLLM version is missing from the
+catalog, and says why.
 
-### 6. Lire les résultats
+### 6. Read the results
 
-Le bandeau du haut résume `max-num-seqs`, le budget de tokens, la taille du KV et le nombre d'avertissements. Les
-avertissements critiques s'affichent juste en dessous.
+The top banner sums up `max-num-seqs`, the token budget, the KV size and the number of warnings. Critical warnings
+show right below it.
 
-| Onglet | Contenu |
+| Tab | Content |
 |---|---|
-| **Configuration** | Bloc `args:` (téléchargeable en `vllm-args.yaml`) et commande `vllm serve`. |
-| **Routage llm-d** | `EndpointPickerConfig` (téléchargeable en `epp-config.yaml`), args vLLM à ajouter en mode precise, justification de chaque paramètre et poids, indicateurs, lignes de log attendues. |
-| **Paliers et SLO** | Plan de test par paliers (flags, charge, plages attendues, instances si validé), protocole et critères de passage, contrôles au point de la config générée, estimation indicative (goulots, pistes). |
-| **Justifications** | Une fiche par paramètre : valeur, émis ou non, règle, formule, calcul, défaut de vLLM, sources, statut. |
-| **Avertissements** | Classés en critique / avertissement / info. Les points 🔶 « À vérifier » viennent de données non confirmées. |
-| **Indicateurs** | Valeurs calculées et leur lecture. Le plus utile : le ratio ISL_eff/OSL réel comparé au ratio nécessaire pour remplir le budget de tokens. |
-| **Hypothèses** | Ce que l'app a supposé faute de donnée. Fournir la donnée réelle supprime l'hypothèse. |
-| **Vérification et métriques** | Commande de vérification des flags, métriques à surveiller, test de validation du seuil de prefill. |
+| **Configuration** | `args:` block (downloadable as `vllm-args.yaml`) and `vllm serve` command. |
+| **Routage llm-d** | `EndpointPickerConfig` (downloadable as `epp-config.yaml`), vLLM args to add in precise mode, justification of every parameter and weight, indicators, expected log lines. |
+| **Paliers et SLO** | Step-by-step test plan (flags, load, expected ranges, instances if validated), capacity in sessions, protocol and pass criteria, checks at the generated config's operating point, indicative estimate (bottlenecks, fixes). |
+| **Justifications** | One card per parameter: value, emitted or not, rule, formula, computation, vLLM default, sources, status. |
+| **Avertissements** | Ranked critical / warning / info. The 🔶 « À vérifier » items come from unconfirmed data. |
+| **Indicateurs** | Computed values and how to read them. The most useful one: the actual ISL_eff/OSL ratio compared to the ratio needed to fill the token budget. |
+| **Hypothèses** | What the app assumed for lack of data. Providing the real data removes the assumption. |
+| **Vérification et métriques** | Flag verification command, metrics to watch, validation test of the prefill threshold. |
 
-### 7. Déployer la configuration
+### 7. Deploy the configuration
 
-1. **Vérifiez les flags sur l'image réellement déployée**, avec la commande de l'onglet « Vérification et
-   métriques ». Elle liste les flags que l'image reconnaît ; chaque flag de la config doit y apparaître :
+1. **Check the flags on the image actually deployed**, with the command of the « Vérification et métriques » tab. It
+   lists the flags the image knows; every flag of the config must show up:
    ```bash
    vllm serve --help=all | grep -oE -- "--(no-)?(max-num-seqs|max-num-batched-tokens|...)\b" | sort -u
    ```
-2. **Collez le bloc `args:`** dans la définition du conteneur vLLM de votre manifeste. Ce bloc ne contient pas le
-   nom du modèle, généralement fourni ailleurs par KServe. La commande `vllm serve`, elle, l'inclut.
-3. **Déployez**, puis vérifiez dans les logs que vLLM démarre sans erreur ni OOM pendant la capture des CUDA graphs.
+2. **Paste the `args:` block** into the vLLM container definition of your manifest. This block does not contain the
+   model name, which KServe usually provides elsewhere. The `vllm serve` command does include it.
+3. **Deploy**, then check in the logs that vLLM starts without errors and without OOM during the CUDA graph capture.
 
-### 8. Après le premier déploiement : boucler
+### 8. After the first deployment: close the loop
 
-La taille du KV dépend de `gpu-memory-utilization`, de `max-num-seqs` et de la capture des CUDA graphs. Elle
-change donc avec la nouvelle configuration.
+The KV size depends on `gpu-memory-utilization`, `max-num-seqs` and the CUDA graph capture. It therefore changes with
+the new configuration.
 
-1. Relevez dans les logs la nouvelle ligne `GPU KV cache size` et la taille de bloc.
-2. Saisissez-les dans « Logs de démarrage » : l'app recalcule `max-num-seqs` et les indicateurs.
-3. Déroulez le plan de paliers de l'onglet « Paliers et SLO » et saisissez la latence mesurée au palier de la config
-   générée : les plages des autres paliers se resserrent. Surveillez aussi le hit rate du prefix cache.
-4. Mesurez la longueur d'acceptation `a = 1 + spec_decode_num_accepted_tokens / spec_decode_num_drafts` et
-   saisissez-la : elle remplace l'hypothèse a = 3.
+1. Read the new `GPU KV cache size` line and the block size in the logs.
+2. Enter them under « Logs de démarrage »: the app recomputes `max-num-seqs` and the indicators.
+3. Run the step plan of the « Paliers et SLO » tab and enter the latency measured at the generated config's step (or
+   import a `ws replay` result): the ranges of the other steps narrow. Also watch the prefix cache hit rate.
+4. Measure the acceptance length `a = 1 + spec_decode_num_accepted_tokens / spec_decode_num_drafts` and enter it: it
+   replaces the a = 3 assumption.
 
-### Routage llm-d
+### llm-d routing
 
-Avec plusieurs instances indépendantes, aucun cache n'est partagé : une session routée sur un autre pod que celui qui
-détient son préfixe refait tout son prefill. L'EPP d'llm-d choisit le pod de chaque requête en combinant des scorers
-pondérés. L'app règle cet `EndpointPickerConfig` à partir de la config vLLM : elle lit les faits du moteur
-(`DeploymentFacts` : KV par instance, taille de bloc, `max-num-seqs`, nombre d'instances), sans les recalculer. Le code
-est dans `src/vllm_configurator/llmd/`, le catalogue dans `catalog/llmd/<version>.yaml`.
+With several independent instances, no cache is shared: a session routed to another pod than the one holding its
+prefix redoes its whole prefill. The llm-d EPP picks the pod of each request by combining weighted scorers. The app
+sets this `EndpointPickerConfig` from the vLLM config: it reads the engine's facts (`DeploymentFacts`: KV per
+instance, block size, `max-num-seqs`, number of instances) without recomputing them. The code is in
+`src/vllm_configurator/llmd/`, the catalog in `catalog/llmd/<version>.yaml`.
 
-**L'index de préfixes (mode approximatif).** L'EPP garde, par pod, une LRU des hashes de blocs des prompts qu'il a
-routés.
+**The prefix index (approximate mode).** The EPP keeps, per pod, an LRU of the block hashes of the prompts it routed.
 
-| Paramètre | Règle |
+| Parameter | Rule |
 |---|---|
-| `blockSizeTokens` | Taille de bloc KV de vLLM (un bloc de l'index = un bloc vLLM), au moins 64 : en dessous, l'EPP l'écrase |
-| `lruCapacityPerServer` | KV par instance / `blockSizeTokens`, pour suivre tout le cache d'un pod. Trop petit : faux misses, routage au hasard |
-| `autoTune` | `false` : la capacité est fixée, la correction automatique n'est pas confirmée |
-| `maxPrefixTokensToMatch` | Au moins l'ISL P95 et le préfixe commun, arrondi à une puissance de 2, au moins le défaut (131 072) ; `maxPrefixBlocksToMatch` en est l'équivalent en blocs |
+| `blockSizeTokens` | vLLM KV block size (one index block = one vLLM block), at least 64: below that, the EPP overrides it |
+| `lruCapacityPerServer` | KV per instance / `blockSizeTokens`, to track a pod's whole cache. Too small: false misses, random routing |
+| `autoTune` | `false`: the capacity is fixed, the automatic correction is not confirmed |
+| `maxPrefixTokensToMatch` | At least the ISL P95 and the shared prefix, rounded up to a power of 2, at least the default (131,072); `maxPrefixBlocksToMatch` is the same in blocks |
 
-**Les poids du profil.**
+**The profile weights.**
 
-| Scorer | Règle |
+| Scorer | Rule |
 |---|---|
-| `prefix-cache-scorer` | Selon le gain de prefill de l'affinité : (1 − h sans affinité) / (1 − h), avec h sans affinité = h commun + (h − h commun) / N. Gain ≥ 3 → 5, ≥ 1,5 → 3, sinon 2 |
-| `kv-cache-utilization-scorer` | Selon l'occupation du KV au palier de la config générée : ≥ 80 % → 3, ≥ 50 % → 2, sinon 1 |
-| `queue-scorer` | 2, ou 3 si les requêtes en vol par pod atteignent 80 % de `max-num-seqs` |
-| `no-hit-lru-scorer` | 2 : répartit les nouvelles sessions, qui n'ont de préfixe connu nulle part |
+| `prefix-cache-scorer` | From the prefill saved by affinity: (1 − h without affinity) / (1 − h), with h without affinity = h shared + (h − h shared) / N. Gain ≥ 3 → 5, ≥ 1.5 → 3, else 2 |
+| `kv-cache-utilization-scorer` | From the KV usage at the generated config's step: ≥ 80 % → 3, ≥ 50 % → 2, else 1 |
+| `queue-scorer` | 2, or 3 if the requests in flight per pod reach 80 % of `max-num-seqs` |
+| `no-hit-lru-scorer` | 2: spreads the new sessions, whose prefix is known nowhere |
 
-Le préfixe commun (system prompt, outils) est en cache sur tous les pods : le déclarer réduit le gain attendu de
-l'affinité. Laissé vide, l'app suppose 0, le cas où l'affinité compte le plus.
+The shared prefix (system prompt, tools) is cached on every pod: declaring it lowers the expected gain of affinity.
+Left empty, the app assumes 0, the case where affinity matters most.
 
-**Forcer une valeur.** Comme les arguments vLLM supplémentaires, le champ « Paramètres llm-d forcés (YAML) » remplace
-une valeur calculée du plugin de préfixe (une ligne par paramètre, par exemple `lruCapacityPerServer: 700000`). Un nom
-inconnu du catalogue ou une valeur du mauvais type est ignoré, avec un avertissement critique. L'app signale aussi ce
-que la valeur forcée casse : index trop petit pour le KV, bloc sous le minimum, fenêtre plus courte que le préfixe
-commun, taille de bloc precise différente de celle de vLLM. Les poids se forcent dans « Forcer les poids du profil ».
-Le panneau « 📖 Comprendre les paramètres llm-d » de l'onglet explique chaque paramètre et chaque scorer, avec son
-défaut et la valeur proposée.
+**Force a value.** Like the extra vLLM arguments, the « Paramètres llm-d forcés (YAML) » field replaces a computed
+value of the prefix plugin (one line per parameter, e.g. `lruCapacityPerServer: 700000`). A name unknown to the
+catalog or a value of the wrong type is ignored, with a critical warning. The app also reports what the forced value
+breaks: index too small for the KV, block below the minimum, window shorter than the shared prefix, precise block size
+different from vLLM's. The weights are forced in « Forcer les poids du profil ». The « 📖 Comprendre les paramètres
+llm-d » panel of the tab explains each parameter and each scorer, with its default and the proposed value.
 
-Pour le cas de référence, l'app retrouve la configuration de la §9.4 de la base de connaissances : bloc 128,
-`lruCapacityPerServer` 673 639, poids 2 / 1 / 5 / 2 (queue / kv / préfixe / no-hit). Sans affinité, le hit rate de
-95,7 % tomberait à ~48 % et le prefill non caché serait multiplié par 12.
+For the reference case, the app finds the configuration of §9.4 of the knowledge base: block 128,
+`lruCapacityPerServer` 673,639, weights 2 / 1 / 5 / 2 (queue / kv / prefix / no-hit). Without affinity, the 95.7 %
+hit rate would drop to ~48 % and the uncached prefill would be multiplied by 12.
 
-**Mode precise.** Les pods publient leurs KV events en ZMQ : l'app génère `--kv-events-config` (à ajouter aux args
-vLLM, avec la variable `POD_IP` sur le conteneur) et `tokenProcessorConfig.blockSize` = taille de bloc vLLM, qu'elle
-exige donc. Elle signale quand ce mode est peu utile (KV peu occupé, évictions rares) ou, à l'inverse, quand l'index
-approximatif risque de diverger (KV occupé à plus de 80 %).
+**Precise mode.** The pods publish their KV events over ZMQ: the app generates `--kv-events-config` (to add to the
+vLLM args, with the `POD_IP` variable on the container) and `tokenProcessorConfig.blockSize` = vLLM block size, which
+it therefore requires. It reports when this mode is of little use (lightly used KV, rare evictions) or, conversely,
+when the approximate index is likely to drift (KV more than 80 % used).
 
-**Boucler après déploiement.** L'onglet donne les lignes attendues dans le log de l'EPP (`Prefix DataProducer
-initialized`, `EPP config after phase two`). Saisissez dans « Mesures llm-d » ce que le log affiche réellement et le hit
-rate du pod le moins bon : l'app calcule la part du cache oubliée par l'index déployé et explique un hit rate trop bas.
-La config EPP est recalculée à chaque changement de la config vLLM, puisque la taille du KV en dépend.
+**Close the loop after deployment.** The tab gives the lines expected in the EPP log (`Prefix DataProducer
+initialized`, `EPP config after phase two`). Enter under « Mesures llm-d » what the log actually shows and the hit rate
+of the worst pod: the app computes the share of the cache the deployed index forgets and explains a hit rate that is
+too low. The EPP config is recomputed on every change of the vLLM config, since the KV size depends on it.
 
-### Paliers de test et SLO
+### Test steps and SLOs
 
-Un modèle de latence non mesuré peut se tromper d'un facteur 2 ou 3. L'app ne promet donc pas de verdict : elle donne
-un **plan de paliers** qui encadre la limite, et c'est la mesure qui dimensionne. Le code est dans
+An unmeasured latency model can be off by a factor of 2 or 3. The app therefore promises no verdict: it gives a
+**step plan** that brackets the limit, and the measurement does the sizing. The code is in
 `src/vllm_configurator/analysis.py`.
 
-**Les paliers.** Ce sont des valeurs de `max-num-seqs` (16, 32, 64… 2048), plafonnées par ce que le KV loge et par les
-requêtes en vol visées par instance. Pour chacune, l'app donne :
+**The steps.** They are `max-num-seqs` values (16, 32, 64… 2048), capped by what the KV holds and by the target
+requests in flight per instance. For each of them, the app gives:
 
-- les flags à poser : `--max-num-seqs`, la capture des CUDA graphs et, si la charge de prefill l'exige, un budget
-  `--max-num-batched-tokens` plus haut ;
-- la charge à injecter, autant de requêtes en vol que de séquences ;
-- les plages attendues d'ITL, de TPOT, de TTFT, de débit et d'occupation du KV ;
-- un pronostic : ✅ si même le cas pessimiste tient les SLO, 🛑 si même le cas optimiste les manque, ⚠️ entre les deux ;
-- le nombre d'instances nécessaire si ce palier est le dernier validé : ⌈requêtes en vol visées / max-num-seqs⌉.
+- the flags to set: `--max-num-seqs`, the CUDA graph capture and, if the prefill load requires it, a higher
+  `--max-num-batched-tokens` budget;
+- the load to inject, as many requests in flight as sequences;
+- the expected ranges of ITL, TPOT, TTFT, throughput and KV usage;
+- a forecast: ✅ if even the pessimistic case meets the SLOs, 🛑 if even the optimistic case misses them, ⚠️ in
+  between;
+- the number of instances needed if this step is the last one to pass: ⌈target requests in flight / max-num-seqs⌉.
 
-L'app retient les paliers autour de la limite attendue : deux paliers sûrs, la zone incertaine et le premier palier
-en échec probable. Le palier de la config générée est marqué ★.
+The app keeps the steps around the expected limit: two safe steps, the uncertain zone and the first step likely to
+fail. The generated config's step is marked ★.
 
-**Protocole.** Chaque palier se valide sur une instance, en boucle fermée et par rejeu de traces réelles (mêmes ISL,
-OSL et thinking qu'en production). Le régime stable doit durer au moins trois fois la durée d'une requête. Un palier
-passe si la latence de génération et le TTFT p95 tiennent la cible, sans file d'attente
-(`vllm:num_requests_waiting` ≈ 0), sans préemption (`vllm:num_preemptions`) et avec `vllm:kv_cache_usage_perc` sous
-90 %. Le premier palier en échec fixe la capacité d'une instance au palier précédent.
+**Protocol.** Each step is validated on one instance, in a closed loop, by replaying real traces (same ISL, OSL and
+thinking as in production). The steady state must last at least three times the duration of a request. A step passes
+if the generation latency and the TTFT p95 meet the target, with no queue (`vllm:num_requests_waiting` ≈ 0), no
+preemption (`vllm:num_preemptions`) and `vllm:kv_cache_usage_perc` below 90 %. The first failing step sets the
+capacity of an instance at the previous step.
 
-**Sessions agentiques : rejeu working-set.** Quand l'attente entre deux requêtes d'une session est connue (saisie, ou
-lue sur une trace importée), chaque palier donne aussi les **sessions à rejouer** : requêtes en vol × (durée d'une
-requête + attente) / durée, pour la durée estimée la plus longue puis la plus courte. Il donne aussi le KV que ces
-sessions occupent : une session en attente d'un outil garde son contexte en cache, et au-delà du pool vLLM évince
-les plus anciennes, dont le tour suivant refait tout son prefill. Un palier dont les sessions dépassent 90 % du KV
-passe à ⚠️. Le protocole donne alors la commande `ws replay` du palier, avec des seuils tirés des SLO.
+#### Agentic sessions: working-set replay
 
-**Import d'une trace working-set** (`src/vllm_configurator/traces.py`, encart « 📼 Importer une trace » du profil de
-charge). Une trace `ws trace pi|claude` (format `workingset-agent-trace` v1 ou v2) ne contient que des tailles et des
-attentes. L'app la lit avec la même comptabilité que `ws replay`, en cache parfait :
+When the wait between two requests of a session is known (entered, or read off an imported trace), each step also
+gives the **sessions to replay**: requests in flight × (request duration + wait) / duration, for the longest then the
+shortest estimated duration. It also gives the KV those sessions hold: a session waiting on a tool keeps its context
+in cache, and beyond the pool vLLM evicts the oldest ones, whose next turn redoes its whole prefill. A step whose
+sessions exceed 90 % of the KV goes to ⚠️. The protocol then gives the `ws replay` command of the step, with
+thresholds derived from the SLOs.
 
-| Requête | Tokens à prefiller |
+**Import a working-set trace** (`src/vllm_configurator/traces.py`, « 📼 Importer une trace » box of the workload
+profile). A `ws trace pi|claude` trace (format `workingset-agent-trace` v1 or v2) only holds sizes and waits. The app
+reads it with the same accounting as `ws replay`, under a perfect cache:
+
+| Request | Tokens to prefill |
 |---|---|
-| Premier tour d'une session, ou prompt qui rétrécit (compaction, branche) : froide | prompt − préfixe commun à toutes les sessions (section llm-d) |
-| Tour suivant : chaude | prompt − prompt précédent − réponse précédente (sans la réponse si le chat template la retire de l'historique : case à décocher) |
+| First turn of a session, or a prompt that shrinks (compaction, branch): cold | prompt − prefix shared by all sessions (llm-d section) |
+| Next turn: warm | prompt − previous prompt − previous reply (without the reply if the chat template drops it from the history: untick the box) |
 
-Elle en déduit :
-- l'ISL et l'OSL en P50, P95 et P99 ;
-- le hit rate pondéré par les tokens, et la part de requêtes froides ;
-- les P50 et P95 des tokens d'une requête chaude, qui fixent la dispersion σ à la place de l'heuristique ;
-- l'attente moyenne entre deux requêtes. Comme `ws replay`, l'app remplace les attentes inactives (erreur, reprise,
-  session laissée ouverte) par l'attente humaine moyenne.
+From it, the app derives:
+- the ISL and the OSL at P50, P95 and P99;
+- the token-weighted hit rate, and the share of cold requests;
+- the P50 and P95 of the tokens of a warm request, which set the dispersion σ instead of the heuristic;
+- the mean wait between two requests. Like `ws replay`, the app replaces the inactive waits (error, resume, session
+  left open) by the mean human wait.
 
-Avec un nombre de sessions et les durées de service d'une trace v2, elle répartit aussi ces sessions entre requêtes
-en vol et sessions en pause. Le hit rate et la part froide d'un cache parfait sont des planchers : évictions et
-mauvais routage ne font qu'ajouter des requêtes froides. Il faut les comparer au hit rate mesuré et à la part
-d'évictions rapportée par `ws replay`.
+With a number of sessions and the service times of a v2 trace, it also splits these sessions into requests in flight
+and paused sessions. The hit rate and the cold share of a perfect cache are floors: evictions and misrouting only add
+cold requests. Compare them to the measured hit rate and to the eviction share `ws replay` reports.
 
-Trois points à respecter pour que le rejeu ressemble à la production :
-- **`--shared-prefix-tokens`.** Par défaut, `ws replay` prend le plus petit premier prompt de la trace comme préfixe
-  commun à toutes les sessions. Avec des sessions qui démarrent au-delà de 100k tokens, ces 100k tokens deviennent
-  communs et les premiers tours sont quasi chauds. Le protocole fixe donc ce flag au préfixe commun déclaré.
-- **`--api chat`.** Il fait passer le chat template et le renderer ; l'API completions les court-circuite.
-- **L'acceptation du spec decoding.** Le texte rejoué est synthétique et sa sortie a une longueur forcée :
-  l'acceptation mesurée pendant le test est à saisir dans l'app pour recaler le bon facteur.
+Three points to respect so that the replay looks like production:
+- **`--shared-prefix-tokens`.** By default, `ws replay` takes the smallest first prompt of the trace as the prefix
+  shared by all sessions. With sessions that start past 100k tokens, those 100k tokens become shared and the first
+  turns are nearly warm. Behind a router (llm-d), it also flattens the prefix scores between pods and weakens session
+  affinity. The protocol therefore sets this flag to the declared shared prefix.
+- **`--api chat`.** It goes through the chat template and the renderer; the completions API bypasses them.
+- **The spec decoding acceptance.** The replayed text is synthetic and its output has a forced length: enter the
+  acceptance measured during the test in the app, so that the right factor is recalibrated.
 
-working-set juge le TTFT p90 des requêtes chaudes et le débit de decode p10. Les seuils qui en découlent
-(`--max-warm-ttft-s`, `--min-decode-tok-s`) sont donc plus permissifs que les SLO p95 : le verdict d'un palier reste
-lu sur les métriques serveur.
+working-set judges the p90 TTFT of warm requests and the p10 decode speed. The thresholds derived from the SLOs
+(`--max-warm-ttft-s`, `--min-decode-tok-s`) are therefore looser than p95 SLOs: the verdict of a step is still read on
+the server metrics.
 
-**Le modèle d'estimation**, qui sert à placer les paliers :
+#### From the replay to the setting
 
-| Grandeur | Calcul |
+The intended workflow:
+1. describe the workload, the hardware and the model, then import an agentic trace;
+2. deploy the generated config and replay it with `ws replay … --out run.json`;
+3. import `run.json` under « Mesures en production » (« 📈 Importer un résultat working-set » box);
+4. read the capacity in sessions and the setting that gives more, in the « Paliers et SLO » tab.
+
+On import of the result (`traces.profile_run`), the app reads every judged step again with working-set's window rule:
+- the requests in flight (mean);
+- the TTFT p95, cold requests included, and the p90 TTFT of warm requests;
+- the TPOT p95, i.e. (last token − first) / (tokens − 1) for each request;
+- the hit rate and the share of cold requests, from the `cached_tokens` vLLM returns, which requires
+  `--enable-prompt-tokens-details`;
+- the evictions, and the server metrics if the replay read them.
+
+One step is used for the recalibration: by default the largest passing step, the closest to the limit. Its latencies
+recalibrate the model **at the measured load**, brought down to one instance (one per replay URL, else the number of
+« Instances »), not at the target concurrency. Its measured hit rate and cold share replace the trace's, evictions and
+routing included.
+
+working-set only measures the TPOT, not the ITL. With an ITL target, the decode part is recalibrated on the TPOT, and
+the ITL p95, which the steps loaded with prefill make, stays extrapolated. Read it on
+`vllm:inter_token_latency_seconds` during the replay to recalibrate it.
+
+#### Capacity in sessions
+
+`analysis.session_capacity`: for each setting, the app looks for the largest number of requests in flight per
+instance that passes every check at the pessimistic end of the estimate. It turns that into sessions, then caps them by
+the KV of the sessions: active and waiting, shared prefix counted once, 90 % of the pool. It compares the generated
+config to the best setting of `--max-num-seqs`, `--max-num-batched-tokens`, `--long-prefill-token-threshold` and the
+frontend. It gives the flags to change, the limit reached (ITL, TPOT, TTFT, prefill load, KV of the sessions,
+frontend) and the levers beyond the setting: offloading the KV of waiting sessions, `gpu-memory-utilization`, TP,
+instances, P/D disaggregation. If the estimated capacity differs from the one validated by working-set by more than
+×1.4, the app says so: recalibrate before following the proposed setting, then validate that setting with a new
+replay.
+
+#### The estimation model
+
+It is used to place the steps:
+
+| Quantity | Computation |
 |---|---|
-| Longueurs | Moyennes d'ISL et d'OSL déduites des percentiles (lognormale ajustée sur P50/P95, corrigée si le P99 révèle une queue plus lourde), pas du P50 |
-| Occupation du KV | S × (ISL moyen + OSL moyen / 2) / KV par instance, KV ramené au `gpu-memory-utilization` de la config si les logs ont été lus à une autre valeur |
-| Tokens à prefiller | Distribution, pas une moyenne : une part de requêtes froides prefillées en entier (`cold_request_fraction`), et pour les autres un delta non caché indépendant de l'historique, à queue lourde (`uncached_tokens_sigma`), calé pour respecter le hit rate |
-| Charge de prefill | prefill non caché demandé par step (S·a/OSL × E[tokens à prefiller]) / (B − S·d), en régime stable (§3.1) |
-| Step | somme des opérateurs (`src/vllm_configurator/perf.py`), chacun borné par son roofline max(lecture mémoire, calcul) : poids denses, experts MoE touchés, attention (lecture du KV ; FLOPs sur le contexte, indexeur d'une attention sparse compris), all-reduce TP sur NVLink, surcoûts fixes (plus élevés sur un step mixte) et par séquence, passe du drafter |
-| ITL / TPOT | ITL p95 = step chargé en prefill ; TPOT p95 = step moyen / a des 5 % de requêtes les moins acceptées (dispersion `acceptance_dispersion`) |
-| TTFT | 95e centile de la somme frontal (HTTP, EPP, tokenisation) + attente d'une place + attente du prefill (file M/G/c, variance des prompts comprise) + prefill du prompt découpé selon le seuil de long prefill, calculé sur la distribution des tokens à prefiller |
+| Lengths | ISL and OSL means derived from the percentiles (lognormal fitted on P50/P95, corrected if the P99 reveals a heavier tail), not from the P50 |
+| KV usage | S × (mean ISL + mean OSL / 2) / KV per instance, KV brought back to the config's `gpu-memory-utilization` if the logs were read at another value |
+| Tokens to prefill | A distribution, not a mean: a share of cold requests prefilled in full (`cold_request_fraction`), and for the others an uncached delta independent of the history, heavy-tailed (`uncached_tokens_sigma`, or the warm-request percentiles of a trace), fitted to match the hit rate |
+| Prefill load | uncached prefill requested per step (S·a/OSL × E[tokens to prefill]) / (B − S·d), in steady state (§3.1) |
+| Step | sum of the operators (`src/vllm_configurator/perf.py`), each bounded by its roofline max(memory reads, compute): dense weights, MoE experts hit, attention (KV reads; FLOPs over the context, including the indexer of a sparse attention), TP all-reduce over NVLink, fixed overheads (higher on a mixed step) and per sequence, drafter pass |
+| ITL / TPOT | ITL p95 = step loaded with prefill; TPOT p95 = mean step / a of the 5 % least accepted requests (dispersion `acceptance_dispersion`) |
+| TTFT | 95th percentile of the sum frontend (HTTP, EPP, tokenization) + wait for a slot + wait for the prefill (M/G/c queue, prompt variance included) + prefill of the prompt chunked by the long prefill threshold, computed over the distribution of the tokens to prefill |
 
-Sans mesure, les durées sont données de ×0,8 à ×2,5 ; recalées sur une latence mesurée, à ±15 %
-(`perf_uncertainty`), séparément pour la partie decode (latence de génération) et la partie prefill (TTFT). Les
-rendements et coûts (`perf_hbm_efficiency`, `perf_mfu`, `perf_overhead_per_layer_ms`, `perf_nvlink_efficiency`,
-`perf_drafter_step_fraction`, `perf_sparse_indexer_cost_ratio`, `frontend_python`…) et les seuils sont des
-heuristiques de `catalog/workload_profiles.yaml`, toutes 🔶. Le coût de l'attention est dérivé de config.json
-(têtes, dimensions, couches à attention non linéaire, top-k d'une attention sparse) ; le bloc `performance` d'une
-fiche modèle peut le fixer (`attention_flops_per_context_token`, `attention_sparse_flops_per_token`,
-`attention_sparse_tokens`). Sans bloc `performance` dans la fiche modèle,
-ni `bandwidth` et `compute` dans la fiche GPU, les paliers n'ont pas de plages de latence : seule la capacité est
-contrôlée.
+Without measurement, durations are given from ×0.8 to ×2.5; recalibrated on a measured latency, at ±15 %
+(`perf_uncertainty`), separately for the decode part (generation latency) and the prefill part (TTFT). The
+efficiencies and costs (`perf_hbm_efficiency`, `perf_mfu`, `perf_overhead_per_layer_ms`, `perf_nvlink_efficiency`,
+`perf_drafter_step_fraction`, `perf_sparse_indexer_cost_ratio`, `frontend_python`…) and the thresholds are heuristics
+of `catalog/workload_profiles.yaml`, all 🔶. The attention cost is derived from config.json (heads, dimensions, layers
+with non-linear attention, top-k of a sparse attention); the `performance` block of a model card can set it
+(`attention_flops_per_context_token`, `attention_sparse_flops_per_token`, `attention_sparse_tokens`). Without a
+`performance` block in the model card, nor `bandwidth` and `compute` in the GPU card, the steps have no latency
+ranges: only the capacity is checked.
 
-**L'estimation indicative**, repliée sous le plan, garde l'analyse au point de la config générée. Elle donne les
-goulots (prefill, KV, places de séquence, decode, interférence du prefill, plancher d'ITL) et des pistes : réglage à
-capacité constante, instances, TP plus large, `gpu-memory-utilization`, DP-attention, prefix cache, désagrégation
-P/D, PCP. Une piste de réglage n'est proposée que si elle tient même dans le cas pessimiste ; elle reste à valider par
-les paliers.
+**The indicative estimate**, folded under the plan, keeps the analysis at the generated config's operating point. It
+gives the bottlenecks (prefill, KV, sequence slots, decode, prefill interference, ITL floor) and fixes: a setting at
+constant capacity, instances, wider TP, `gpu-memory-utilization`, DP-attention, prefix cache, P/D disaggregation, PCP.
+A setting is only proposed if it holds even in the pessimistic case; it still has to be validated by the steps.
 
-### Frontal : `--api-server-count` et `--renderer-num-workers`
+### Frontend: `--api-server-count` and `--renderer-num-workers`
 
-Le GPU n'est pas le seul goulot possible. Avant et après lui, le **frontend Python** de `vllm serve` (le défaut ;
-le frontend Rust, `VLLM_USE_RUST_FRONTEND=1`, est opt-in et n'est pas modélisé) fait tout le travail CPU d'une
-requête. Ce qui suit est vérifié dans le code source de vLLM 0.31.0, 0.32.0 et 0.33.0 (comportements
-`frontend.api_servers` et `frontend.renderer_pool` du catalogue de chaque version).
+The GPU is not the only possible bottleneck. Before and after it, the **Python frontend** of `vllm serve` (the
+default; the Rust frontend, `VLLM_USE_RUST_FRONTEND=1`, is opt-in and not modelled) does all the CPU work of a
+request. What follows was checked in the source code of vLLM 0.31.0, 0.32.0 and 0.33.0 (behaviors
+`frontend.api_servers` and `frontend.renderer_pool` of each version's catalog).
 
-**Ce que fait chaque flag.**
+**What each flag does.**
 
-| Flag | Ce qu'il change | Ce qu'il ne change pas |
+| Flag | What it changes | What it does not change |
 |---|---|---|
-| `--api-server-count` (défaut : `data_parallel_size`, donc 1 en DP1) | N processus API sur un port partagé. Chacun a sa boucle asyncio, son GIL, son renderer et sa détokenisation. | L'engine core reste unique : au-delà, c'est lui ou le GPU qui limite. |
-| `--renderer-num-workers` (défaut : 1) | Taille du pool de threads de chaque processus API, qui fait le chat template (renderers HF et DeepSeek V4) et la tokenisation du prompt. | Ni les sorties (détokenisation, streaming, parseurs, sur la boucle asyncio), ni le multimodal (un thread dédié imposé), ni le mode offline (`LLM`). |
+| `--api-server-count` (default: `data_parallel_size`, so 1 in DP1) | N API processes on a shared port. Each has its asyncio loop, its GIL, its renderer and its detokenization. | The engine core stays single: beyond that, it or the GPU is the limit. |
+| `--renderer-num-workers` (default: 1) | Size of the thread pool of each API process, which runs the chat template (HF and DeepSeek V4 renderers) and the tokenization of the prompt. | Neither the outputs (detokenization, streaming, parsers, on the asyncio loop), nor multimodal (a dedicated thread is enforced), nor the offline mode (`LLM`). |
 
-Le chat template est du Python (Jinja, ou `encode_messages` pour DeepSeek V4 et V4.1) : il tient le GIL même sur
-un thread du pool, donc des threads de plus ne le parallélisent pas. La tokenisation, elle, en profite. Le chemin
-vérifié est `encode` → transformers `_encode_plus` → `tokenizers` `encode_batch`, dont le cœur Rust tourne hors
-GIL (`py.allow_threads`, renommé `py.detach`). Il a été relu dans transformers 5.10.3, 5.16.1 et 5.20.2 et dans
-`tokenizers` 0.21.1, 0.23.2 et 0.23.3, soit les versions épinglées par vLLM 0.31 à 0.33. Seules l'extraction du texte
-et la conversion du résultat en listes Python gardent le GIL : l'app en compte 10 % (`tokenize_gil_share`, 🔶). Le
-backend `fastokens` (`VLLM_USE_FASTOKENS=1`) n'a pas été relu.
+The chat template is Python (Jinja, or `encode_messages` for DeepSeek V4 and V4.1): it holds the GIL even on a pool
+thread, so more threads do not parallelize it. Tokenization does benefit. The verified path is `encode` →
+transformers `_encode_plus` → `tokenizers` `encode_batch`, whose Rust core runs outside the GIL (`py.allow_threads`,
+renamed `py.detach`). It was read in transformers 5.10.3, 5.16.1 and 5.20.2 and in `tokenizers` 0.21.1, 0.23.2 and
+0.23.3, the versions pinned by vLLM 0.31 to 0.33. Only extracting the text and converting the result to Python lists
+keep the GIL: the app counts 10 % for them (`tokenize_gil_share`, 🔶). The `fastokens` backend
+(`VLLM_USE_FASTOKENS=1`) was not reviewed.
 
-**Le modèle.** Par processus API, l'app estime :
-- la charge du GIL : requêtes/s × (boucle + JSON des messages + chat template) + sorties streamées/s × coût d'une
-  sortie ;
-- la charge du pool : requêtes/s × (chat template + tokenisation), répartie sur les threads.
+**The model.** Per API process, the app estimates:
+- the GIL load: requests/s × (loop + message JSON + chat template) + streamed outputs/s × cost of one output;
+- the pool load: requests/s × (chat template + tokenization), spread over the threads.
 
-Le trafic vient du step du GPU. Il y a S·a/OSL requêtes par step, et une sortie par séquence et par step. Les
-attentes sur le GIL (M/G/1) s'ajoutent à l'ITL ; celles du pool (M/G/c) s'ajoutent au TTFT. La règle R-FE-01/02
-dimensionne au plus petit nombre qui garde chaque GIL et chaque pool sous 70 %. Elle se cale sur les steps rapides
-de l'estimation (plus de trafic, donc le cas prudent pour le frontal) et garde les défauts de vLLM quand ils tiennent.
-Les coûts unitaires sont des heuristiques (`frontend_python`, 🔶).
+The traffic comes from the GPU step: S·a/OSL requests per step, and one output per sequence and per step. The waits on
+the GIL (M/G/1) add to the ITL; those of the pool (M/G/c) add to the TTFT. Rule R-FE-01/02 sizes to the smallest
+number that keeps every GIL and every pool below 70 %. It uses the fast steps of the estimate (more traffic, so the
+cautious case for the frontend) and keeps the vLLM defaults when they hold. The unit costs are heuristics
+(`frontend_python`, 🔶).
 
-**Quand ça vaut la peine d'y toucher.**
+**When it is worth touching them.**
 
-| Scénario | Ce qui sature | Levier |
+| Scenario | What saturates | Lever |
 |---|---|---|
-| Longues sorties, gros MoE, steps de 30 à 50 ms, spec decoding (le cas de référence à concurrence modérée) | Rien : quelques requêtes/s, GIL à ~40 % | Garder les défauts |
-| Beaucoup de flux en parallèle et des steps courts : modèle rapide, `max-num-seqs` élevé, sans spec decoding (une sortie par token) | GIL, à ~90 % par les sorties | `--api-server-count` ; le renderer n'y peut rien |
-| Appels courts sur de longs contextes : agentique à OSL de ~250, RAG, classification, scoring | Pool : des dizaines de requêtes/s × 20–30 ms de rendu chacune | `--renderer-num-workers` pour la tokenisation, `--api-server-count` si le chat template domine |
-| Multimodal | Le thread multimodal dédié | `--api-server-count` (un thread multimodal par processus) |
-| Instances pleines (pas de concurrence cible) | Souvent les sorties : 512 flux × ~25 steps/s ≈ 13 000 sorties/s | `--api-server-count 2` (écart documenté dans le golden) |
+| Long outputs, large MoE, 30 to 50 ms steps, spec decoding (the reference case at moderate concurrency) | Nothing: a few requests/s, GIL at ~40 % | Keep the defaults |
+| Many parallel streams and short steps: fast model, high `max-num-seqs`, no spec decoding (one output per token) | The GIL, at ~90 % from the outputs | `--api-server-count`; the renderer cannot help |
+| Short calls on long contexts: agentic at an OSL of ~250, RAG, classification, scoring | The pool: tens of requests/s × 20–30 ms of rendering each | `--renderer-num-workers` for the tokenization, `--api-server-count` if the chat template dominates |
+| Multimodal | The dedicated multimodal thread | `--api-server-count` (one multimodal thread per process) |
+| Full instances (no target concurrency) | Often the outputs: 512 streams × ~25 steps/s ≈ 13,000 outputs/s | `--api-server-count 2` (deviation documented in the golden test) |
 
-Le speculative decoding allège le frontal : une sortie par step porte ~a tokens.
+Speculative decoding lightens the frontend: one output per step carries ~a tokens.
 
-**Ce que ça coûte, et quand ça devient le goulot.**
-- **CPU** : ~1 cœur par processus API saturé, plus les threads de tokenisation, en plus de l'engine core (~1
-  cœur) et d'un worker par GPU (~1 chacun). Une limite CPU trop basse fait brider (CFS) les workers GPU, ce qui
-  est pire qu'un frontal lent. Renseignez « Cœurs CPU par instance » : l'app plafonne les processus API et
-  affiche le besoin (indicateur `frontend_cpu`).
-- **Contraintes** : avec N > 1, Prometheus passe en multiprocess (vérifiez que l'EPP et les tableaux de bord
-  lisent bien les métriques agrégées). N > 1 est aussi incompatible avec `VLLM_ALLOW_RUNTIME_LORA_UPDATING`.
-  Elastic EP ramène à 1, et chaque processus charge son tokenizer en mémoire hôte.
-- **Signes de saturation** : un processus API à ~100 % d'un cœur (`top -H`, `pidstat`, `py-spy dump`). Autre
-  signe : un TTFT ou une ITL côté client qui s'écartent de plus en plus du serveur quand la charge monte.
-- **Au-delà** : l'engine core (sérialisation des entrées et des sorties) devient le goulot suivant. Plus de
-  processus API n'y change rien : il faut plus d'instances, ou du DP dans l'instance.
+**What it costs, and when it becomes the bottleneck.**
+- **CPU**: ~1 core per saturated API process, plus the tokenization threads, on top of the engine core (~1 core) and
+  of one worker per GPU (~1 each). A CPU limit set too low throttles (CFS) the GPU workers, which is worse than a slow
+  frontend. Fill in « Cœurs CPU par instance »: the app caps the API processes and shows the need (indicator
+  `frontend_cpu`).
+- **Constraints**: with N > 1, Prometheus switches to multiprocess mode (check that the EPP and the dashboards read the
+  aggregated metrics). N > 1 is also incompatible with `VLLM_ALLOW_RUNTIME_LORA_UPDATING`. Elastic EP brings it back
+  to 1, and each process loads its tokenizer in host memory.
+- **Signs of saturation**: an API process at ~100 % of a core (`top -H`, `pidstat`, `py-spy dump`). Another sign: a
+  client-side TTFT or ITL that drifts further and further from the server's as the load rises.
+- **Beyond**: the engine core (serialization of inputs and outputs) becomes the next bottleneck. More API processes
+  change nothing there: you need more instances, or DP inside the instance.
 
-**Frontend Rust.** vLLM ignore `--api-server-count` (frontend multithread, sans GIL) et refuse les flags
-inconnus. Son coût n'est pas modélisé : à comparer en A/B sur un même palier.
+**Rust frontend.** vLLM ignores `--api-server-count` (multithreaded frontend, no GIL) and refuses unknown flags. Its
+cost is not modelled: compare it in an A/B test at the same step.
 
-### 9. Dépannage
+### 9. Troubleshooting
 
-| Symptôme | Solution |
+| Symptom | Fix |
 |---|---|
 | `ModuleNotFoundError: No module named 'vllm_configurator'` | `uv sync --reinstall-package vllm-configurator` |
-| « Taille du KV inconnue » | Le modèle a une architecture dont le KV ne se calcule pas de façon fiable : saisissez `GPU KV cache size` lu dans les logs. |
-| Avertissement critique « absente du registre de vLLM » | La version choisie ne prend pas en charge ce modèle. Utilisez l'image dédiée indiquée, puis vérifiez les flags dessus. |
-| Modèle, GPU ou version absent des listes | Ajoutez-le au catalogue (voir ci-dessous). |
-| Caractères accentués illisibles dans un terminal Windows | Préfixez les scripts par `PYTHONUTF8=1`. |
+| « Taille du KV inconnue » (unknown KV size) | The model has an architecture whose KV cannot be computed reliably: enter the `GPU KV cache size` read in the logs. |
+| Critical warning « absente du registre de vLLM » | The chosen version does not support this model. Use the dedicated image given, then check the flags on it. |
+| Model, GPU or version missing from the lists | Add it to the catalog (see below). |
+| Unreadable accented characters in a Windows terminal | Prefix the scripts with `PYTHONUTF8=1`. |
 
-### 10. Lancer les tests
+### 10. Run the tests
 
 ```bash
 uv run pytest
 ```
 
-Les tests couvrent les formules (avec les valeurs numériques de la base de connaissances), les règles et leur
-dépendance à la version, la cohérence du catalogue, le golden test et l'interface.
+The tests cover the formulas (with the numbers of the knowledge base), the rules and their dependency on the version,
+the consistency of the catalog, the golden test, the trace and replay imports, and the interface.
 
 ---
 
-## Maintenance : architecture et catalogue
+## Maintenance: architecture and catalog
 
-La base de connaissances d'origine est `docs/vllm-config-knowledge-base.md`. Les vérifications faites dans le code
-source de vLLM, dont plusieurs corrections à cette base, sont dans `docs/verification-vllm-0.33.0.md`.
+The original knowledge base is `docs/vllm-config-knowledge-base.md`. The checks made in the vLLM source code,
+including several corrections to that base, are in `docs/verification-vllm-0.33.0.md`.
 
 ### Architecture
 
 ```
-catalog/                    Données versionnées (YAML), séparées de la logique
-  gpus/<id>.yaml            GPU : HBM, famille de compute capability…
-  models/<id>.yaml          Modèles : config.json épinglé, KV, taille de bloc, spec decoding natif, support vLLM
-  vllm/<version>.yaml       Versions de vLLM : défauts, comportements, flags émis, changements cassants
-  vllm/extracted/*.yaml     Flags et clés JSON extraits du code source au tag (générés)
-  llmd/<version>.yaml       llm-d (EPP) : plugins, défauts lus dans les logs, comportements, heuristiques des poids
-  workload_profiles.yaml    Profils de charge, heuristiques, métriques
+catalog/                    Versioned data (YAML), separate from the logic
+  gpus/<id>.yaml            GPUs: HBM, compute capability family…
+  models/<id>.yaml          Models: pinned config.json, KV, block size, native spec decoding, vLLM support
+  vllm/<version>.yaml       vLLM versions: defaults, behaviors, emitted flags, breaking changes
+  vllm/extracted/*.yaml     Flags and JSON keys extracted from the source code at the tag (generated)
+  llmd/<version>.yaml       llm-d (EPP): plugins, defaults read in the logs, behaviors, weight heuristics
+  workload_profiles.yaml    Workload profiles, heuristics, metrics
 src/vllm_configurator/
-  catalog/                  Schémas pydantic et chargement + validation croisée
-  formulas.py               Formules de la §3, fonctions pures
-  perf.py                   Modèle d'un step du scheduler (somme des rooflines par opérateur) et files d'attente
-  analysis.py               Paliers de test, contrôles SLO, goulots et pistes de correction
-  scenario.py               Fichiers de scénario YAML (export / import du formulaire)
-  traces.py                 Traces working-set (ws trace) : profil de charge lu sur des sessions enregistrées
-  rules/                    Règles : une fonction pure (RuleContext, state) -> RuleOutput par décision
-  engine.py                 Exécute le pipeline de règles, produit un GenerationResult
-  render.py                 YAML `args` (KServe/K8s), ligne de commande, commande de vérification
-  llmd/                     Cible llm-d : règles de l'EndpointPickerConfig et rendu YAML
-  targets/                  Registre des cibles : `vllm` et `llmd_epp`
-  web/app.py                Interface Streamlit
+  catalog/                  Pydantic schemas and loading + cross-validation
+  formulas.py               Formulas of §3, pure functions
+  perf.py                   Model of one scheduler step (sum of per-operator rooflines) and queues
+  frontend.py               CPU model of the Python frontend (GIL, renderer pool)
+  analysis.py               Test steps, SLO checks, capacity in sessions, bottlenecks and fixes
+  scenario.py               YAML scenario files (form export / import)
+  traces.py                 working-set traces (ws trace) and replay results (ws replay --out)
+  rules/                    Rules: one pure function (RuleContext, state) -> RuleOutput per decision
+  engine.py                 Runs the rule pipeline, produces a GenerationResult
+  render.py                 `args` YAML (KServe/K8s), command line, verification command
+  llmd/                     llm-d target: EndpointPickerConfig rules and YAML rendering
+  targets/                  Target registry: `vllm` and `llmd_epp`
+  web/app.py                Streamlit interface
 tests/
-  unit/                     Formules, règles, catalogue, UI
-  golden/reference_case/    Cas de référence : entrées §1, config attendue §7, écarts justifiés
-tools/extract_vllm_flags.py Extraction des flags d'une version de vLLM depuis GitHub
+  unit/                     Formulas, rules, catalog, traces, UI
+  golden/reference_case/    Reference case: §1 inputs, §7 expected config, justified deviations
+tools/extract_vllm_flags.py Extraction of the flags of a vLLM version from GitHub
 ```
 
-Principes :
+Principles:
 
-- **Les règles ne codent aucune version en dur.** Elles lisent les comportements du catalogue de la version
-  (`ctx.behavior("spec_decode.extra_draft_slots")`, etc.). Changer de version, c'est changer de fichier.
-- **Aucun flag inconnu n'est émis.** Le rendu refuse un flag absent de `catalog/vllm/extracted/<version>.yaml`. Le
-  moteur refuse aussi une clé `--speculative-config` inconnue.
-- **Honnêteté sur l'incertitude.** Toute donnée `unverified` utilisée par une règle produit un avertissement
-  « À vérifier ». Une donnée manquante produit soit une hypothèse affichée, soit une erreur bloquante qui demande
-  la valeur.
-- **Toujours émettre.** Les flags sur lesquels repose la config sont émis même quand ils valent le défaut. Font
-  exception `--block-size` (ne jamais forcer une taille imposée par le backend), `--kv-offloading-size` (sa seule
-  présence active l'offload) et `--max-model-len` (défaut = contexte maximal du modèle). Leur raison figure en
-  commentaire dans le YAML.
-- **Cibles découplées.** `GenerationResult.facts` (`DeploymentFacts`) expose le KV par instance et sa source, la
-  taille de bloc, `max_num_seqs`, etc. La cible `llmd_epp` consomme ces faits
-  (`lruCapacityPerServer = formulas.lru_capacity_per_server(kv, block)`) sans toucher au moteur vLLM.
+- **Rules hard-code no version.** They read the behaviors of the version's catalog
+  (`ctx.behavior("spec_decode.extra_draft_slots")`, etc.). Changing versions means changing files.
+- **No unknown flag is emitted.** Rendering refuses a flag missing from `catalog/vllm/extracted/<version>.yaml`. The
+  engine also refuses an unknown `--speculative-config` key.
+- **Honesty about uncertainty.** Every `unverified` input used by a rule produces a « À vérifier » warning. A missing
+  input produces either a displayed assumption or a blocking error that asks for the value.
+- **Always emit.** The flags the config relies on are emitted even when they equal the default. The exceptions are
+  `--block-size` (never force a size the backend imposes), `--kv-offloading-size` (its mere presence turns offload on)
+  and `--max-model-len` (default = maximum context of the model). Their reason is written as a comment in the YAML.
+- **Decoupled targets.** `GenerationResult.facts` (`DeploymentFacts`) exposes the KV per instance and its source, the
+  block size, `max_num_seqs`, etc. The `llmd_epp` target consumes these facts
+  (`lruCapacityPerServer = formulas.lru_capacity_per_server(kv, block)`) without touching the vLLM engine.
 
-### Ajouter une version d'llm-d
+### Add an llm-d version
 
-Copier `catalog/llmd/rhoai-3.5.yaml` en `catalog/llmd/<id>.yaml` (le nom du fichier doit être égal à `id`). Relever
-les défauts dans le log de démarrage de l'EPP (`Prefix DataProducer initialized`, `EPP config after phase two`) et les
-passer en `status: verified` avec ce log pour source. Garder en `unverified` ce qui n'a pas été lu (emplacement des
-paramètres, effet de l'autoTune, paramètres du mode precise).
+Copy `catalog/llmd/rhoai-3.5.yaml` to `catalog/llmd/<id>.yaml` (the file name must equal `id`). Read the defaults in
+the EPP startup log (`Prefix DataProducer initialized`, `EPP config after phase two`) and set them to
+`status: verified` with that log as the source. Keep as `unverified` what was not read (location of the parameters,
+effect of autoTune, precise-mode parameters).
 
-### Ajouter un GPU
+### Add a GPU
 
-Le skill Claude Code `vllm-configurator-catalog` (`.claude/skills/vllm-configurator-catalog/`) automatise cette procédure et
-celle des modèles. À la main :
+The Claude Code skill `vllm-configurator-catalog` (`.claude/skills/vllm-configurator-catalog/`) automates this
+procedure and the model one. By hand:
 
-1. Créer `catalog/gpus/<id>.yaml` (le nom du fichier doit être égal à `id`), sur le modèle de `b300.yaml`.
-2. `memory.hbm_gb` en Go décimaux, d'après la fiche constructeur. Si seule une page système donne un total,
-   diviser, mais marquer `status: unverified` et expliquer le recoupement dans `note`.
-3. `cudagraph_family` : `blackwell_dc` pour une compute capability 10.x, sinon `other`. C'est la seule
-   information que vLLM utilise pour le plafond de capture des CUDA graphs.
-4. `bandwidth.hbm_tb_s` et `compute.dense_tflops` (fp4, fp8, bf16, valeurs **denses** par GPU) : facultatifs, ils
-   servent au modèle de latence des paliers de test.
-5. Valider (voir plus bas).
+1. Create `catalog/gpus/<id>.yaml` (the file name must equal `id`), after `b300.yaml`.
+2. `memory.hbm_gb` in decimal GB, from the vendor datasheet. If only a system page gives a total, divide it, but set
+   `status: unverified` and explain the cross-check in `note`.
+3. `cudagraph_family`: `blackwell_dc` for a compute capability 10.x, else `other`. It is the only information vLLM
+   uses for the CUDA graph capture cap.
+4. `bandwidth.hbm_tb_s` and `compute.dense_tflops` (fp4, fp8, bf16, **dense** values per GPU): optional, they feed
+   the latency model of the test steps.
+5. Validate (see below).
 
-La HBM ne sert qu'à estimer le KV quand les logs de démarrage ne sont pas fournis.
+The HBM is only used to estimate the KV when the startup logs are not provided.
 
-### Ajouter un modèle
+### Add a model
 
-1. Identifier le dépôt Hugging Face exact et collecter les faits à une révision épinglée :
+1. Identify the exact Hugging Face repository and collect the facts at a pinned revision:
    ```bash
    PYTHONUTF8=1 uv run python .claude/skills/vllm-configurator-catalog/scripts/hf_model_facts.py <org/repo>
    ```
-2. Lire la recette `https://recipes.vllm.ai/<org/repo>` : méthode et `k` de spec decoding, dtype du KV, version
-   minimale, image dédiée.
-3. Créer `catalog/models/<id>.yaml` sur le modèle des fiches existantes. Règles :
-   - `hf_revision` : SHA complet de 40 caractères ; les URLs `source` pointent vers cette révision.
-   - `kv_cache.bytes_per_token` : laisser `null` si l'architecture est exotique (attention linéaire ou hybride,
-     compression, KV partagé, indexeurs). L'app exigera alors la ligne « GPU KV cache size » des logs, ce qui est
-     voulu. Une formule standard (GQA, MLA simple) se met dans `method`, avec `status: unverified`.
-   - `block_size.forced_by_backend` : seulement d'après un log réel ou une consigne explicite de la recette.
-   - `speculative.native_method` doit figurer dans `speculative_methods` du fichier `extracted` de la version visée.
-   - `context_extension` (facultatif) : seulement d'après la model card ou la recette. `native_max_model_len`,
-     `max_model_len` atteignable, `override_path` (ex. `[text_config, rope_parameters]`) et le bloc `rope_parameters`
-     complet **sans** `factor`, que l'app calcule.
-   - `performance` (facultatif, pour les plages de latence des paliers) : paramètres activés par token d'après la model card ou
-     la recette, taille des experts routés d'après `config.json`, octets par paramètre selon la quantization.
-4. Valider.
+2. Read the recipe `https://recipes.vllm.ai/<org/repo>`: spec decoding method and `k`, KV dtype, minimum version,
+   dedicated image.
+3. Create `catalog/models/<id>.yaml` after the existing cards. Rules:
+   - `hf_revision`: full 40-character SHA; the `source` URLs point to that revision.
+   - `kv_cache.bytes_per_token`: leave `null` if the architecture is exotic (linear or hybrid attention, compression,
+     shared KV, indexers). The app then requires the « GPU KV cache size » line of the logs, which is intended. A
+     standard formula (GQA, plain MLA) goes into `method`, with `status: unverified`.
+   - `block_size.forced_by_backend`: only from a real log or an explicit instruction of the recipe.
+   - `speculative.native_method` must be listed in `speculative_methods` of the `extracted` file of the target version.
+   - `context_extension` (optional): only from the model card or the recipe. `native_max_model_len`, reachable
+     `max_model_len`, `override_path` (e.g. `[text_config, rope_parameters]`) and the complete `rope_parameters`
+     block **without** `factor`, which the app computes.
+   - `performance` (optional, for the latency ranges of the steps): parameters activated per token from the model card
+     or the recipe, size of the routed experts from `config.json`, bytes per parameter according to the quantization.
+4. Validate.
 
-Le détail champ par champ est dans `.claude/skills/vllm-configurator-catalog/references/fields.md`.
+The field-by-field details are in `.claude/skills/vllm-configurator-catalog/references/fields.md`.
 
-### Ajouter une version de vLLM
+### Add a vLLM version
 
-1. **Extraire les flags** au tag de la version :
+1. **Extract the flags** at the version's tag:
    ```bash
    uv run python tools/extract_vllm_flags.py v0.34.0
    ```
-   L'outil génère `catalog/vllm/extracted/0.34.0.yaml` : flags CLI, clés de `--speculative-config` et de
-   `--compilation-config`, méthodes de spec decoding, architectures du registre. Les fichiers sources sont
-   téléchargés dans `.cache/vllm-src/` et lus comme du texte, jamais exécutés.
-2. **Copier le catalogue précédent** (`catalog/vllm/0.33.0.yaml` → `0.34.0.yaml`), puis mettre à jour `version`,
-   `source_tag` et `verified_on`.
-3. **Revérifier chaque comportement dans le code source au nouveau tag** et corriger `value`, `source` et
-   `status`. Où regarder :
+   The tool generates `catalog/vllm/extracted/0.34.0.yaml`: CLI flags, `--speculative-config` and
+   `--compilation-config` keys, spec decoding methods, registry architectures. The source files are downloaded into
+   `.cache/vllm-src/` and read as text, never executed.
+2. **Copy the previous catalog** (`catalog/vllm/0.33.0.yaml` → `0.34.0.yaml`), then update `version`, `source_tag`
+   and `verified_on`.
+3. **Check every behavior again in the source code at the new tag** and fix `value`, `source` and `status`. Where to
+   look:
 
-   | Comportement | Fichier, symbole |
+   | Behavior | File, symbol |
    |---|---|
-   | `defaults.*` | `vllm/config/cache.py`, `scheduler.py`, `speculative.py` (valeurs des champs) |
+   | `defaults.*` | `vllm/config/cache.py`, `scheduler.py`, `speculative.py` (field values) |
    | `long_prefill.*` | `vllm/v1/core/sched/scheduler.py`, `schedule()` (`num_eligible_reqs`, `adaptive_long_prefill_threshold`) |
-   | `spec_decode.verification_tokens_in_budget` | `scheduler.py`, calcul de `num_new_tokens` pour les requêtes running |
-   | `spec_decode.extra_draft_slots` | `vllm/config/speculative.py`, `max_num_new_slots_for_drafting` (tableau dans la docstring) |
+   | `spec_decode.verification_tokens_in_budget` | `scheduler.py`, computation of `num_new_tokens` for running requests |
+   | `spec_decode.extra_draft_slots` | `vllm/config/speculative.py`, `max_num_new_slots_for_drafting` (table in the docstring) |
    | `spec_decode.dspark_active_seq_cap` | `vllm/config/vllm.py`, `max_draft_seqs` |
    | `spec_decode.fly`, `adaptive_verification`, `draft_lm_head_quantization` | `vllm/config/speculative.py` |
-   | `cudagraph.*` | `vllm/config/vllm.py`, `_set_cudagraph_sizes` ; `vllm/config/compilation.py` |
+   | `cudagraph.*` | `vllm/config/vllm.py`, `_set_cudagraph_sizes`; `vllm/config/compilation.py` |
+   | `frontend.*` | `vllm/entrypoints/cli/serve.py` (`run_multi_api_server`), `vllm/renderers/base.py`, `hf.py`, `deepseek_v4.py`, `vllm/v1/engine/async_llm.py` (`output_handler`) |
 
-   Ce qui n'a pas pu être relu dans le code reste en `status: unverified`, avec la source utilisée (notes de
-   version…). L'app l'affichera « à vérifier ».
-4. **Mettre à jour** `breaking_changes` et `notes` d'après les notes de version.
-5. Si une règle a besoin d'un comportement nouveau, ajouter la clé dans **tous** les catalogues de versions, avec la
-   valeur propre à chacune, puis la lire dans la règle via `ctx.behavior(...)`. `tests/unit/test_catalog.py`
-   vérifie que chaque version définit les comportements utilisés.
-6. Valider.
+   What could not be read in the code stays `status: unverified`, with the source used (release notes…). The app will
+   show it as « à vérifier ».
+4. **Update** `breaking_changes` and `notes` from the release notes.
+5. If a rule needs a new behavior, add the key to **every** version catalog, with each one's own value, then read it
+   in the rule through `ctx.behavior(...)`. `tests/unit/test_catalog.py` checks that every version defines the
+   behaviors in use.
+6. Validate.
 
-### Valider le catalogue
+### Validate the catalog
 
 ```bash
 uv run python -c "from vllm_configurator.catalog import load_catalog; c = load_catalog(); print(c.validate() or 'OK')"
@@ -671,12 +713,15 @@ uv run pytest
 
 ### Golden test
 
-`tests/golden/reference_case/` contient les entrées du §1 (`input.yaml`), la config du §7 recopiée telle quelle
-(`expected.yaml`) et les écarts assumés (`deviations.yaml`). Le test échoue si la config générée diffère de la §7
-sans que l'écart soit listé et justifié, ou si un écart listé ne se produit plus. Écarts actuels :
+`tests/golden/reference_case/` holds the §1 inputs (`input.yaml`), the §7 config copied as is (`expected.yaml`) and
+the accepted deviations (`deviations.yaml`). The test fails if the generated config differs from §7 without the
+deviation being listed and justified, or if a listed deviation no longer happens. Current deviations:
 
-- flags ajoutés par la politique « toujours émettre » (`--tensor-parallel-size 4`, `--data-parallel-size 1`,
-  `--enable-chunked-prefill`, clés `rejection_sample_method` et `enable_adaptive_verification`) ;
-- `--long-prefill-token-threshold-adaptive`, sans lequel le comportement dynamique du §2.5 n'est pas actif en 0.33 ;
-- même budget de 8192, mais justification corrigée : avec 1 + k tokens de vérification par séquence, le ratio
-  nécessaire est de 4,0, et 8192 est retenu pour l'ITL en interactif.
+- flags added by the « always emit » policy (`--tensor-parallel-size 4`, `--data-parallel-size 1`,
+  `--enable-chunked-prefill`, keys `rejection_sample_method` and `enable_adaptive_verification`);
+- `--long-prefill-token-threshold-adaptive`, without which the dynamic behavior of §2.5 is not active in 0.33;
+- same 8192 budget, but a corrected justification: with 1 + k verification tokens per sequence, the ratio needed is
+  4.0, and 8192 is kept for the ITL in interactive mode;
+- `--gpu-memory-utilization` left at the vLLM default (0.92) instead of 0.8: vLLM profiles the CUDA graph memory, so
+  0.8 would count it twice;
+- `--api-server-count 2`: at full load, the streamed outputs would saturate the GIL of a single API process.

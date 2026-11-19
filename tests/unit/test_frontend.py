@@ -30,7 +30,7 @@ class TestModel:
         load = fe.frontend_load(COSTS, 10, 5000, 30000, 30000**2, 1, 1)
         expected = 10 * (1.5e-3 + 0.05e-6 * 30000) + 10 * 0.15e-6 * 30000 + 5000 * 60e-6
         assert load.gil_utilization == pytest.approx(expected)
-        assert load.gil_share["sorties"] == pytest.approx(0.3 / expected)  # COSTS : tokenize_gil_share = 0
+        assert load.gil_share["sorties"] == pytest.approx(0.3 / expected)  # COSTS: tokenize_gil_share = 0
         assert load.pool_utilization == pytest.approx(10 * 0.65e-6 * 30000)
         assert load.loop_wait_p95_s > load.loop_wait_s > 0
 
@@ -39,7 +39,7 @@ class TestModel:
         two = fe.frontend_load(COSTS, 60, 5000, 30000, 30000**2, 2, 1)
         threads = fe.frontend_load(COSTS, 60, 5000, 30000, 30000**2, 1, 4)
         assert two.gil_utilization == pytest.approx(one.gil_utilization / 2)
-        assert threads.gil_utilization == pytest.approx(one.gil_utilization)  # le chat template tient le GIL
+        assert threads.gil_utilization == pytest.approx(one.gil_utilization)  # the chat template holds the GIL
         assert threads.pool_utilization == pytest.approx(one.pool_utilization / 4)
 
     def test_saturation_makes_the_waits_infinite(self):
@@ -48,9 +48,9 @@ class TestModel:
 
     def test_sizing_follows_the_bottleneck(self):
         assert fe.size_frontend(COSTS, 5, 3000, 30000) == (1, 1)
-        assert fe.size_frontend(COSTS, 20, 15000, 3000)[0] >= 2  # sorties : des processus, pas des threads
+        assert fe.size_frontend(COSTS, 20, 15000, 3000)[0] >= 2  # outputs: processes, not threads
         servers, workers = fe.size_frontend(COSTS, 60, 1000, 30000)
-        assert servers * workers >= 2  # longs prompts à fort débit : le rendu sature
+        assert servers * workers >= 2  # long prompts at a high rate: the rendering saturates
         assert fe.size_frontend(COSTS, 20, 15000, 3000, max_servers=1)[0] == 1
 
 
@@ -88,12 +88,12 @@ class TestRule:
         assert servers.value == 1 and "plafonné" in servers.justification
         assert any(w.rule_id == "R-FE-03" for w in result.warnings)
         cpu = {i.key: i for i in result.indicators}["frontend_cpu"]
-        assert cpu.value > 5  # engine core + 4 workers GPU + frontal
+        assert cpu.value > 5  # engine core + 4 GPU workers + frontend
 
     def test_forced_value_is_a_known_flag_and_wins(self):
         result = generate(req(**CHAT_NO_SPEC, extra_args={"--api-server-count": 1}))
         assert not any(w.rule_id == "R-EXTRA-01" and w.severity == "critical" for w in result.warnings)
-        assert not result.decision("api_server_count").emitted  # remplacé par l'argument supplémentaire
+        assert not result.decision("api_server_count").emitted  # replaced by the extra argument
         front = checks(result.analysis)["frontend"]
         assert front.status in ("at_risk", "ko")
         assert "frontend_cpu" in [b.key for b in result.analysis.bottlenecks]

@@ -10,7 +10,7 @@ from vllm_configurator import perf
 from vllm_configurator.domain import DeploymentRequest
 from vllm_configurator.engine import generate
 
-# Cas de référence (§1) : DeepSeek V4.1 Flash, 2 pods TP4 de B300, KV lu dans les logs.
+# Reference case (§1): DeepSeek V4.1 Flash, 2 TP4 pods of B300, KV read in the logs.
 BASE = {
     "gpu_id": "b300", "gpus_per_instance": 4, "num_instances": 2, "model_id": "deepseek-v4.1-flash-1017",
     "vllm_version": "0.33.0",
@@ -53,23 +53,23 @@ class TestPerfModel:
         assert perf.experts_hit_fraction(0, 6, 384) == 0.0
 
     def test_erlang_c(self):
-        assert perf.erlang_c(1, 0.5) == pytest.approx(0.5)  # M/M/1 : P(attente) = ρ
+        assert perf.erlang_c(1, 0.5) == pytest.approx(0.5)  # M/M/1: P(wait) = ρ
         assert perf.erlang_c(2, 1.0) == pytest.approx(1 / 3)
         assert perf.erlang_c(3, 3.0) == 1.0
 
     def test_mgc_wait_grows_with_the_service_variance(self):
         p_wait, scale = perf.mgc_wait(0.5, 1, 1.0, 0.0)
-        assert p_wait * scale == pytest.approx(0.5)  # M/D/1 : ρ / (2 (1 − ρ)) × service
+        assert p_wait * scale == pytest.approx(0.5)  # M/D/1: ρ / (2 (1 − ρ)) × service
         _, heavy = perf.mgc_wait(0.5, 1, 1.0, 20.0)
-        assert heavy == pytest.approx(21 * scale)  # facteur (1 + SCV)
+        assert heavy == pytest.approx(21 * scale)  # factor (1 + SCV)
         _, wait_c = perf.mgc_wait(0.5, 4, 1.0, 0.0)
-        assert wait_c < scale  # plusieurs prefills de front : moins d'attente
+        assert wait_c < scale  # several prefills side by side: less waiting
         assert math.isinf(perf.mgc_wait(1.0, 1, 1.0, 0.0)[1])
 
     def test_quantile_of_sum(self):
         points = [(0.5, 1.0), (0.5, 3.0)]
-        assert perf.quantile_of_sum(0.5, points, 0.0, 0.0) == pytest.approx(2.0)  # interpolation entre les tranches
-        # W exponentielle de moyenne 1, toujours présente : P(W > x) = 0,05 à x = ln 20.
+        assert perf.quantile_of_sum(0.5, points, 0.0, 0.0) == pytest.approx(2.0)  # interpolation between the slices
+        # W exponential of mean 1, always present: P(W > x) = 0.05 at x = ln 20.
         assert perf.quantile_of_sum(0.95, [(1.0, 0.0)], 1.0, 1.0) == pytest.approx(math.log(20), rel=1e-3)
         assert perf.quantile_of_sum(0.95, points, 0.5, 2.0) > perf.quantile_of_sum(0.95, points, 0.0, 0.0)
 
@@ -84,7 +84,7 @@ class TestVerdict:
     def test_reference_case_without_slo_is_a_capacity_verdict(self):
         a = analysis()
         assert a.verdict == "ok"
-        assert checks(a)["itl"].status == "unknown"  # pas de cible
+        assert checks(a)["itl"].status == "unknown"  # no target
         assert checks(a)["kv"].status == "ok"
         assert kinds(a)[0] == "none"
 
@@ -94,7 +94,7 @@ class TestVerdict:
         assert "devraient être tenus" in a.summary
 
     def test_full_load_with_short_agentic_outputs_saturates_the_prefill(self):
-        # OSL 250 (médiane agentique publiée) à 512 séquences : ratio effectif 4,1 ≥ 4,0 nécessaire (§3.1).
+        # OSL 250 (published agentic median) at 512 sequences: effective ratio 4.1 ≥ 4.0 needed (§3.1).
         a = analysis(workload={"osl": {"p50": 250}}, slo={"ttft_p95_ms": 2000})
         assert checks(a)["prefill_load"].status == "ko"
         assert bottlenecks(a)[0] == "prefill"
@@ -109,7 +109,7 @@ class TestVerdict:
         a = analysis(slo={"itl_p95_ms": 30}, observed_perf={"itl_p95_ms": 45})
         itl = checks(a)["itl"]
         assert itl.measured == 45 and itl.status == "ko"
-        assert a.calibration and itl.estimate == pytest.approx(45, rel=0.01)  # modèle recalé sur la mesure
+        assert a.calibration and itl.estimate == pytest.approx(45, rel=0.01)  # model recalibrated on the measurement
 
     def test_no_latency_model_without_performance_data(self):
         from vllm_configurator.catalog import load_catalog
@@ -129,7 +129,7 @@ class TestVerdict:
 
 class TestBottlenecks:
     def test_prefill_saturation(self):
-        # Sorties courtes : beaucoup de requêtes finissent par step, le prefill non caché dépasse le budget.
+        # Short outputs: many requests finish per step, the uncached prefill exceeds the budget.
         a = analysis(workload={"target_concurrency": 1500, "osl": {"p50": 250}}, slo={"itl_p95_ms": 25, "ttft_p95_ms": 1500})
         assert a.verdict == "ko"
         assert bottlenecks(a)[0] == "prefill"
@@ -143,7 +143,7 @@ class TestBottlenecks:
         assert "kv_capacity" in bottlenecks(a)
         titles = " ".join(r.title for r in a.recommendations)
         assert "--gpu-memory-utilization" in titles and "DP-attention" in titles
-        # Les paliers ne dépassent pas ce que le KV loge (90 % au contexte moyen) ; la capture suit (k + 1) × S.
+        # The steps do not exceed what the KV holds (90 % at the mean context); the capture follows (k + 1) × S.
         assert all(s.kv_usage_pct <= 90 for s in a.test_plan.steps)
         assert all(s.capture_size == min(4 * s.max_num_seqs, s.max_num_batched_tokens) for s in a.test_plan.steps)
 
@@ -160,14 +160,14 @@ class TestBottlenecks:
         assert wider.changes["GPU"] < scale.changes["GPU"]
 
     def test_parameter_fix_without_extra_gpu_when_one_exists(self):
-        # 500 séquences par instance, sorties courtes : le prefill sature le budget de 8192 ; 12288 suffit, même dans
-        # le cas pessimiste (×2,5) avec des cibles lâches (le step chargé d'un budget plus haut allonge l'ITL).
+        # 500 sequences per instance, short outputs: the prefill saturates the 8192 budget; 12288 is enough, even in the
+        # pessimistic case (×2.5) with loose targets (the loaded step of a higher budget lengthens the ITL).
         a = analysis(workload={"target_concurrency": 1000, "osl": {"p50": 250}}, slo={"ttft_p95_ms": 5000, "itl_p95_ms": 300})
         assert a.verdict == "ko" and bottlenecks(a)[0] == "prefill"
         tune = a.recommendations[0]
         assert tune.kind == "param"
         assert tune.changes["--max-num-batched-tokens"] > 8192
-        assert "--max-num-seqs" not in tune.changes  # pas de file d'attente ajoutée
+        assert "--max-num-seqs" not in tune.changes  # no queue added
 
 def test_every_catalog_model_gets_an_analysis():
     for model_id, kv in (("glm-5.3-flash", 40_000_000), ("qwen3.8-flash-next", 20_000_000), ("mistral-large-4", 30_000_000)):
@@ -184,8 +184,8 @@ class TestRangesAndMetric:
         a = analysis(slo={"itl_p95_ms": 50, "ttft_p95_ms": 2000})
         itl = checks(a)["itl"]
         assert a.uncertainty == (0.8, 2.5)
-        # Le multiplicateur porte sur le GPU ; l'attente du frontal (GIL) s'y ajoute sans être multipliée, et croît un peu
-        # quand les steps sont plus rapides (plus de trafic) : d'où quelques pourcents d'écart.
+        # The multiplier applies to the GPU; the frontend wait (GIL) adds to it without being multiplied, and grows a
+        # little when the steps are faster (more traffic): hence a few percent of gap.
         assert itl.estimate_low == pytest.approx(itl.estimate * 0.8, rel=0.03)
         assert itl.estimate_high == pytest.approx(itl.estimate * 2.5, rel=0.03)
 
@@ -197,7 +197,7 @@ class TestRangesAndMetric:
         a = analysis(slo={"itl_p95_ms": 50, "itl_metric": "tpot"})
         tpot = checks(a)["itl"]
         assert tpot.label == "TPOT p95"
-        # a moyen = 3 avec DSpark k = 3, mais ~2,2 pour les 5 % de requêtes les moins acceptées.
+        # mean a = 3 with DSpark k = 3, but ~2.2 for the 5 % least accepted requests.
         step = a.step_breakdown["Step moyen (ms)"]
         assert step / 3 < tpot.estimate < step / 2
         assert any("les 5 % de requêtes les moins acceptées" in n for n in a.notes)
@@ -205,15 +205,15 @@ class TestRangesAndMetric:
     def test_spec_decoding_lowers_tpot_less_than_the_mean_acceptance(self):
         on = checks(analysis(slo={"itl_p95_ms": 50, "itl_metric": "tpot"}))["itl"].estimate
         off = checks(analysis(slo={"itl_p95_ms": 50, "itl_metric": "tpot"}, spec={"enabled": False}))["itl"].estimate
-        # Drafter, vérification de k + 1 tokens et requêtes peu acceptées : gain réel bien en deçà de a = 3.
+        # Drafter, verification of k + 1 tokens and poorly accepted requests: real gain well below a = 3.
         assert off / 3 < on < off
 
     def test_mean_context_from_percentiles(self):
         a = analysis(workload={"isl": {"p50": 23000, "p95": 76600, "p99": 666000}})
-        assert any("ISL 35" in n for n in a.notes)  # moyenne ≈ 35 452, bien au-delà du P50
+        assert any("ISL 35" in n for n in a.notes)  # mean ≈ 35,452, well above the P50
 
     def test_kv_is_rescaled_to_the_generated_memory_fraction(self):
-        # KV lu à 0,8, config au défaut 0,92 (vLLM profile la mémoire des CUDA graphs) : plus de mémoire libre.
+        # KV read at 0.8, config at the 0.92 default (vLLM profiles the CUDA graph memory): more free memory.
         a = analysis(observed_kv={"kv_cache_tokens": 86_225_864, "gpu_memory_utilization": 0.8})
         assert any(n.startswith("KV ramené") for n in a.notes)
 
@@ -226,7 +226,7 @@ class TestTestPlan:
         plan = a.test_plan
         seqs = [s.max_num_seqs for s in plan.steps]
         assert seqs == sorted(seqs) and 2 <= len(seqs) <= 8
-        assert max(seqs) <= 850  # inutile de tester au-delà des requêtes en vol par instance
+        assert max(seqs) <= 850  # no need to test beyond the requests in flight per instance
         assert any(s.is_generated_config for s in plan.steps)
         assert plan.steps[0].expectation == "ok"
         assert all(s.instances_needed == -(-1700 // s.max_num_seqs) for s in plan.steps)
@@ -271,7 +271,7 @@ def internals(**overrides):
 
 class TestStepModel:
     def test_prefill_tokens_lengthen_the_step(self):
-        # Somme des opérateurs : le calcul du prefill ne se cache plus sous la lecture des poids.
+        # Sum of the operators: the prefill compute no longer hides under the weight reads.
         b = analysis(workload={"target_concurrency": 400}).step_breakdown
         assert b["Step chargé, ITL p95 (ms)"] > 1.2 * b["Step de decode pur (ms)"]
 
@@ -303,14 +303,14 @@ class TestStepModel:
             full, _, _, note = A.attention_cost(ctx)
             assert full > 0 and note, model_id
         _, _, tokens, note = A.attention_cost(build_context(req(), catalog))
-        assert tokens == 512 + 128  # DeepSeek V4.1 : index_topk + sliding_window de config.json
+        assert tokens == 512 + 128  # DeepSeek V4.1: index_topk + sliding_window from config.json
         assert "indexeur" in note
 
 
 class TestPrefillDistribution:
     def test_ttft_p95_reflects_cold_requests(self):
-        # À hit rate constant, sous 5 % de requêtes froides le p95 peut même baisser (le prefill non caché part dans la
-        # queue, au-delà du p95) ; au-delà de 5 %, le p95 est un prefill complet.
+        # At a constant hit rate, below 5 % of cold requests the p95 can even drop (the uncached prefill moves into the
+        # tail, past the p95); above 5 %, the p95 is a full prefill.
         default = checks(analysis(workload={"target_concurrency": 400}))["ttft"].estimate
         cold = checks(analysis(workload={"target_concurrency": 400, "cold_request_fraction": 0.08}))["ttft"].estimate
         assert cold > 3 * default
@@ -336,7 +336,7 @@ class TestPrefillDistribution:
         env, base, _ = internals(workload={"target_concurrency": 1000, "osl": {"p50": 1000}})
         ev = A.evaluate(env, base)
         assert 0 < ev.rho < 1 and ev.servers >= 2
-        assert env.u_scv > 5  # requêtes froides : service très dispersé
+        assert env.u_scv > 5  # cold requests: very dispersed service
         assert ev.prefill_wait_s > 0 and ev.ttft_s > ev.own_prefill_s
 
     def test_fast_pass_matches_the_checks(self):
@@ -364,7 +364,7 @@ class TestCalibration:
     def test_irreconcilable_measurements_are_explained(self):
         a = analysis(slo={"itl_p95_ms": 50, "ttft_p95_ms": 2000}, observed_perf={"itl_p95_ms": 45, "ttft_p95_ms": 1500})
         assert any("non conciliables" in n for n in a.notes)
-        assert checks(a)["itl"].estimate == pytest.approx(45, rel=0.01)  # la latence de génération reste recalée
+        assert checks(a)["itl"].estimate == pytest.approx(45, rel=0.01)  # the generation latency stays recalibrated
         assert a.calibration_prefill is None
 
 

@@ -2,8 +2,8 @@ id: b300
 display_name: NVIDIA B300 (Blackwell Ultra, HGX)
 vendor: nvidia
 generation: blackwell_ultra
-# vLLM applique le plafond de capture CUDA graphs « Blackwell datacenter » (1024) à toute la famille
-# de compute capability 10.x : is_device_capability_family(100) dans vllm/config/vllm.py.
+# vLLM applies the « Blackwell datacenter » CUDA graph capture cap (1024) to the whole compute capability 10.x family:
+# is_device_capability_family(100) in vllm/config/vllm.py.
 cudagraph_family: blackwell_dc
 verified_on: "2026-11-12"
 
@@ -35,7 +35,7 @@ bandwidth:
 
 
 compute:
-  # Crête dense par GPU, en TFLOPS : tableau HGX B300 (8 GPU) divisé par 8.
+  # Dense peak per GPU, in TFLOPS: HGX B300 table (8 GPUs) divided by 8.
   dense_tflops: {fp4: 13500, fp8: 4500, bf16: 2250}
   status: verified
   source: "https://www.nvidia.com/en-us/data-center/hgx/ (HGX B300 : FP4 « 144 PFLOPS | 108 PFLOPS » sparse | dense ; FP8/FP6 72 PFLOPS et FP16/BF16 36 PFLOPS en sparse, « Dense is ½ sparse spec shown »)"

@@ -228,11 +228,11 @@ def lognormal_quantile_fn(p50: float, p95: float | None = None, p99: float | Non
     return quantile
 
 
-# Bornes des tranches de probabilité de la grille : fines dans la queue, où se joue le p95.
+# Probability slice edges of the grid: fine in the tail, where the p95 is decided.
 GRID_EDGES = [i / 40 for i in range(37)] + [0.925, 0.95, 0.96, 0.97, 0.98, 0.99, 0.995, 0.999, 1.0]
 _F_EDGES = [i / 12 for i in range(11)] + [0.95, 0.99, 1.0]
-# Tranches de la distribution réduite utilisée point par point (TTFT, ITL) : plus larges sous le 90e centile.
-# Pas de borne à 0,95 : le p95 tombe au milieu d'une tranche et s'interpole (quantile_interpolated).
+# Slices of the reduced distribution used point by point (TTFT, ITL): wider below the 90th percentile. No edge at 0.95:
+# the p95 falls in the middle of a slice and is interpolated (quantile_interpolated).
 COLLAPSE_EDGES = [i / 20 for i in range(19)] + [0.92, 0.94, 0.955, 0.965, 0.975, 0.985, 0.99, 0.995, 0.999, 1.0]
 
 
@@ -300,7 +300,7 @@ def collapse(points: list[tuple[float, float, float]], edges: list[float] | None
             prob, su, si, acc, i = prob + p, su + p * u, si + p * isl, acc + p, i + 1
         if prob > 0:
             out.append((prob, su / prob, si / prob))
-    if i < len(points):  # reste dû aux arrondis
+    if i < len(points):  # remainder due to rounding
         rest = points[i:]
         prob = sum(p for p, _, _ in rest)
         if prob > 0:

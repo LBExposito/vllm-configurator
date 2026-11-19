@@ -1,12 +1,12 @@
-# Catalogue vLLM 0.33.0 (édité à la main).
-# La liste exhaustive des flags et des clés JSON est dans extracted/0.33.0.yaml (générée).
-# status: verified = lu dans le code source au tag v0.33.0 ; unverified = 🔶 à vérifier.
+# vLLM 0.33.0 catalog (edited by hand).
+# The exhaustive list of flags and JSON keys is in extracted/0.33.0.yaml (generated).
+# status: verified = read in the source code at tag v0.33.0; unverified = 🔶 to verify.
 version: "0.33.0"
 release_date: "2026-11"
 source_tag: v0.33.0
 verified_on: "2026-11-12"
 
-# Valeurs par défaut utilisées par le moteur (pour l'affichage « défaut → choisi »).
+# Default values used by the engine (for the « default → chosen » display).
 defaults:
   gpu_memory_utilization:
     value: 0.92
@@ -101,7 +101,7 @@ behaviors:
     source: "vllm/v1/core/sched/scheduler.py (num_new_tokens = num_tokens_with_spec - num_computed_tokens) ; PR #59468 (« charged 6 tokens instead of 10 » pour K=5)"
     note: "En decode, chaque séquence consomme 1 + k tokens du budget (tokens de vérification), quelle que soit la méthode."
   spec_decode.extra_draft_slots:
-    # Slots supplémentaires réservés par requête dans le budget d'entrée, en plus de 1 + k.
+    # Extra slots reserved per request in the input budget, on top of 1 + k.
     value: {dspark: "0", dflash: "0", mtp: "0", eagle3: "0", eagle3_parallel: "k-1", draft_model: "1", pard: "k", ngram: "0"}
     status: verified
     source: "vllm/config/speculative.py (SpeculativeConfig.max_num_new_slots_for_drafting) ; PR #59468"
@@ -146,7 +146,7 @@ behaviors:
     source: "Notes de version 0.33.0, PR #62431 (comportement du frontend Rust non relu dans le code)"
     note: "Le frontend Rust renvoie une erreur sur un flag non supporté au lieu de l'ignorer."
 
-# Flags et clés JSON que le moteur peut émettre. Chaque nom est validé contre extracted/0.33.0.yaml.
+# Flags and JSON keys the engine can emit. Each name is validated against extracted/0.33.0.yaml.
   frontend.api_servers:
     value:
       default: data_parallel_size

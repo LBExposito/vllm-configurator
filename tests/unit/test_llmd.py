@@ -36,7 +36,7 @@ def test_catalog_has_the_rhoai_epp():
 
 
 def test_reference_case_matches_the_proposed_epp_config():
-    # §9.4 : blockSizeTokens 128, lruCapacityPerServer ≈ 86 225 834 / 128, autoTune off, poids 2 / 1 / 5 / 2.
+    # §9.4: blockSizeTokens 128, lruCapacityPerServer ≈ 86,225,834 / 128, autoTune off, weights 2 / 1 / 5 / 2.
     r = routing_for(reference())
     assert not r.blocking_errors
     assert r.decision("blockSizeTokens").value == 128
@@ -91,7 +91,7 @@ def test_shared_prefix_reduces_the_value_of_affinity():
 
 def test_saturated_pods_raise_the_queue_weight():
     data = yaml.safe_load(REFERENCE.read_text(encoding="utf-8"))
-    data["workload"]["target_concurrency"] = 1000  # 500 par pod pour max-num-seqs 512
+    data["workload"]["target_concurrency"] = 1000  # 500 per pod for max-num-seqs 512
     r = routing_for(DeploymentRequest(**data))
     assert r.weights["queue-scorer"] == 3
 
@@ -108,7 +108,7 @@ def test_single_instance_is_flagged():
 
 
 def test_undersized_deployed_index_is_critical():
-    # §9.3 : 31 250 blocs × 64 ≈ 2M tokens suivis pour 86M réels.
+    # §9.3: 31,250 blocks × 64 ≈ 2M tokens tracked for 86M real ones.
     r = routing_for(reference(routing={"observed": {"block_size_tokens": 16, "lru_capacity_per_server": 31250}}))
     messages = [w for w in r.warnings if w.rule_id == "llmd.observed"]
     assert any(w.severity == "critical" and "oublié" in w.message for w in messages)
@@ -172,7 +172,7 @@ def test_forced_parameters_replace_the_computed_values():
     assert "calculé : 673639" in r.decision("lruCapacityPerServer").justification
     params = yaml.safe_load(render_epp_config(r))["plugins"][0]["parameters"]
     assert params["lruCapacityPerServer"] == 700000 and params["maxPrefixTokensToMatch"] == 262144
-    # 262 144 tokens / 128 ≠ 1 024 blocs : incohérence signalée.
+    # 262,144 tokens / 128 ≠ 1,024 blocks: inconsistency reported.
     assert any("maxPrefixBlocksToMatch" in w.message for w in r.warnings)
 
 

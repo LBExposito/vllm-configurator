@@ -30,12 +30,12 @@ from typing import Any
 
 FORMAT = "workingset-agent-trace"
 VERSIONS = (1, 2)
-# Attentes où la session n'était pas utilisée (erreur et nouvel essai, reprise, session laissée ouverte) : `ws replay`
-# les remplace par une attente humaine tirée de la trace (politique « sample », par défaut).
+# Waits where the session was not in use (error and retry, resume, session left open): `ws replay` replaces them with a
+# human wait drawn from the trace (« sample » policy, the default).
 INACTIVE = frozenset({"error", "resume", "idle"})
-# Au-delà, une attente humaine est une session laissée ouverte (même seuil que working-set).
+# Beyond this, a human wait is a session left open (same threshold as working-set).
 PARK_S = 1800.0
-# Plafond de la dispersion déduite des percentiles des requêtes chaudes.
+# Bounds of the dispersion derived from the percentiles of the warm requests.
 SIGMA_BOUNDS = (0.1, 3.0)
 
 
@@ -52,14 +52,14 @@ class TraceProfile:
     first_prompt_p50: int
     first_prompt_min: int
     max_context: int
-    hit_rate: float                     # pondéré par les tokens, cache parfait
-    cold_fraction: float                # part des requêtes froides
-    cold_share_of_prefill: float        # part du prefill non caché portée par les requêtes froides
+    hit_rate: float                     # token-weighted, perfect cache
+    cold_fraction: float                # share of cold requests
+    cold_share_of_prefill: float        # share of the uncached prefill carried by cold requests
     warm_uncached: dict[str, int] | None
     mean_gap_s: float | None
     mean_service_s: float | None
-    busy_share: float | None            # part du temps où une session a une requête en vol (serveur enregistré)
-    resets: int                         # prompts qui ont rétréci (compaction, branche)
+    busy_share: float | None            # share of the time a session has a request in flight (recorded server)
+    resets: int                         # prompts that shrank (compaction, branch)
     shared_prefix_tokens: int
     reply_cached: bool
     notes: list[str] = field(default_factory=list)
@@ -122,7 +122,7 @@ def _percentiles(values: list[float], with_p99: bool = True) -> dict[str, int]:
     out = {"p50": max(1, round(_quantile(xs, 0.5))), "p95": max(1, round(_quantile(xs, 0.95)))}
     if with_p99:
         out["p99"] = max(1, round(_quantile(xs, 0.99)))
-    # arrondis : garder l'ordre exigé par Percentiles
+    # rounding: keep the order Percentiles requires
     out["p95"] = max(out["p95"], out["p50"])
     if with_p99:
         out["p99"] = max(out["p99"], out["p95"])
@@ -260,3 +260,188 @@ def summary_rows(profile: TraceProfile) -> list[tuple[str, str]]:
     if profile.busy_share is not None:
         rows.append(("Part du temps en vol (serveur enregistré)", f"{profile.busy_share:.0%}"))
     return rows
+
+
+# --- Results of `ws replay --out run.json` --------------------------------------------------------------------------
+
+RUN_FORMAT = "workingset-replay-run"
+RUN_VERSIONS = (1,)
+MIN_DECODE_TOKENS = 32  # same threshold as working-set for the decode speed of a request
+
+
+@dataclass(frozen=True)
+class RunStep:
+    """One judged step of a replay: N sessions at once, what the requests of its window measured."""
+
+    sessions: int
+    passed: bool
+    no_evidence: bool
+    requests: int
+    inflight: float | None              # requests in flight, mean over the window, whole deployment
+    ttft_p95_ms: float | None           # every request of the window, cold ones included
+    warm_ttft_p90_ms: float | None
+    tpot_p95_ms: float | None           # (last token − first) / (tokens − 1), per request
+    decode_p10_tok_s: float | None
+    hit_rate: float | None              # tokens served from the cache / prompt tokens (vLLM usage)
+    cold_fraction: float | None         # requests with nothing cached past the shared prefix
+    eviction_share: float | None
+    server_hit_rate: float | None
+    kv_max: float | None
+    preemptions: float | None
+    waiting_max: float | None
+    reasons: list[str] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class RunProfile:
+    steps: list[RunStep]
+    serves: int
+    fails_at: int | None
+    endpoints: int
+    routing: str
+    shared_prefix_tokens: int
+    kv_block_tokens: int
+    complete: bool
+    notes: list[str] = field(default_factory=list)
+
+    def default_step(self) -> int:
+        """Index of the step to recalibrate on: the largest that passed (closest to the limit), else the smallest."""
+        passed = [i for i, s in enumerate(self.steps) if s.passed]
+        if passed:
+            return max(passed, key=lambda i: self.steps[i].sessions)
+        return min(range(len(self.steps)), key=lambda i: self.steps[i].sessions)
+
+    def updates(self, index: int, instances: int) -> dict[str, dict[str, Any]]:
+        """Request fields read off one step: measured latencies and load (observed_perf), measured cache (workload).
+        `instances`: vLLM instances behind the endpoint(s), to bring the load to one instance."""
+        step = self.steps[index]
+        n = max(instances, 1)
+        perf: dict[str, Any] = {"sessions_per_instance": round(step.sessions / n, 2),
+                                "capacity_sessions_per_instance": round(self.serves / n, 2)}
+        if step.ttft_p95_ms:
+            perf["ttft_p95_ms"] = round(step.ttft_p95_ms, 1)
+        if step.tpot_p95_ms:
+            perf["tpot_p95_ms"] = round(step.tpot_p95_ms, 2)
+        if step.inflight:
+            perf["inflight_per_instance"] = round(step.inflight / n, 2)
+        workload: dict[str, Any] = {}
+        hit = step.hit_rate if step.hit_rate is not None else step.server_hit_rate
+        if hit is not None:
+            workload["prefix_cache_hit_rate"] = round(hit, 4)
+        if step.cold_fraction is not None:
+            workload["cold_request_fraction"] = round(step.cold_fraction, 4)
+        return {"observed_perf": perf, "workload": workload}
+
+
+def _rows_in_window(step: dict) -> list[dict]:
+    """Requests in flight at any time of the measured window (working-set's own rule)."""
+    w0, w1 = (step.get("window") or (0.0, 0.0))[:2]
+    end_all = w1 + (step.get("drain_s") or 0.0)
+    out = []
+    for r in step.get("rows", []):
+        if r.get("sent") is None or r["sent"] >= w1:
+            continue
+        if r.get("done"):
+            end = r.get("ended")
+            if end is None:
+                end = r["sent"] + (r.get("service") or 0.0)
+        else:
+            end = end_all
+        if end >= w0:
+            out.append(r)
+    return out
+
+
+def _ok(r: dict) -> bool:
+    return bool(r.get("done")) and not r.get("error") and r.get("ttft") is not None
+
+
+def _generated(r: dict) -> int:
+    return int(r.get("ctok") or r.get("out_tokens") or 0)
+
+
+def _run_step(step: dict, shared: int, block: int) -> RunStep:
+    rows = _rows_in_window(step)
+    ok = [r for r in rows if _ok(r)]
+    ttfts = sorted(r["ttft"] * 1e3 for r in ok)
+    warm = sorted(r["ttft"] * 1e3 for r in ok if r.get("warm"))
+    tpots = sorted(r["span"] / (_generated(r) - 1) * 1e3 for r in ok
+                   if _generated(r) >= MIN_DECODE_TOKENS and r.get("span") and r["span"] > 0)
+    reported = [r for r in ok if r.get("cached") is not None and (r.get("ptok") or r.get("prompt"))]
+    hit = cold = None
+    if reported:
+        prompt = sum(r.get("ptok") or r["prompt"] for r in reported)
+        hit = sum(min(r["cached"], r.get("ptok") or r["prompt"]) for r in reported) / prompt if prompt else None
+        cold = sum(1 for r in reported if r["cached"] < shared // block * block + block) / len(reported)
+    checks = step.get("checks") or {}
+    evictions = (checks.get("evictions") or {}).get("value")
+    server = step.get("server") or {}
+    return RunStep(
+        sessions=int(step["sessions"]), passed=bool(step.get("passed")), no_evidence=bool(step.get("no_evidence")),
+        requests=len(rows), inflight=step.get("streams_mean"),
+        ttft_p95_ms=_quantile(ttfts, 0.95) if ttfts else None,
+        warm_ttft_p90_ms=_quantile(warm, 0.90) if warm else None,
+        tpot_p95_ms=_quantile(tpots, 0.95) if tpots else None,
+        decode_p10_tok_s=1e3 / _quantile(tpots, 0.90) if tpots else None,
+        hit_rate=hit, cold_fraction=cold, eviction_share=evictions,
+        server_hit_rate=server.get("prefix_hit_rate"), kv_max=server.get("kv_max"),
+        preemptions=server.get("preemptions"), waiting_max=server.get("waiting_max"),
+        reasons=list(step.get("reasons") or []),
+    )
+
+
+def profile_run(data: str | bytes | dict) -> RunProfile:
+    """Steps of a working-set replay record (`ws replay --out run.json`)."""
+    if not isinstance(data, dict):
+        try:
+            data = json.loads(data)
+        except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+            raise TraceError(f"JSON invalide : {exc}") from exc
+    if not isinstance(data, dict) or data.get("format") != RUN_FORMAT:
+        raise TraceError(f"Pas un résultat de ws replay (format attendu {RUN_FORMAT!r}, produit par `ws replay --out`).")
+    if data.get("version") not in RUN_VERSIONS:
+        raise TraceError(f"Version de résultat {data.get('version')!r} non lue (version lue : 1).")
+    plan = data.get("plan") or {}
+    shared = int(plan.get("shared_prefix_tokens") or 0)
+    block = max(int(plan.get("kv_block_tokens") or 16), 1)
+    raw = [s for s in data.get("steps") or [] if isinstance(s, dict) and s.get("sessions")]
+    if not raw:
+        raise TraceError("Le résultat ne contient aucun palier jugé.")
+    steps = sorted((_run_step(s, shared, block) for s in raw), key=lambda s: s.sessions)
+    answer = data.get("answer") or {}
+    endpoints = len(data.get("endpoints") or []) or 1
+    notes = []
+    if not data.get("complete", True):
+        notes.append("Résultat incomplet (rejeu interrompu) : seuls les paliers déjà jugés sont lus.")
+    if all(s.hit_rate is None for s in steps):
+        notes.append("Le serveur n'a renvoyé aucun cached_tokens (vLLM sans --enable-prompt-tokens-details) : hit rate"
+                     " et requêtes froides non mesurés par requête, évictions non comptées.")
+    if all(s.server_hit_rate is None and s.kv_max is None for s in steps):
+        notes.append("Rejeu sans /metrics (--no-metrics) : ni file d'attente, ni préemptions, ni occupation du KV.")
+    notes.append(f"Préfixe commun du rejeu : {_tok(shared)} tokens (--shared-prefix-tokens). Le hit rate et la part froide"
+                 " mesurés en dépendent : il doit correspondre au préfixe réellement commun en production.")
+    if endpoints == 1:
+        notes.append("Une seule URL : si c'est une passerelle (llm-d) devant plusieurs pods, la charge est ramenée à une"
+                     " instance avec le champ « Instances », et le routage fait partie de la mesure.")
+    return RunProfile(steps=steps, serves=int(answer.get("serves") or 0), fails_at=answer.get("fails_at"),
+                      endpoints=endpoints, routing=str(plan.get("routing") or "sticky"), shared_prefix_tokens=shared,
+                      kv_block_tokens=block, complete=bool(data.get("complete", True)), notes=notes)
+
+
+def run_rows(profile: RunProfile) -> list[dict[str, Any]]:
+    """One table row per step of a replay."""
+    def ms(v: float | None) -> str:
+        return "—" if v is None else f"{_tok(v)} ms"
+
+    def pct(v: float | None) -> str:
+        return "—" if v is None else f"{v:.1%}"
+    return [{
+        "Sessions": s.sessions,
+        "Verdict": "✅" if s.passed else ("❔" if s.no_evidence else "🛑"),
+        "Requêtes en vol (moy.)": "—" if s.inflight is None else f"{s.inflight:.1f}",
+        "TTFT p95": ms(s.ttft_p95_ms), "TTFT chaud p90": ms(s.warm_ttft_p90_ms),
+        "TPOT p95": "—" if s.tpot_p95_ms is None else f"{s.tpot_p95_ms:.1f} ms",
+        "Hit rate": pct(s.hit_rate if s.hit_rate is not None else s.server_hit_rate),
+        "Froides": pct(s.cold_fraction), "Évictions": pct(s.eviction_share),
+        "KV max": pct(s.kv_max), "Pourquoi": " ; ".join(s.reasons),
+    } for s in profile.steps]

@@ -7,9 +7,9 @@ import re
 import sys
 from pathlib import Path
 
-# Toujours exécuter le package du dépôt, pas une copie installée dans le venv : un hébergeur (Streamlit Community
-# Cloud) installe le projet au premier déploiement puis met à jour le dépôt sans le réinstaller. Si le code ou le
-# catalogue a changé depuis le dernier import dans ce process, les modules sont purgés pour être relus.
+# Always run the repository's package, not a copy installed in the venv: a host (Streamlit Community Cloud) installs the
+# project on the first deployment, then updates the repository without reinstalling it. If the code or the catalog
+# changed since the last import in this process, the modules are purged to be read again.
 _SRC = Path(__file__).resolve().parents[2]
 _ROOT = _SRC.parent
 sys.path[:] = [str(_SRC)] + [entry for entry in sys.path if Path(entry or ".").resolve() != _SRC]
@@ -42,7 +42,7 @@ from vllm_configurator.domain import DeploymentRequest, GenerationError  # noqa:
 from vllm_configurator.engine import generate  # noqa: E402
 from vllm_configurator.llmd import generate_routing, render_epp_config, render_vllm_args  # noqa: E402
 from vllm_configurator.scenario import (  # noqa: E402
-    ROUTING_WEIGHT_KEYS, ScenarioError, dump_scenario, load_scenario, request_to_form, trace_to_form,
+    ROUTING_WEIGHT_KEYS, ScenarioError, dump_scenario, load_scenario, request_to_form, run_to_form, trace_to_form,
 )
 
 REFERENCE_INPUT = Path(__file__).resolve().parents[3] / "tests" / "golden" / "reference_case" / "input.yaml"
@@ -64,7 +64,8 @@ DEFAULTS = {
     "llmd_version": sorted(catalog.llmd_versions)[-1], "llmd_mode": "approximate", "llmd_kv_endpoint": "",
 }
 OPTIONAL = ["isl_p50", "isl_p95", "isl_p99", "osl_p50", "osl_p95", "osl_p99", "hit_rate", "cold_fraction", "target_concurrency",
-            "paused_sessions", "warm_p50", "warm_p95", "session_gap", "trace_sessions", "ttft", "itl", "itl_measured", "ttft_measured", "k", "acceptance_length", "kv_tokens", "kv_util", "kv_block", "gpu_util",
+            "paused_sessions", "warm_p50", "warm_p95", "session_gap", "trace_sessions", "tpot_measured",
+            "inflight_measured", "sessions_measured", "capacity_measured", "ttft", "itl", "itl_measured", "ttft_measured", "k", "acceptance_length", "kv_tokens", "kv_util", "kv_block", "gpu_util",
             "reserve", "cpu_cores", "max_model_len", "llmd_shared_prefix", "llmd_obs_block", "llmd_obs_lru", "llmd_obs_window",
             "llmd_obs_hit", *ROUTING_WEIGHT_KEYS.values()]
 for _key, _value in DEFAULTS.items():
@@ -147,6 +148,36 @@ def import_trace() -> None:
     st.session_state.update(trace_to_form(profile, st.session_state.get("trace_sessions")))
     st.session_state["trace_summary"] = (traces.summary_rows(profile), profile.notes)
     st.session_state["trace_message"] = ("success", f"Trace « {uploaded.name} » appliquée au profil de charge.")
+
+
+def run_instances(profile) -> int:
+    """vLLM instances the replay measured: one per URL, else the instances of the form (a gateway in front)."""
+    return profile.endpoints if profile.endpoints > 1 else int(st.session_state.get("num_instances") or 1)
+
+
+def apply_run() -> None:
+    """Fill the measurements from the selected step of the imported replay."""
+    profile = st.session_state.get("run_profile")
+    if profile is None:
+        return
+    index = st.session_state.get("run_step", profile.default_step())
+    st.session_state.update(run_to_form(profile, index, run_instances(profile), st.session_state.get("itl_metric", "itl")))
+    step = profile.steps[index]
+    st.session_state["run_message"] = ("success", f"Palier de {step.sessions} sessions appliqué aux mesures (recalage).")
+
+
+def import_run() -> None:
+    uploaded = st.session_state.get("run_file")
+    if uploaded is None:
+        return
+    try:
+        profile = traces.profile_run(uploaded.getvalue())
+    except traces.TraceError as exc:
+        st.session_state["run_message"] = ("error", f"{uploaded.name} : {exc}")
+        return
+    st.session_state["run_profile"] = profile
+    st.session_state["run_step"] = profile.default_step()
+    apply_run()
 
 
 def slug(name: str) -> str:
@@ -315,12 +346,41 @@ with st.sidebar:
 
     st.header("Mesures en production (optionnel)")
     st.caption("Mesurées avec la config générée : elles priment sur l'estimation, et l'ITL recalibre le modèle de latence.")
+    with st.expander("📈 Importer un résultat working-set (ws replay --out)", expanded=False):
+        st.caption("Un palier du rejeu recale le modèle (TTFT et TPOT p95 aux requêtes en vol mesurées) et remplace hit"
+                   " rate et requêtes froides par leur mesure. Charge ramenée à une instance : une par URL du rejeu,"
+                   " sinon le nombre d'« Instances » ci-dessus.")
+        st.file_uploader("Résultat (.json)", type=["json"], key="run_file", on_change=import_run)
+        profile = st.session_state.get("run_profile")
+        if profile is not None:
+            st.selectbox("Palier de recalage", list(range(len(profile.steps))), key="run_step", on_change=apply_run,
+                         format_func=lambda i: (f"{profile.steps[i].sessions} sessions "
+                                                f"{'✅' if profile.steps[i].passed else '🛑'}"),
+                         help="Par défaut le plus grand palier validé : le plus proche de la limite.")
+            st.dataframe(traces.run_rows(profile), hide_index=True, width="stretch")
+            st.caption(f"working-set valide {profile.serves} sessions"
+                       + (f", échoue à {profile.fails_at}" if profile.fails_at else "") + ".")
+            for note in profile.notes:
+                st.caption(note)
+        message = st.session_state.pop("run_message", None)
+        if message:
+            (st.success if message[0] == "success" else st.error)(message[1])
     c1, c2 = st.columns(2)
     with c1:
         itl_measured = opt_float("ITL / TPOT p95 mesuré (ms)", "itl_measured", 0.1, step=1.0,
                                  help="Même métrique que la cible (ITL ou TPOT), mesurée avec la config générée.")
     with c2:
         ttft_measured = opt_float("TTFT p95 mesuré (ms)", "ttft_measured", 1.0, step=10.0)
+    c1, c2 = st.columns(2)
+    with c1:
+        tpot_measured = opt_float("TPOT p95 mesuré (ms)", "tpot_measured", 0.1, step=1.0,
+                                  help="Quand la cible est l'ITL mais que seul le TPOT est mesuré (working-set).")
+        sessions_measured = opt_float("Sessions par instance (palier mesuré)", "sessions_measured", 0.01, step=1.0)
+    with c2:
+        inflight_measured = opt_float(
+            "Requêtes en vol par instance pendant la mesure", "inflight_measured", 0.01, step=1.0,
+            help="Vide : la mesure est faite à la concurrence cible. Sinon le modèle est recalé à cette charge.")
+        capacity_measured = opt_float("Sessions par instance validées (capacité)", "capacity_measured", 0.0, step=1.0)
 
     st.header("Routage llm-d (EPP)")
     st.caption("Configuration de l'EndpointPickerConfig qui répartit les requêtes entre les instances vLLM ci-dessus.")
@@ -408,8 +468,11 @@ try:
               "draft_sample_method": None if draft_choice == "défaut vLLM" else draft_choice},
         observed_kv=({"kv_cache_tokens": kv_tokens, "gpu_memory_utilization": kv_util, "block_size": kv_block}
                      if kv_tokens else None),
-        observed_perf=({"itl_p95_ms": itl_measured, "ttft_p95_ms": ttft_measured}
-                       if itl_measured or ttft_measured else None),
+        observed_perf=({"itl_p95_ms": itl_measured, "ttft_p95_ms": ttft_measured, "tpot_p95_ms": tpot_measured,
+                        "inflight_per_instance": inflight_measured, "sessions_per_instance": sessions_measured,
+                        "capacity_sessions_per_instance": capacity_measured}
+                       if any(v is not None for v in (itl_measured, ttft_measured, tpot_measured, capacity_measured))
+                       else None),
         gpu_memory_utilization=gpu_util, kv_estimate_reserve_gib_per_gpu=reserve, cpu_cores_per_instance=cpu_cores,
         max_model_len=max_model_len, extra_args=extra_args, extra_env=extra_env,
         routing={
@@ -557,7 +620,7 @@ with tabs[1]:
                 "Le scorer de préfixe s'appuie sur un **index** : pour chaque pod, l'EPP retient les hashes des débuts de"
                 " prompts qu'il lui a envoyés, ce qui lui permet de renvoyer une session vers le pod qui a déjà son"
                 " préfixe en cache (affinité). Les paramètres ci-dessous règlent cet index.")
-            prefix_plugin = routing.plugins[0]["type"]  # le plugin de préfixe est toujours posé en premier
+            prefix_plugin = routing.plugins[0]["type"]  # the prefix plugin always comes first
             decided = {d.key: d.value for d in routing.decisions}
             st.markdown(f"**Paramètres de l'index** (`{prefix_plugin}`) — modifiables dans « Paramètres llm-d forcés »")
             st.dataframe([{
@@ -639,6 +702,22 @@ with tabs[2]:
                    f" ({'recalé sur la mesure' if analysis.calibration_prefill else 'non calibré'})."
                    f" Le verdict de chaque palier porte sur la cible {gen_label}."
                    if analysis.uncertainty else "★ : palier de la config générée. Pas de modèle de latence : la mesure tranche.")
+        capacity = analysis.session_capacity
+        if capacity is not None:
+            st.subheader("Capacité en sessions par instance")
+            c1, c2, c3 = st.columns(3)
+            c1.metric("Config générée (estimée)", capacity.current_sessions,
+                      help=f"{capacity.current_inflight} requêtes en vol ; limite : {capacity.current_binding}.")
+            c2.metric("Meilleur réglage vLLM (estimé)", capacity.best_sessions,
+                      delta=capacity.best_sessions - capacity.current_sessions or None,
+                      help=f"{capacity.best_inflight} requêtes en vol ; limite : {capacity.best_binding}.")
+            c3.metric("Validé par working-set", "—" if capacity.measured_sessions is None else f"{capacity.measured_sessions:g}")
+            st.write(capacity.summary)
+            if capacity.changes:
+                st.code(yaml.safe_dump(capacity.changes, allow_unicode=True, sort_keys=False, default_flow_style=None),
+                        language="yaml")
+            for note in capacity.notes:
+                st.caption(note)
         c1, c2 = st.columns(2)
         with c1:
             st.markdown("**Protocole**")

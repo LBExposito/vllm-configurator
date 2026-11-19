@@ -55,12 +55,12 @@ class Gpu(_Strict):
     display_name: str
     vendor: Literal["nvidia", "amd", "other"]
     generation: str
-    # Clé de cudagraph.default_max_capture_size dans le catalogue vLLM.
+    # Key of cudagraph.default_max_capture_size in the vLLM catalog.
     cudagraph_family: Literal["blackwell_dc", "other"]
     compute_capability: GpuComputeCapability
     memory: GpuMemory
     bandwidth: GpuBandwidth | None = None
-    # Utilisé seulement par le modèle de latence de l'analyse SLO (roofline).
+    # Only used by the latency model of the SLO analysis (roofline).
     compute: GpuCompute | None = None
     verified_on: str
     notes: list[str] = []
@@ -86,7 +86,7 @@ class Architecture(Provenance):
     head_dim: int | None = Field(default=None, ge=0)
     max_position_embeddings: int = Field(gt=0)
     moe: MoeSpec | None = None
-    # Champs bruts de config.json utiles mais non interprétés par le moteur.
+    # Raw config.json fields, useful but not interpreted by the engine.
     raw: dict[str, Any] = {}
 
     @model_validator(mode="after")
@@ -102,22 +102,22 @@ class Weights(Provenance):
 
 
 class KvCache(Provenance):
-    # null = non dérivable de façon fiable : l'app exige alors la taille lue dans les logs.
+    # null = not reliably derivable: the app then requires the size read in the logs.
     bytes_per_token: float | None = Field(default=None, gt=0)
     bytes_per_token_dtype: str | None = None
-    # Sommes « par token » répliquées sur chaque rang TP (MLA, MQA) ou partagées.
+    # « Per token » sums replicated on each TP rank (MLA, MQA) or sharded.
     replicated_across_tp: bool | None = None
-    # État fixe par séquence (attention linéaire, fenêtre glissante), si connu.
+    # Fixed state per sequence (linear attention, sliding window), if known.
     per_sequence_state_bytes: float | None = Field(default=None, ge=0)
     method: str = Field(description="Formule ou raison de l'absence de valeur")
     recommended_dtype: str | None = None
-    # Provenance propre au dtype recommandé (souvent une recette vLLM), distincte de celle de bytes_per_token.
+    # Provenance of the recommended dtype (often a vLLM recipe), separate from that of bytes_per_token.
     recommended_dtype_status: Status = "unverified"
     recommended_dtype_source: str | None = None
 
 
 class BlockSize(Provenance):
-    # null = laissé au backend ; ne jamais forcer sans raison.
+    # null = left to the backend; never force it without a reason.
     forced_by_backend: int | None = Field(default=None, gt=0)
 
 
@@ -132,20 +132,20 @@ class ModelPerformance(Provenance):
 
     method: str = Field(description="Comment les valeurs ont été obtenues")
 
-    # Paramètres activés par token (FLOPs ≈ 2 × paramètres activés), hors tables de lookup (engram, n-gram).
+    # Parameters activated per token (FLOPs ≈ 2 × activated parameters), lookup tables excluded (engram, n-gram).
     active_params_per_output_token: float = Field(gt=0)
     active_params_per_prompt_token: float | None = Field(default=None, gt=0)
-    # MoE : taille des experts routés, pour estimer les octets de poids lus par step selon le nombre de tokens.
+    # MoE: size of the routed experts, to estimate the weight bytes read per step from the number of tokens.
     moe_layers: int | None = Field(default=None, gt=0)
     moe_intermediate_size: int | None = Field(default=None, gt=0)
     routed_expert_bytes_per_param: float | None = Field(default=None, gt=0)
-    # Octets par paramètre des poids non routés (attention, expert partagé, couches denses, lm_head).
+    # Bytes per parameter of the non-routed weights (attention, shared expert, dense layers, lm_head).
     dense_bytes_per_param: float = Field(gt=0)
-    # Type des tensor cores utilisés par les GEMM (débit crête du GPU pris pour ce type).
+    # Type of the tensor cores used by the GEMMs (peak GPU throughput taken for that type).
     compute_dtype: ComputeDtype
-    # Coût de l'attention par token requête (facultatif ; sinon dérivé de l'architecture, voir analysis.attention_cost) :
-    # FLOPs par token de contexte (attention dense, ou indexeur d'une attention sparse), FLOPs par token sélectionné
-    # et nombre de tokens sélectionnés (attention sparse : top-k + fenêtre glissante).
+    # Attention cost per query token (optional; otherwise derived from the architecture, see analysis.attention_cost):
+    # FLOPs per context token (dense attention, or the indexer of a sparse attention), FLOPs per selected token and
+    # number of selected tokens (sparse attention: top-k + sliding window).
     attention_flops_per_context_token: float | None = Field(default=None, ge=0)
     attention_sparse_flops_per_token: float | None = Field(default=None, ge=0)
     attention_sparse_tokens: int | None = Field(default=None, ge=0)
@@ -158,7 +158,7 @@ class ContextExtension(Provenance):
     native_max_model_len: int = Field(gt=0)
     max_model_len: int = Field(gt=0)
     override_path: list[str] = Field(min_length=1)
-    # Bloc complet, sans `factor` : le moteur calcule le facteur d'après la longueur visée.
+    # Complete block, without `factor`: the engine computes the factor from the target length.
     rope_parameters: dict[str, Any]
 
 

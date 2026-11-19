@@ -27,14 +27,14 @@ from . import perf as p
 
 @dataclass(frozen=True)
 class FrontendCosts:
-    network_s: float                # hors CPU du pod : réseau, passage par l'EPP (TTFT seulement)
-    request_loop_s: float           # boucle : HTTP, validation, routage, métriques, par requête
-    parse_s_per_token: float        # boucle : JSON de l'historique de messages, par token de prompt
-    template_s_per_token: float     # pool, tient le GIL : chat template
-    tokenize_s_per_token: float     # pool : tokenisation (cœur Rust hors GIL)
-    chunk_s: float                  # boucle : une sortie d'une séquence pour un step
+    network_s: float                # outside the pod CPU: network, going through the EPP (TTFT only)
+    request_loop_s: float           # loop: HTTP, validation, routing, metrics, per request
+    parse_s_per_token: float        # loop: JSON of the message history, per prompt token
+    template_s_per_token: float     # pool, holds the GIL: chat template
+    tokenize_s_per_token: float     # pool: tokenization (Rust core outside the GIL)
+    chunk_s: float                  # loop: one output of one sequence for one step
     utilization_max: float
-    tokenize_gil_share: float = 0.0  # part de la tokenisation qui garde le GIL (conversion du résultat en Python)
+    tokenize_gil_share: float = 0.0  # share of the tokenization that keeps the GIL (conversion of the result to Python)
 
     @classmethod
     def from_heuristic(cls, value: dict) -> "FrontendCosts":
@@ -59,17 +59,17 @@ class FrontendCosts:
 
 @dataclass(frozen=True)
 class FrontendLoad:
-    requests_per_s: float           # par instance
-    chunks_per_s: float             # sorties streamées par seconde, par instance
+    requests_per_s: float           # per instance
+    chunks_per_s: float             # streamed outputs per second, per instance
     api_servers: int
     workers: int
-    gil_utilization: float          # par processus API
-    pool_utilization: float         # par processus API, sur ses threads
-    loop_wait_s: float              # attente moyenne d'une tâche sur le GIL
+    gil_utilization: float          # per API process
+    pool_utilization: float         # per API process, on its threads
+    loop_wait_s: float              # mean wait of a task on the GIL
     loop_wait_p95_s: float
-    pool_wait_s: float              # attente moyenne d'un rendu de prompt dans le pool
-    cores: float                    # cœurs CPU consommés par le frontal de l'instance
-    gil_share: dict[str, float]     # part de la charge du GIL : requêtes, chat template, sorties
+    pool_wait_s: float              # mean wait of a prompt rendering in the pool
+    cores: float                    # CPU cores used by the instance's frontend
+    gil_share: dict[str, float]     # share of the GIL load: requests, chat template, outputs
 
     @property
     def utilization(self) -> float:
@@ -97,7 +97,7 @@ def frontend_load(costs: FrontendCosts, requests_per_s: float, chunks_per_s: flo
     if gil >= 1:
         loop_wait = loop_p95 = math.inf
     else:
-        # M/G/1 sur le GIL (Pollaczek–Khinchine) : toutes les tâches, courtes (sorties) et longues (requêtes).
+        # M/G/1 on the GIL (Pollaczek–Khinchine): every task, short (outputs) and long (requests).
         second = lam * req_m2 + lam * tpl_m2 + chunks * costs.chunk_s ** 2
         loop_wait = second / (2 * (1 - gil))
         loop_p95 = loop_wait / gil * math.log(gil / 0.05) if gil > 0.05 else 0.0

@@ -64,8 +64,8 @@ def test_invalid_extra_args_yaml_is_reported():
 
 
 def test_app_uses_the_repository_package_even_if_a_stale_copy_is_loaded(tmp_path, monkeypatch):
-    # Streamlit Community Cloud installe le projet au premier déploiement, puis met à jour le dépôt sans réinstaller :
-    # une vieille copie de vllm_configurator peut être importée avant app.py.
+    # Streamlit Community Cloud installs the project on the first deployment, then updates the repository without
+    # reinstalling: an old copy of vllm_configurator can be imported before app.py.
     import sys
 
     stale = tmp_path / "vllm_configurator"
@@ -117,4 +117,6 @@ def test_session_gap_adds_the_working_set_columns():
     assert not at.exception
     columns = [c for df in at.dataframe for c in df.value.columns]
     assert "Sessions working-set / instance" in columns
+    assert any("Capacité en sessions" in h.value for h in at.subheader)
+    assert any(e.label.startswith("📈 Importer un résultat") for e in at.sidebar.expander)
     assert any(e.label.startswith("📼 Importer une trace") for e in at.sidebar.expander)

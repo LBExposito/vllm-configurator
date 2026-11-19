@@ -21,7 +21,7 @@ import yaml
 from pydantic import ValidationError
 
 from .domain import DeploymentRequest, GenerationResult, RoutingRequest
-from .traces import TraceProfile
+from .traces import RunProfile, TraceProfile
 
 KIND = "vllm-configurator/scenario"
 VERSION = 1
@@ -98,6 +98,10 @@ def request_to_form(request: DeploymentRequest) -> dict[str, Any]:
         "session_gap": wl.session_gap_s,
         "ttft": request.slo.ttft_p95_ms, "itl": request.slo.itl_p95_ms, "itl_metric": request.slo.itl_metric,
         "itl_measured": perf.itl_p95_ms if perf else None, "ttft_measured": perf.ttft_p95_ms if perf else None,
+        "tpot_measured": perf.tpot_p95_ms if perf else None,
+        "inflight_measured": perf.inflight_per_instance if perf else None,
+        "sessions_measured": perf.sessions_per_instance if perf else None,
+        "capacity_measured": perf.capacity_sessions_per_instance if perf else None,
         "allow_lossy": request.allow_lossy, "spec_enabled": spec.enabled, "k": spec.num_speculative_tokens,
         "draft_sample_method": spec.draft_sample_method or "défaut vLLM", "acceptance_length": spec.acceptance_length,
         "kv_tokens": kv.kv_cache_tokens if kv else None, "kv_util": kv.gpu_memory_utilization if kv else None,
@@ -124,6 +128,26 @@ def trace_to_form(profile: TraceProfile, sessions: int | None = None) -> dict[st
         form |= {"warm_p50": updates["warm_uncached_tokens"]["p50"], "warm_p95": updates["warm_uncached_tokens"]["p95"]}
     form |= {TRACE_FORM_KEYS[k]: v for k, v in updates.items() if k in TRACE_FORM_KEYS}
     form["usage_type"] = "agentic"
+    return form
+
+
+RUN_FORM_KEYS = {"ttft_p95_ms": "ttft_measured", "tpot_p95_ms": "tpot_measured",
+                 "inflight_per_instance": "inflight_measured", "sessions_per_instance": "sessions_measured",
+                 "capacity_sessions_per_instance": "capacity_measured",
+                 "prefix_cache_hit_rate": "hit_rate", "cold_request_fraction": "cold_fraction"}
+
+
+def run_to_form(profile: RunProfile, index: int, instances: int, itl_metric: str = "itl") -> dict[str, Any]:
+    """Session-state values of the « Mesures en production » section read off one step of a working-set replay.
+
+    The replay measures the TPOT, not the ITL: with a TPOT target it fills the measured target latency, with an ITL
+    target the separate TPOT field (and clears a measured ITL, which belonged to another measurement)."""
+    updates = profile.updates(index, instances)
+    values = updates["observed_perf"] | updates["workload"]
+    form: dict[str, Any] = {key: None for key in ("ttft_measured", "tpot_measured", "itl_measured")}
+    form |= {RUN_FORM_KEYS[k]: v for k, v in values.items()}
+    if itl_metric == "tpot":
+        form["itl_measured"], form["tpot_measured"] = form["tpot_measured"], None
     return form
 
 

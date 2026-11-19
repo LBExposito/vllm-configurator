@@ -98,7 +98,7 @@ context_extension:
   method: yarn
   native_max_model_len: 262144
   max_model_len: 1000000
-  # Chemin de l'override dans config.json, et bloc complet à passer : vLLM remplace rope_parameters en bloc.
+  # Path of the override in config.json, and the complete block to pass: vLLM replaces rope_parameters as a whole.
   override_path: [text_config, rope_parameters]
   rope_parameters:
     mrope_interleaved: true
