@@ -124,6 +124,11 @@ behaviors:
     status: verified
     source: "vllm/config/compilation.py (adjust_cudagraph_sizes_for_spec_decode)"
     note: "Avec spec decoding, les tailles de capture sont arrondies à un multiple de k + 1."
+  cudagraph.memory_profiling:
+    value: {enabled_by_default: true, disable_env: VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS}
+    status: verified
+    source: "Log de démarrage réel (vllm.v1.worker.gpu_worker) : « CUDA graph memory profiling is enabled (default since v0.21.0). The current --gpu-memory-utilization=0.8000 is equivalent to --gpu-memory-utilization=0.6708 without CUDA graph memory profiling »"
+    note: "La mémoire des CUDA graphs est mesurée au profilage et retirée du budget de gpu-memory-utilization : baisser cette fraction pour protéger la capture compte la réserve deux fois."
   frontend.rejects_unknown_flags:
     value: true
     status: verified

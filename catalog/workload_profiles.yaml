@@ -98,7 +98,10 @@ heuristics:
     value: 0.8
     status: verified
     source: "Blog vLLM sur DSpark (base de connaissances §2.4) : 0,8 si la capture des CUDA graphs fait déborder la mémoire"
-    note: "« Grosse capture » = au-delà du plafond par défaut de vLLM pour la famille de GPU (1024 sur Blackwell datacenter, 512 sinon)."
+    note: >-
+      « Grosse capture » = au-delà du plafond par défaut de vLLM pour la famille de GPU (1024 sur Blackwell datacenter,
+      512 sinon). Ne s'applique que si vLLM ne profile pas la mémoire des CUDA graphs (comportement
+      cudagraph.memory_profiling du catalogue de la version) : sinon la réserve serait comptée deux fois.
   assumed_acceptance_length:
     value: 3.0
     status: unverified

@@ -168,13 +168,31 @@ def decide_gpu_memory_utilization(ctx: RuleContext, state: dict[str, Any]) -> Ru
     size = state["max_cudagraph_capture_size"]
     ceiling = default_capture_ceiling(ctx)
     h = ctx.heuristic("gpu_memory_utilization_large_capture")
+    profiling = ctx.behavior("cudagraph.memory_profiling")
+    disable_env = profiling.value["disable_env"]
+    profiled = profiling.value["enabled_by_default"] and str(req.extra_env.get(disable_env, "1")).strip() != "0"
+    large_capture = k > 0 and size > ceiling
+    sources = [f"{KB} §2.4, §5", h.source]
+    formula = "0,8 avec de grosses captures de CUDA graphs et spec decoding, si vLLM ne profile pas leur mémoire (§5)"
     if req.gpu_memory_utilization is not None:
         value, reason, confidence = req.gpu_memory_utilization, "Valeur fournie en entrée.", "verified"
-    elif k > 0 and size > ceiling:
+    elif large_capture and profiled:
+        value = default
+        reason = (
+            f"Capture de {fmt_int(size)} tokens avec speculative decoding, au-delà du plafond par défaut de vLLM"
+            f" ({fmt_int(ceiling)}). vLLM profile la mémoire des CUDA graphs et la retire lui-même du budget : la"
+            f" recommandation du blog ({h.value}), faite pour l'ancien comportement, compterait la réserve deux fois et"
+            f" amputerait le KV (avec le profilage, 0,8 ≈ 0,67 sans). Défaut de vLLM. Désactiver le profilage"
+            f" ({disable_env}=0) ramène la règle du blog."
+        )
+        confidence = profiling.status
+        sources = [profiling.source, *sources]
+    elif large_capture:
         value = h.value
         reason = (
             f"Capture de {fmt_int(size)} tokens avec speculative decoding, au-delà du plafond par défaut de vLLM"
-            f" ({fmt_int(ceiling)}) : risque d'OOM pendant la capture. Recommandation du blog vLLM : {h.value}."
+            f" ({fmt_int(ceiling)}) et profilage mémoire des CUDA graphs désactivé ({disable_env}=0) : vLLM ne réserve"
+            f" pas leur mémoire, risque d'OOM pendant la capture. Recommandation du blog vLLM : {h.value}."
             " À relever si aucun OOM n'apparaît et si le KV devient limitant."
         )
         confidence = h.status
@@ -183,8 +201,7 @@ def decide_gpu_memory_utilization(ctx: RuleContext, state: dict[str, Any]) -> Ru
     out.state["gpu_memory_utilization"] = value
     out.decisions.append(Decision(
         key="gpu_memory_utilization", value=value, rule_id="R-KV-04", title="Fraction de mémoire GPU",
-        justification=reason, formula="0,8 avec de grosses captures de CUDA graphs et spec decoding (§5)",
-        confidence=confidence, sources=[f"{KB} §2.4, §5", h.source], default=default,
+        justification=reason, formula=formula, confidence=confidence, sources=sources, default=default,
     ))
     observed = req.observed_kv
     if observed is not None and observed.gpu_memory_utilization != value:

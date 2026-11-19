@@ -191,8 +191,8 @@ class TestRangesAndMetric:
         assert any("ISL 35" in n for n in a.notes)  # moyenne ≈ 35 452, bien au-delà du P50
 
     def test_kv_is_rescaled_to_the_generated_memory_fraction(self):
-        # KV lu à 0,92, config à 0,8 (grosse capture avec spec decoding) : moins de mémoire libre, moins de KV.
-        a = analysis(observed_kv={"kv_cache_tokens": 86_225_864, "gpu_memory_utilization": 0.92})
+        # KV lu à 0,8, config au défaut 0,92 (vLLM profile la mémoire des CUDA graphs) : plus de mémoire libre.
+        a = analysis(observed_kv={"kv_cache_tokens": 86_225_864, "gpu_memory_utilization": 0.8})
         assert any(n.startswith("KV ramené") for n in a.notes)
 
 

@@ -25,6 +25,13 @@ flags:
     justification: >-
       Politique « toujours émettre » : c'est le défaut, mais le remplissage du budget et le seuil de long prefill en
       dépendent.
+  - flag: --gpu-memory-utilization
+    kind: changed
+    value: "0.92"
+    justification: >-
+      La §7 retient 0,8 d'après le blog vLLM (grosse capture de CUDA graphs avec spec decoding). Le log de démarrage
+      réel indique que vLLM profile la mémoire des CUDA graphs et la retire du budget (défaut depuis 0.21.0) : avec
+      ce profilage, 0,8 équivaut à 0,67 sans, la réserve est comptée deux fois. Retour au défaut de vLLM (0,92).
 
 json_keys:
   - flag: --speculative-config

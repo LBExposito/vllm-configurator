@@ -183,3 +183,16 @@ class TestRender:
     def test_json_values_are_compact(self):
         args = render.argv(generate(req()))
         assert '{"max_cudagraph_capture_size":2048}' in args
+
+
+class TestGpuMemoryUtilization:
+    def test_profiled_cudagraph_memory_keeps_the_vllm_default(self):
+        # Capture de 2048 avec DSpark : vLLM profile la mémoire des graphs, 0,8 la compterait deux fois.
+        result = generate(req())
+        decision = values(result)["gpu_memory_utilization"]
+        assert decision == 0.92
+        assert "deux fois" in result.decision("gpu_memory_utilization").justification
+
+    def test_blog_rule_applies_when_profiling_is_disabled(self):
+        result = generate(req(extra_env={"VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS": "0"}))
+        assert values(result)["gpu_memory_utilization"] == 0.8
