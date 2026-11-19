@@ -135,7 +135,7 @@ def itl_watch(ctx: RuleContext, state: dict[str, Any]) -> RuleOutput:
             severity="info", category="itl", rule_id="R-DIAG-04",
             message=(
                 f"TTFT p95 cible {ctx.request.slo.ttft_p95_ms:g} ms : aucun modèle de latence n'est calibré dans l'app."
-                " Valider avec le test du seuil de long prefill (onglet Vérification)."
+                " Valider avec le test du seuil de long prefill (étape ③)."
             ),
         ))
     return out

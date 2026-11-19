@@ -58,12 +58,16 @@ for it explicitly when it cannot do without it.
   (bottleneck, fixes) remains available. See [Test steps and SLOs](#test-steps-and-slos).
 - **The capacity in agentic sessions** per instance, for the generated config and for the best vLLM setting found.
   See [Capacity in sessions](#capacity-in-sessions).
-- **The assumptions** made when an input is missing.
+- **The assumptions**: every value the config rests on, with its origin (entered, trace, replay, logs, or assumed by
+  the app), shown first at step ② so that you can correct them.
 - **Verification**: a command to check that every flag exists on the deployed image, and the list of Prometheus
   metrics to watch.
 - **The llm-d configuration**: the `EndpointPickerConfig` (prefix index and scorer weights) derived from the vLLM
   config, with its justifications and the EPP log lines to check after deployment. See
   [llm-d routing](#llm-d-routing).
+- **A review report** (Markdown and JSON) to send to a reviewer, a person or an agent: the questions to answer, every
+  assumption with its origin, the config and its justifications, what the app expects, the measurements and the
+  known limits of the tool. See [Review report](#review-report).
 - **A YAML scenario file**, exportable from and re-importable into the interface: inputs, SLOs and measurements, plus
   a snapshot of the generated config. See [Save and reload a scenario](#save-and-reload-a-scenario).
 
@@ -176,30 +180,35 @@ pytest).
 uv run streamlit run src/vllm_configurator/web/app.py
 ```
 
-The app opens on <http://localhost:8501>. The form is in the sidebar and the results in the main area.
+The app opens on <http://localhost:8501>. It is a five-step workflow; the step bar at the top lets you go back and
+forth, and every value you entered is kept from one step to the next.
+
+| Step | What you do | What the app does |
+|---|---|---|
+| **① Votre besoin** | Hardware, model, vLLM version, workload (or a working-set trace), SLOs. « Affiner » holds the optional inputs. | Nothing yet: only ISL P50 and OSL P50 are required to move on. |
+| **② Hypothèses et config** | Read what the app assumed and correct it in ① if it does not match your case. | Lists every assumption with its origin (entered, trace, replay, logs, or assumed), then the proposed config, why each value, what it expects (checks, capacity in sessions) and the llm-d config. |
+| **③ Tester** | Deploy the config and run the step plan. | Gives the steps, the load to inject (requests in flight, or sessions and the `ws replay` command), the protocol, the pass criteria and the flag check command. |
+| **④ Mesurer et ajuster** | Import the `ws replay --out` result, or type the measurements (startup logs, Prometheus latencies, acceptance length). | Recalibrates the model at the measured load, compares the estimated and measured capacity, and proposes the setting that holds more sessions. |
+| **⑤ Exporter** | Download the review report and the scenario. | Writes the report for a reviewer, a person or an agent (see [Review report](#review-report)). |
 
 ### 4. First try: the reference case
 
-Click **« Charger le cas de référence (§1) »** (load the reference case) at the top of the sidebar. The form fills
-with the real deployment described in `docs/vllm-config-knowledge-base.md`, and the configuration shows up right
-away. Go through the tabs to see how each value is justified.
+Click **« Charger le cas de référence (§1) »** (load the reference case) at step ①. The form fills with the real
+deployment described in `docs/vllm-config-knowledge-base.md`, and the app jumps to step ② with the assumptions and the
+configuration.
 
-### 5. Describe your own deployment
+### 5. Describe your own deployment (step ①)
 
-Fill the sidebar from top to bottom. The results are recomputed on every change.
+The results are recomputed on every change.
 
 | Section | Advice |
 |---|---|
-| **Matériel** (hardware) | « GPU par instance » is the tensor parallel of one pod; « Instances » is the number of independent pods. |
-| **Modèle et version** | Pick the vLLM version actually deployed: several rules depend on it. |
-| **Profil de charge** (workload) | Measure ISL and OSL **per model call**, not per conversation turn or per session. Leave the hit rate empty if you have not measured it: the app takes the value published for your usage type and shows it under « Hypothèses ». Target requests in flight are a total over all instances: running + queued requests, **not users** (an agentic user only has a request running part of the time). Measurement: `vllm:num_requests_running` + `vllm:num_requests_waiting` summed over the pods. The share of cold requests (prefix missing from the cache: first call of a session past the shared prefix, eviction, misrouting) makes the TTFT p95: left empty, the app assumes 5 %, capped to stay consistent with the hit rate. For agentic sessions, import a working-set trace instead (see [Agentic sessions](#agentic-sessions-working-set-replay)). |
-| **SLO** | Optional. They do not change the generated config; they set the pass criteria of the steps. Choose what the generation target is about: **ITL** (`vllm:inter_token_latency_seconds`, interval between two outputs, i.e. one step) or **TPOT** (`vllm:request_time_per_output_token_seconds`, time per token). With speculative decoding the ITL rises a little but the TPOT is divided by ~a (less for poorly accepted requests, which make the TPOT p95): for the user experience, the TPOT is what counts. |
-| **Mesures en production** | Generation latency (same metric as the target) and TTFT p95 read at the generated config's step, or a `ws replay` result. The measurement decides; the generation latency recalibrates the decode part of the estimated durations, the TTFT their prefill part. If the two cannot be reconciled, the app says so: the gap then comes from the shape of the load, not from the GPU. |
-| **Speculative decoding** | Leave `k` empty to use the value recommended for the model. Only tick « Tolérer une vérification lossy » for an A/B test: FLy can change the outputs, which is risky for tool calls. |
-| **Logs de démarrage** (startup logs) | If an instance is already running, copy `GPU KV cache size: N tokens`, the block size (`Setting kv cache block size to N`) and the `gpu-memory-utilization` used. This is the input that makes the configuration most reliable. |
-| **Contexte et arguments supplémentaires** | See below. |
-| **Routage llm-d (EPP)** | See [llm-d routing](#llm-d-routing). |
-| **Avancé** (advanced) | Force `gpu-memory-utilization`, or give a memory reserve per GPU to refine the KV estimate without logs. |
+| **Matériel et modèle** | « GPU par instance » is the tensor parallel of one pod; « Instances » is the number of independent pods. Pick the vLLM version actually deployed: several rules depend on it. |
+| **Charge** | Measure ISL and OSL **per model call**, not per conversation turn or per session. Target requests in flight are a total over all instances: running + queued requests, **not users** (an agentic user only has a request running part of the time). Measurement: `vllm:num_requests_running` + `vllm:num_requests_waiting` summed over the pods. For agentic sessions, import a working-set trace instead (see [Agentic sessions](#agentic-sessions-working-set-replay)): it fills the lengths, the cache, the cold requests and the waits. |
+| **Objectifs (SLO)** | Optional. They do not change the generated config; they set the pass criteria of the steps. Choose what the generation target is about: **ITL** (`vllm:inter_token_latency_seconds`, interval between two outputs, i.e. one step) or **TPOT** (`vllm:request_time_per_output_token_seconds`, time per token). With speculative decoding the ITL rises a little but the TPOT is divided by ~a: for the user experience, the TPOT is what counts. |
+| **Affiner** | Hit rate (empty: the value published for your usage type), share of cold requests (empty: 5 %, capped to stay consistent with the hit rate; they make the TTFT p95), warm-request tokens, wait between requests, speculative decoding (leave `k` empty for the model's recommended value; only allow a lossy verification for an A/B test: FLy can change the outputs, which is risky for tool calls), context and extra arguments (below), CPU limit, llm-d routing (see [llm-d routing](#llm-d-routing)). |
+
+Measurements (startup logs, latencies, acceptance length, llm-d logs) are entered at step ④.
 
 #### Extend the context and add vLLM arguments
 
@@ -217,7 +226,7 @@ VLLM_ALLOW_LONG_MAX_MODEL_LEN=1 vllm serve Qwen/Qwen3.8-Flash-Next \
   1,000,000, as in the model card.
 - The `rope_parameters` block is passed whole: vLLM replaces it as a block, whereas it merges `text_config`.
 - `VLLM_ALLOW_LONG_MAX_MODEL_LEN=1` is required from 0.31 to 0.33: for YaRN, vLLM does not apply the factor to the
-  maximum derived from `config.json` and otherwise refuses to start. The Configuration tab then shows an `env:` block
+  maximum derived from `config.json` and otherwise refuses to start. Step ② then shows an `env:` block
   to set on the container, and the `vllm serve` command is prefixed with it.
 - YaRN is static: it applies to every request and can degrade short texts. Only extend the context if the traffic
   needs it.
@@ -245,9 +254,9 @@ The context, the arguments and the variables are saved in the scenario files.
 
 #### Save and reload a scenario
 
-The **« 💾 Scénarios »** panel at the top of the sidebar exports the whole form (hardware, model, workload profile,
-SLOs, measurements, startup logs) to a YAML file, and re-imports such a file to fill the form. Name the scenario
-before exporting: the name is used for the file name.
+Step ⑤ exports the whole form (hardware, model, workload profile, SLOs, measurements, startup logs) to a YAML file;
+« 💾 Reprendre un scénario enregistré » at step ① re-imports it to fill the form. Name the scenario before exporting:
+the name is used for the file name.
 
 ```yaml
 kind: vllm-configurator/scenario
@@ -270,44 +279,47 @@ The files can be versioned next to the manifests. The import also accepts a bare
 `tests/golden/reference_case/input.yaml`. It rejects a file whose GPU, model or vLLM version is missing from the
 catalog, and says why.
 
-### 6. Read the results
+### 6. Deploy and test (step ③)
 
-The top banner sums up `max-num-seqs`, the token budget, the KV size and the number of warnings. Critical warnings
-show right below it.
-
-| Tab | Content |
-|---|---|
-| **Configuration** | `args:` block (downloadable as `vllm-args.yaml`) and `vllm serve` command. |
-| **Routage llm-d** | `EndpointPickerConfig` (downloadable as `epp-config.yaml`), vLLM args to add in precise mode, justification of every parameter and weight, indicators, expected log lines. |
-| **Paliers et SLO** | Step-by-step test plan (flags, load, expected ranges, instances if validated), capacity in sessions, protocol and pass criteria, checks at the generated config's operating point, indicative estimate (bottlenecks, fixes). |
-| **Justifications** | One card per parameter: value, emitted or not, rule, formula, computation, vLLM default, sources, status. |
-| **Avertissements** | Ranked critical / warning / info. The 🔶 « À vérifier » items come from unconfirmed data. |
-| **Indicateurs** | Computed values and how to read them. The most useful one: the actual ISL_eff/OSL ratio compared to the ratio needed to fill the token budget. |
-| **Hypothèses** | What the app assumed for lack of data. Providing the real data removes the assumption. |
-| **Vérification et métriques** | Flag verification command, metrics to watch, validation test of the prefill threshold. |
-
-### 7. Deploy the configuration
-
-1. **Check the flags on the image actually deployed**, with the command of the « Vérification et métriques » tab. It
-   lists the flags the image knows; every flag of the config must show up:
+1. **Check the flags on the image actually deployed**, with the command under « Vérifier les flags sur l'image » of
+   step ③. It lists the flags the image knows; every flag of the config must show up:
    ```bash
    vllm serve --help=all | grep -oE -- "--(no-)?(max-num-seqs|max-num-batched-tokens|...)\b" | sort -u
    ```
-2. **Paste the `args:` block** into the vLLM container definition of your manifest. This block does not contain the
-   model name, which KServe usually provides elsewhere. The `vllm serve` command does include it.
+2. **Paste the `args:` block** of step ② into the vLLM container definition of your manifest. This block does not
+   contain the model name, which KServe usually provides elsewhere. The `vllm serve` command does include it.
 3. **Deploy**, then check in the logs that vLLM starts without errors and without OOM during the CUDA graph capture.
+4. **Run the step plan** of step ③, with `ws replay` for agentic sessions.
 
-### 8. After the first deployment: close the loop
+### 7. Measure and adjust (step ④)
 
-The KV size depends on `gpu-memory-utilization`, `max-num-seqs` and the CUDA graph capture. It therefore changes with
-the new configuration.
+The KV size depends on `gpu-memory-utilization`, `max-num-seqs` and the CUDA graph capture: it changes with the new
+configuration.
 
-1. Read the new `GPU KV cache size` line and the block size in the logs.
-2. Enter them under « Logs de démarrage »: the app recomputes `max-num-seqs` and the indicators.
-3. Run the step plan of the « Paliers et SLO » tab and enter the latency measured at the generated config's step (or
-   import a `ws replay` result): the ranges of the other steps narrow. Also watch the prefix cache hit rate.
-4. Measure the acceptance length `a = 1 + spec_decode_num_accepted_tokens / spec_decode_num_drafts` and enter it: it
+1. Enter the new `GPU KV cache size` line and the block size of the startup logs: the app recomputes `max-num-seqs`
+   and the indicators.
+2. Import the `ws replay --out` result, or enter the latencies measured at the generated config's step: the model is
+   recalibrated and the ranges of the other steps narrow.
+3. Measure the acceptance length `a = 1 + spec_decode_num_accepted_tokens / spec_decode_num_drafts` and enter it: it
    replaces the a = 3 assumption.
+4. Read the capacity in sessions and the flags of the best setting; deploy it and replay again to validate it.
+
+### 8. Export for review (step ⑤)
+
+#### Review report
+
+The report gathers what a reviewer needs to judge whether the configuration fits the workload
+(`src/vllm_configurator/report.py`):
+- the review questions and the expected answer format (overall verdict, blocking points, points to check, proposed
+  corrections);
+- every assumption with its origin, so the reviewer can challenge the ones the app assumed;
+- the SLOs, the generated config and the justification of every parameter, the llm-d config;
+- what the app expects: checks, capacity in sessions, bottlenecks, fixes, and the values the latency model ran on;
+- the test plan, the measurements (startup logs, latencies, working-set replay steps);
+- the known limits of the tool.
+
+It comes as Markdown (`<name>-rapport.md`, to send to an agent or a person) and as JSON (`<name>-rapport.json`, for a
+tool). Step ⑤ also exports the scenario (`.yaml`), to reload at step ①.
 
 ### llm-d routing
 
@@ -342,8 +354,9 @@ Left empty, the app assumes 0, the case where affinity matters most.
 value of the prefix plugin (one line per parameter, e.g. `lruCapacityPerServer: 700000`). A name unknown to the
 catalog or a value of the wrong type is ignored, with a critical warning. The app also reports what the forced value
 breaks: index too small for the KV, block below the minimum, window shorter than the shared prefix, precise block size
-different from vLLM's. The weights are forced in « Forcer les poids du profil ». The « 📖 Comprendre les paramètres
-llm-d » panel of the tab explains each parameter and each scorer, with its default and the proposed value.
+different from vLLM's. The weights are forced in the « Poids … » fields of « Affiner » (step ①). At step ②, the
+« 📖 Comprendre les paramètres llm-d » panel explains each parameter and each scorer, with its default and the
+proposed value.
 
 For the reference case, the app finds the configuration of §9.4 of the knowledge base: block 128,
 `lruCapacityPerServer` 673,639, weights 2 / 1 / 5 / 2 (queue / kv / prefix / no-hit). Without affinity, the 95.7 %
@@ -354,9 +367,9 @@ vLLM args, with the `POD_IP` variable on the container) and `tokenProcessorConfi
 it therefore requires. It reports when this mode is of little use (lightly used KV, rare evictions) or, conversely,
 when the approximate index is likely to drift (KV more than 80 % used).
 
-**Close the loop after deployment.** The tab gives the lines expected in the EPP log (`Prefix DataProducer
-initialized`, `EPP config after phase two`). Enter under « Mesures llm-d » what the log actually shows and the hit rate
-of the worst pod: the app computes the share of the cache the deployed index forgets and explains a hit rate that is
+**Close the loop after deployment.** Step ② gives the lines expected in the EPP log (`Prefix DataProducer
+initialized`, `EPP config after phase two`). Enter at step ④ (llm-d fields) what the log actually shows and the hit
+rate of the worst pod: the app computes the share of the cache the deployed index forgets and explains a hit rate that is
 too low. The EPP config is recomputed on every change of the vLLM config, since the KV size depends on it.
 
 ### Test steps and SLOs
@@ -432,8 +445,9 @@ the server metrics.
 The intended workflow:
 1. describe the workload, the hardware and the model, then import an agentic trace;
 2. deploy the generated config and replay it with `ws replay … --out run.json`;
-3. import `run.json` under « Mesures en production » (« 📈 Importer un résultat working-set » box);
-4. read the capacity in sessions and the setting that gives more, in the « Paliers et SLO » tab.
+3. import `run.json` at step ④ (« Importer un rejeu working-set »);
+4. read the capacity in sessions and the setting that gives more, at step ④;
+5. export the review report at step ⑤.
 
 On import of the result (`traces.profile_run`), the app reads every judged step again with working-set's window rule:
 - the requests in flight (mean);

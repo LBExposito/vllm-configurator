@@ -80,6 +80,8 @@ class Env:
     # Multiplicative uncertainty (low, high) on the decode part and on the prefill part of the durations.
     spread: tuple[float, float] = (1.0, 1.0)
     spread_prefill: tuple[float, float] = (1.0, 1.0)
+    # Dispersion (lognormal sigma) of the tokens a warm request prefills.
+    warm_sigma: float = 1.0
 
     @property
     def wl(self):
@@ -990,7 +992,7 @@ def build_env(ctx: RuleContext, state: dict[str, Any], kv_tokens: int | None,
             f" routage) : {cold:.1%} des requêtes, hypothèse 🔶 ({cold_h['value']:.0%}"
             + (f", plafonnée pour que leur prefill ne dépasse pas {cold_h['max_share_of_uncached_tokens']:.0%} du prefill"
                f" non caché d'un hit rate de {hit:.1%}" if cold < cold_h["value"] else "")
-            + "). Mesure : part des requêtes dont vllm:prefix_cache_hits est nul ; saisir « Part de requêtes froides »."
+            + "). Mesure : part des requêtes dont vllm:prefix_cache_hits est nul ; la saisir à l'étape ① (Affiner)."
         )
     if wl.warm_uncached_tokens is not None and wl.warm_uncached_tokens.p95:
         sigma = traces.warm_sigma(wl.warm_uncached_tokens.p50, wl.warm_uncached_tokens.p95)
@@ -1014,7 +1016,7 @@ def build_env(ctx: RuleContext, state: dict[str, Any], kv_tokens: int | None,
         dspark_cap=bool(ctx.behavior("spec_decode.dspark_active_seq_cap").value) and state.get("spec_method") in ("dspark", "dflash"),
         dist=dist, hit_effective=hit_eff, cold_fraction=cold if 0 < hit else 0.0, a_low=a_low,
         frontend_costs=costs, api_servers=caps.api_servers, renderer_workers=caps.renderer_workers,
-        max_api_servers=caps.max_servers, spread=spread, spread_prefill=spread,
+        max_api_servers=caps.max_servers, spread=spread, spread_prefill=spread, warm_sigma=sigma,
     )
     notes.append(
         f"Tokens à prefiller par requête : moyenne {fmt_int(env.isl_eff_mean)}, p95 {fmt_int(env.isl_eff_p95)}, p99"
@@ -1254,7 +1256,7 @@ def analyze(ctx: RuleContext, state: dict[str, Any]) -> SloAnalysis:
             kind="none", title="Configuration conforme : aucune action",
             rationale=("Tous les contrôles passent avec marge." if slo_given else
                        "Capacité suffisante. Sans SLO de latence, le verdict ne porte que sur le KV et le prefill.")
-            + " Valider en production avec les métriques de l'onglet Vérification.",
+            + " Valider en production avec les métriques de l'étape ③.",
         ))
     else:
         # The frontend is re-sized point by point: a setting or more instances are not blocked by it.
@@ -1350,7 +1352,23 @@ def analyze(ctx: RuleContext, state: dict[str, Any]) -> SloAnalysis:
                        step_breakdown=breakdown, calibration=calibration, calibration_prefill=calibration_prefill,
                        uncertainty=env.spread if model is not None else None,
                        uncertainty_ttft=env.spread_prefill if model is not None else None, test_plan=plan,
-                       session_capacity=capacity, notes=notes)
+                       session_capacity=capacity, model_inputs=model_inputs(env), notes=notes)
+
+
+def model_inputs(env: Env) -> dict[str, Any]:
+    """The values the latency model actually ran on, assumed or given: what a reviewer must be able to challenge."""
+    routing = env.ctx.request.routing
+    return {
+        "isl_mean_tokens": round(env.isl_mean), "osl_mean_tokens": round(env.osl_mean),
+        "prefix_cache_hit_rate": round(env.hit, 4), "hit_rate_effective": round(env.hit_effective, 4),
+        "cold_request_fraction": round(env.cold_fraction, 4), "warm_uncached_sigma": round(env.warm_sigma, 3),
+        "uncached_tokens_mean": round(env.isl_eff_mean), "uncached_tokens_p95": round(env.isl_eff_p95),
+        "shared_prefix_tokens": (routing.shared_prefix_tokens or 0) if routing else 0,
+        "acceptance_length_mean": env.a, "acceptance_length_p5": round(env.a_low, 2), "speculative_tokens": env.k,
+        "kv_tokens_per_instance": env.kv_tokens,
+        "uncertainty_decode": list(env.spread), "uncertainty_prefill": list(env.spread_prefill),
+        "session_gap_s": env.wl.session_gap_s,
+    }
 
 
 def adjusted_kv_tokens(ctx: RuleContext, state: dict[str, Any]) -> tuple[int | None, str | None]:
@@ -1717,7 +1735,7 @@ def build_test_plan(env: Env, base: Point, block_size: int | None = None) -> Tes
             "--api chat fait passer le chat template et le renderer comme en production (completions les court-circuite,"
             " le frontal paraît moins chargé). Le texte du rejeu est synthétique, avec une longueur de sortie forcée :"
             " relever l'acceptation du spec decoding pendant le test (1 + vllm:spec_decode_num_accepted_tokens /"
-            " vllm:spec_decode_num_drafts) et la saisir dans « Longueur d'acceptation mesurée », sinon le recalage"
+            " vllm:spec_decode_num_drafts) et la saisir à l'étape ④, sinon le recalage"
             " attribue l'écart au mauvais facteur.",
             "Les seuils ws replay ci-dessus sont la traduction approchée des SLO : working-set juge le TTFT p90 des"
             " requêtes chaudes et le débit de decode p10 par requête, plus permissifs que des p95. Le verdict du palier"
@@ -1731,7 +1749,7 @@ def build_test_plan(env: Env, base: Point, block_size: int | None = None) -> Tes
             " (par exemple vllm bench serve --max-concurrency sur un jeu de traces). Rejouer des sessions entières, dans"
             " l'ordre et avec le même routage qu'en production : des prompts aléatoires ou mélangés n'ont pas le hit rate"
             " de la production et font exploser le TTFT. Pour des sessions agentiques, importer une trace working-set"
-            " (`ws trace`) dans « Profil de charge » : le plan donne alors les sessions à rejouer par palier.",
+            " (`ws trace`) à l'étape ① : le plan donne alors les sessions à rejouer par palier.",
             "Garder la dispersion réelle des sorties : une OSL fixe (ignore_eos avec une longueur constante) et une montée"
             " en charge d'un bloc font finir les requêtes par vagues, et leurs prefills arrivent en rafale (TTFT p95"
             " doublé).",
@@ -1750,9 +1768,9 @@ def build_test_plan(env: Env, base: Point, block_size: int | None = None) -> Tes
         " un processus à ~100 % d'un cœur, et un TTFT ou une ITL client qui s'écartent de plus en plus du serveur quand"
         " la charge monte, signalent un frontal saturé (--api-server-count, --renderer-num-workers).",
         "Palier validé : passer au suivant. Premier palier en échec : la capacité d'une instance est le palier précédent.",
-        "Saisir la latence de génération et le TTFT mesurés au palier de la config générée (★) dans « Mesures en"
-        " production » : l'app recale séparément la partie decode et la partie prefill du modèle et resserre les plages"
-        " des autres paliers.",
+        "À l'étape ④, importer le résultat du rejeu ou saisir la latence de génération et le TTFT mesurés au palier de la"
+        " config générée (★) : l'app recale séparément la partie decode et la partie prefill du modèle et resserre les"
+        " plages des autres paliers.",
         "Dimensionner : instances = ⌈requêtes en vol visées / max-num-seqs validé⌉ (colonne « Si validé »), plus une marge"
         " pour les pics.",
     ]

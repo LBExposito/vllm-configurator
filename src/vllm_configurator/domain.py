@@ -333,6 +333,8 @@ class SloAnalysis(_Frozen):
     test_plan: TestPlan | None = None
     # Capacity in agentic sessions (if the wait between two requests of a session is known).
     session_capacity: SessionCapacity | None = None
+    # Values the latency model ran on (lengths, cache, cold share, acceptance, KV, uncertainty), assumed or given.
+    model_inputs: dict[str, Any] = {}
     notes: list[str] = []
     confidence: Status = "unverified"
 

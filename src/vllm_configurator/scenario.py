@@ -120,7 +120,7 @@ TRACE_FORM_KEYS = {"prefix_cache_hit_rate": "hit_rate", "cold_request_fraction":
 
 
 def trace_to_form(profile: TraceProfile, sessions: int | None = None) -> dict[str, Any]:
-    """Session-state values of the « Profil de charge » form section read off a working-set trace."""
+    """Session-state values of the workload inputs of the form read off a working-set trace."""
     updates = profile.workload_updates(sessions)
     form: dict[str, Any] = {f"isl_{k}": v for k, v in updates["isl"].items()}
     form |= {f"osl_{k}": v for k, v in updates["osl"].items()}
@@ -138,7 +138,7 @@ RUN_FORM_KEYS = {"ttft_p95_ms": "ttft_measured", "tpot_p95_ms": "tpot_measured",
 
 
 def run_to_form(profile: RunProfile, index: int, instances: int, itl_metric: str = "itl") -> dict[str, Any]:
-    """Session-state values of the « Mesures en production » section read off one step of a working-set replay.
+    """Session-state values of the measurement inputs of the form read off one step of a working-set replay.
 
     The replay measures the TPOT, not the ITL: with a TPOT target it fills the measured target latency, with an ITL
     target the separate TPOT field (and clears a measured ITL, which belonged to another measurement)."""
@@ -156,7 +156,7 @@ ROUTING_WEIGHT_KEYS = {"queue-scorer": "llmd_w_queue", "kv-cache-utilization-sco
 
 
 def routing_to_form(routing: RoutingRequest | None) -> dict[str, Any]:
-    """Session-state values of the « Routage llm-d » form section."""
+    """Session-state values of the llm-d routing inputs of the form."""
     routing = routing or RoutingRequest()
     obs = routing.observed
     form: dict[str, Any] = {
