@@ -8,7 +8,8 @@ source:
   - vllm/config/speculative.py
   - vllm/config/compilation.py
   - vllm/model_executor/models/registry.py
-  extracted_on: '2026-11-12'
+  - vllm/entrypoints/common/cli_args.py
+  extracted_on: '2026-11-18'
   tool: tools/extract_vllm_flags.py
 cli_flags:
 - --additional-config
@@ -17,6 +18,7 @@ cli_flags:
 - --allow-deprecated-quantization
 - --allowed-local-media-path
 - --allowed-media-domains
+- --api-server-count
 - --async-scheduling
 - --attention-backend
 - --attention-config
@@ -25,6 +27,7 @@ cli_flags:
 - --code-revision
 - --collect-detailed-traces
 - --compilation-config
+- --config
 - --config-format
 - --convert
 - --cp-kv-cache-interleave-size
@@ -108,6 +111,8 @@ cli_flags:
 - --gdn-prefill-backend
 - --generation-config
 - --gpu-memory-utilization
+- --grpc
+- --headless
 - --hf-config-path
 - --hf-overrides
 - --hf-token

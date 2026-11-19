@@ -15,6 +15,7 @@ import argparse
 import datetime as dt
 import re
 import sys
+import urllib.error
 import urllib.request
 from pathlib import Path
 
@@ -29,6 +30,9 @@ FILES = {
     "compilation": "vllm/config/compilation.py",
     "registry": "vllm/model_executor/models/registry.py",
 }
+# Arguments du frontend de `vllm serve` (--api-server-count, --host, parseurs…) : le fichier a changé de place.
+FRONTEND_FILES = ["vllm/entrypoints/common/cli_args.py", "vllm/entrypoints/launchers/cli_args.py",
+                  "vllm/entrypoints/openai/cli_args.py"]
 
 
 def fetch(tag: str, path: str, cache_dir: Path) -> str:
@@ -72,6 +76,17 @@ def main() -> int:
     args = parser.parse_args()
 
     src = {key: fetch(args.tag, path, args.cache_dir) for key, path in FILES.items()}
+    frontend_path = None
+    for path in FRONTEND_FILES:
+        try:
+            src["frontend"] = fetch(args.tag, path, args.cache_dir)
+            frontend_path = path
+            break
+        except urllib.error.HTTPError as exc:
+            if exc.code != 404:
+                raise
+    if frontend_path is None:
+        raise SystemExit(f"arguments du frontend introuvables au tag {args.tag} : {FRONTEND_FILES}")
     spec_methods = set(literal_values(src["speculative"], "SpeculativeMethod"))
     for alias in ("MTPModelTypes", "EagleModelTypes", "DFlashModelTypes", "DSparkModelTypes", "NgramGPUTypes"):
         spec_methods.update(literal_values(src["speculative"], alias))
@@ -81,11 +96,11 @@ def main() -> int:
         "source": {
             "repository": "https://github.com/vllm-project/vllm",
             "tag": args.tag,
-            "files": list(FILES.values()),
+            "files": [*FILES.values(), frontend_path],
             "extracted_on": dt.date.today().isoformat(),
             "tool": "tools/extract_vllm_flags.py",
         },
-        "cli_flags": cli_flags(src["arg_utils"]),
+        "cli_flags": sorted(set(cli_flags(src["arg_utils"])) | set(cli_flags(src["frontend"]))),
         "speculative_config_keys": class_fields(src["speculative"], "SpeculativeConfig"),
         "speculative_methods": sorted(spec_methods),
         "rejection_sample_methods": literal_values(src["speculative"], "RejectionSampleMethod"),

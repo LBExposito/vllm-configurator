@@ -27,9 +27,9 @@ version à l'autre. L'app applique ces règles de façon reproductible et montre
 |---|---|
 | Matériel | Type de GPU, nombre de GPU par instance (tensor parallel), nombre d'instances |
 | Modèle et version | Modèle du catalogue, version de vLLM |
-| Profil de charge | Type d'usage (chat, agentique, RAG, extraction, résumé, scoring, batch), mode interactif ou batch, ISL et OSL en P50 / P95 / P99, taux de prefix cache hit attendu, requêtes en vol visées |
+| Profil de charge | Type d'usage (chat, agentique, RAG, extraction, résumé, scoring, batch), mode interactif ou batch, ISL et OSL en P50 / P95 / P99, taux de prefix cache hit attendu, part de requêtes froides (préfixe absent du cache), requêtes en vol visées |
 | SLO | TTFT p95 et ITL p95 cibles (optionnels) |
-| Mesures en production (optionnel) | ITL (ou TPOT) p95 et TTFT p95 mesurés avec la config générée : ils priment sur l'estimation, et la latence de génération recale le modèle |
+| Mesures en production (optionnel) | ITL (ou TPOT) p95 et TTFT p95 mesurés avec la config générée : ils priment sur l'estimation ; la latence de génération recale la partie decode du modèle, le TTFT sa partie prefill |
 | Speculative decoding | Activation, `k`, méthode d'échantillonnage du draft, longueur d'acceptation mesurée, tolérance à une vérification lossy (FLy) |
 | Contexte et arguments supplémentaires (optionnel) | `max-model-len` cible (avec extension de contexte YaRN quand le modèle en a une), flags vLLM et variables d'environnement additionnels |
 | Logs de démarrage (optionnel) | `GPU KV cache size`, taille de bloc et `gpu-memory-utilization` lus dans les logs d'une instance |
@@ -78,7 +78,10 @@ l'app la demande explicitement si elle est indispensable.
 
 - L'app ne mesure rien : elle applique des règles. Les latences des paliers sont des **plages** (×0,8 à ×2,5 sans
   mesure) issues d'un modèle roofline dont les rendements sont supposés (🔶). C'est la mesure des paliers qui tranche ;
-  saisir la latence mesurée recale le modèle (±15 %).
+  saisir la latence de génération et le TTFT mesurés recale chacun sa partie du modèle (±15 %).
+- Le TTFT p95 dépend surtout de la forme de la charge : part de requêtes froides, hit rate réel, rafales. Un test de
+  charge par prompts aléatoires, ou à OSL fixe démarré d'un bloc, ne reproduit pas la production (voir le protocole
+  des paliers).
 - Sans logs de démarrage, la taille du KV est une estimation grossière (borne haute) : relancez le calcul avec la
   valeur réelle après le premier déploiement.
 - Les poids des scorers llm-d sont des choix de l'app (🔶), calés sur la configuration proposée par la base de
@@ -184,9 +187,9 @@ Remplissez la barre latérale de haut en bas. Les résultats se recalculent à c
 |---|---|
 | **Matériel** | « GPU par instance » est le tensor parallel d'un pod ; « Instances » est le nombre de pods indépendants. |
 | **Modèle et version** | Choisissez la version de vLLM réellement déployée : plusieurs règles en dépendent. |
-| **Profil de charge** | Mesurez ISL et OSL **par appel au modèle**, pas par tour de conversation ni par session. Laissez le hit rate vide si vous ne l'avez pas mesuré : l'app prend la valeur publiée pour votre type d'usage et l'affiche dans « Hypothèses ». Les requêtes en vol visées sont un total sur toutes les instances : requêtes en cours + en file, **pas des utilisateurs** (un utilisateur agentique n'a une requête en cours qu'une partie du temps). Mesure : `vllm:num_requests_running` + `vllm:num_requests_waiting` sommés sur les pods. |
-| **SLO** | Optionnels. Ils ne changent pas la config générée ; ils fixent les critères de passage des paliers. Choisissez sur quoi porte la cible de génération : **ITL** (`vllm:inter_token_latency_seconds`, intervalle entre deux sorties, soit un step) ou **TPOT** (`vllm:request_time_per_output_token_seconds`, temps par token). Avec le speculative decoding, l'ITL monte un peu mais le TPOT est divisé par ~a : pour le ressenti utilisateur, c'est le TPOT qui compte. |
-| **Mesures en production** | Latence de génération (même métrique que la cible) et TTFT p95 relevés au palier de la config générée. La mesure tranche ; la latence de génération recale toutes les durées estimées. |
+| **Profil de charge** | Mesurez ISL et OSL **par appel au modèle**, pas par tour de conversation ni par session. Laissez le hit rate vide si vous ne l'avez pas mesuré : l'app prend la valeur publiée pour votre type d'usage et l'affiche dans « Hypothèses ». Les requêtes en vol visées sont un total sur toutes les instances : requêtes en cours + en file, **pas des utilisateurs** (un utilisateur agentique n'a une requête en cours qu'une partie du temps). Mesure : `vllm:num_requests_running` + `vllm:num_requests_waiting` sommés sur les pods. La part de requêtes froides (préfixe absent du cache : premier appel d'une session au-delà du préfixe commun, éviction, mauvais routage) fait le TTFT p95 : laissée vide, l'app suppose 5 %, plafonnés pour rester compatibles avec le hit rate. |
+| **SLO** | Optionnels. Ils ne changent pas la config générée ; ils fixent les critères de passage des paliers. Choisissez sur quoi porte la cible de génération : **ITL** (`vllm:inter_token_latency_seconds`, intervalle entre deux sorties, soit un step) ou **TPOT** (`vllm:request_time_per_output_token_seconds`, temps par token). Avec le speculative decoding, l'ITL monte un peu mais le TPOT est divisé par ~a (moins pour les requêtes peu acceptées, qui font le TPOT p95) : pour le ressenti utilisateur, c'est le TPOT qui compte. |
+| **Mesures en production** | Latence de génération (même métrique que la cible) et TTFT p95 relevés au palier de la config générée. La mesure tranche ; la latence de génération recale la partie decode des durées estimées, le TTFT leur partie prefill. Si les deux ne se concilient pas, l'app le dit : l'écart vient alors de la forme de la charge, pas du GPU. |
 | **Speculative decoding** | Laissez `k` vide pour utiliser la valeur recommandée pour le modèle. Ne cochez « Tolérer une vérification lossy » qu'en A/B : FLy peut modifier les sorties, ce qui est risqué pour les tool calls. |
 | **Logs de démarrage** | Si une instance tourne déjà, recopiez `GPU KV cache size: N tokens`, la taille de bloc (`Setting kv cache block size to N`) et la `gpu-memory-utilization` utilisée. C'est la donnée qui fiabilise le plus la configuration. |
 | **Contexte et arguments supplémentaires** | Voir ci-dessous. |
@@ -384,14 +387,20 @@ passe si la latence de génération et le TTFT p95 tiennent la cible, sans file 
 |---|---|
 | Longueurs | Moyennes d'ISL et d'OSL déduites des percentiles (lognormale ajustée sur P50/P95, corrigée si le P99 révèle une queue plus lourde), pas du P50 |
 | Occupation du KV | S × (ISL moyen + OSL moyen / 2) / KV par instance, KV ramené au `gpu-memory-utilization` de la config si les logs ont été lus à une autre valeur |
-| Charge de prefill | prefill non caché demandé par step (S·a/OSL × ISL_eff) / (B − S·d), en régime stable (§3.1) |
-| Step | roofline (`src/vllm_configurator/perf.py`) : max(lecture des poids, experts MoE touchés et KV ; calcul) + surcoût fixe par couche |
-| ITL / TPOT | ITL = step chargé en prefill ; TPOT = step moyen / a |
-| TTFT | attente d'une place + attente du prefill (file M/D/1) + prefill du prompt P95 non caché, découpé selon le seuil de long prefill |
+| Tokens à prefiller | Distribution, pas une moyenne : une part de requêtes froides prefillées en entier (`cold_request_fraction`), et pour les autres un delta non caché indépendant de l'historique, à queue lourde (`uncached_tokens_sigma`), calé pour respecter le hit rate |
+| Charge de prefill | prefill non caché demandé par step (S·a/OSL × E[tokens à prefiller]) / (B − S·d), en régime stable (§3.1) |
+| Step | somme des opérateurs (`src/vllm_configurator/perf.py`), chacun borné par son roofline max(lecture mémoire, calcul) : poids denses, experts MoE touchés, attention (lecture du KV ; FLOPs sur le contexte, indexeur d'une attention sparse compris), all-reduce TP sur NVLink, surcoûts fixes (plus élevés sur un step mixte) et par séquence, passe du drafter |
+| ITL / TPOT | ITL p95 = step chargé en prefill ; TPOT p95 = step moyen / a des 5 % de requêtes les moins acceptées (dispersion `acceptance_dispersion`) |
+| TTFT | 95e centile de la somme frontal (HTTP, EPP, tokenisation) + attente d'une place + attente du prefill (file M/G/c, variance des prompts comprise) + prefill du prompt découpé selon le seuil de long prefill, calculé sur la distribution des tokens à prefiller |
 
 Sans mesure, les durées sont données de ×0,8 à ×2,5 ; recalées sur une latence mesurée, à ±15 %
-(`perf_uncertainty`). Les rendements (`perf_hbm_efficiency`, `perf_mfu`, `perf_overhead_per_layer_ms`) et les seuils
-sont des heuristiques de `catalog/workload_profiles.yaml`, toutes 🔶. Sans bloc `performance` dans la fiche modèle,
+(`perf_uncertainty`), séparément pour la partie decode (latence de génération) et la partie prefill (TTFT). Les
+rendements et coûts (`perf_hbm_efficiency`, `perf_mfu`, `perf_overhead_per_layer_ms`, `perf_nvlink_efficiency`,
+`perf_drafter_step_fraction`, `perf_sparse_indexer_cost_ratio`, `frontend_python`…) et les seuils sont des
+heuristiques de `catalog/workload_profiles.yaml`, toutes 🔶. Le coût de l'attention est dérivé de config.json
+(têtes, dimensions, couches à attention non linéaire, top-k d'une attention sparse) ; le bloc `performance` d'une
+fiche modèle peut le fixer (`attention_flops_per_context_token`, `attention_sparse_flops_per_token`,
+`attention_sparse_tokens`). Sans bloc `performance` dans la fiche modèle,
 ni `bandwidth` et `compute` dans la fiche GPU, les paliers n'ont pas de plages de latence : seule la capacité est
 contrôlée.
 
@@ -400,6 +409,67 @@ goulots (prefill, KV, places de séquence, decode, interférence du prefill, pla
 capacité constante, instances, TP plus large, `gpu-memory-utilization`, DP-attention, prefix cache, désagrégation
 P/D, PCP. Une piste de réglage n'est proposée que si elle tient même dans le cas pessimiste ; elle reste à valider par
 les paliers.
+
+### Frontal : `--api-server-count` et `--renderer-num-workers`
+
+Le GPU n'est pas le seul goulot possible. Avant et après lui, le **frontend Python** de `vllm serve` (le défaut ;
+le frontend Rust, `VLLM_USE_RUST_FRONTEND=1`, est opt-in et n'est pas modélisé) fait tout le travail CPU d'une
+requête. Ce qui suit est vérifié dans le code source de vLLM 0.31.0, 0.32.0 et 0.33.0 (comportements
+`frontend.api_servers` et `frontend.renderer_pool` du catalogue de chaque version).
+
+**Ce que fait chaque flag.**
+
+| Flag | Ce qu'il change | Ce qu'il ne change pas |
+|---|---|---|
+| `--api-server-count` (défaut : `data_parallel_size`, donc 1 en DP1) | N processus API sur un port partagé. Chacun a sa boucle asyncio, son GIL, son renderer et sa détokenisation. | L'engine core reste unique : au-delà, c'est lui ou le GPU qui limite. |
+| `--renderer-num-workers` (défaut : 1) | Taille du pool de threads de chaque processus API, qui fait le chat template (renderers HF et DeepSeek V4) et la tokenisation du prompt. | Ni les sorties (détokenisation, streaming, parseurs, sur la boucle asyncio), ni le multimodal (un thread dédié imposé), ni le mode offline (`LLM`). |
+
+Le chat template est du Python (Jinja, ou `encode_messages` pour DeepSeek V4 et V4.1) : il tient le GIL même sur
+un thread du pool, donc des threads de plus ne le parallélisent pas. La tokenisation, elle, en profite. Le chemin
+vérifié est `encode` → transformers `_encode_plus` → `tokenizers` `encode_batch`, dont le cœur Rust tourne hors
+GIL (`py.allow_threads`, renommé `py.detach`). Il a été relu dans transformers 5.10.3, 5.16.1 et 5.20.2 et dans
+`tokenizers` 0.21.1, 0.23.2 et 0.23.3, soit les versions épinglées par vLLM 0.31 à 0.33. Seules l'extraction du texte
+et la conversion du résultat en listes Python gardent le GIL : l'app en compte 10 % (`tokenize_gil_share`, 🔶). Le
+backend `fastokens` (`VLLM_USE_FASTOKENS=1`) n'a pas été relu.
+
+**Le modèle.** Par processus API, l'app estime :
+- la charge du GIL : requêtes/s × (boucle + JSON des messages + chat template) + sorties streamées/s × coût d'une
+  sortie ;
+- la charge du pool : requêtes/s × (chat template + tokenisation), répartie sur les threads.
+
+Le trafic vient du step du GPU. Il y a S·a/OSL requêtes par step, et une sortie par séquence et par step. Les
+attentes sur le GIL (M/G/1) s'ajoutent à l'ITL ; celles du pool (M/G/c) s'ajoutent au TTFT. La règle R-FE-01/02
+dimensionne au plus petit nombre qui garde chaque GIL et chaque pool sous 70 %. Elle se cale sur les steps rapides
+de l'estimation (plus de trafic, donc le cas prudent pour le frontal) et garde les défauts de vLLM quand ils tiennent.
+Les coûts unitaires sont des heuristiques (`frontend_python`, 🔶).
+
+**Quand ça vaut la peine d'y toucher.**
+
+| Scénario | Ce qui sature | Levier |
+|---|---|---|
+| Longues sorties, gros MoE, steps de 30 à 50 ms, spec decoding (le cas de référence à concurrence modérée) | Rien : quelques requêtes/s, GIL à ~40 % | Garder les défauts |
+| Beaucoup de flux en parallèle et des steps courts : modèle rapide, `max-num-seqs` élevé, sans spec decoding (une sortie par token) | GIL, à ~90 % par les sorties | `--api-server-count` ; le renderer n'y peut rien |
+| Appels courts sur de longs contextes : agentique à OSL de ~250, RAG, classification, scoring | Pool : des dizaines de requêtes/s × 20–30 ms de rendu chacune | `--renderer-num-workers` pour la tokenisation, `--api-server-count` si le chat template domine |
+| Multimodal | Le thread multimodal dédié | `--api-server-count` (un thread multimodal par processus) |
+| Instances pleines (pas de concurrence cible) | Souvent les sorties : 512 flux × ~25 steps/s ≈ 13 000 sorties/s | `--api-server-count 2` (écart documenté dans le golden) |
+
+Le speculative decoding allège le frontal : une sortie par step porte ~a tokens.
+
+**Ce que ça coûte, et quand ça devient le goulot.**
+- **CPU** : ~1 cœur par processus API saturé, plus les threads de tokenisation, en plus de l'engine core (~1
+  cœur) et d'un worker par GPU (~1 chacun). Une limite CPU trop basse fait brider (CFS) les workers GPU, ce qui
+  est pire qu'un frontal lent. Renseignez « Cœurs CPU par instance » : l'app plafonne les processus API et
+  affiche le besoin (indicateur `frontend_cpu`).
+- **Contraintes** : avec N > 1, Prometheus passe en multiprocess (vérifiez que l'EPP et les tableaux de bord
+  lisent bien les métriques agrégées). N > 1 est aussi incompatible avec `VLLM_ALLOW_RUNTIME_LORA_UPDATING`.
+  Elastic EP ramène à 1, et chaque processus charge son tokenizer en mémoire hôte.
+- **Signes de saturation** : un processus API à ~100 % d'un cœur (`top -H`, `pidstat`, `py-spy dump`). Autre
+  signe : un TTFT ou une ITL côté client qui s'écartent de plus en plus du serveur quand la charge monte.
+- **Au-delà** : l'engine core (sérialisation des entrées et des sorties) devient le goulot suivant. Plus de
+  processus API n'y change rien : il faut plus d'instances, ou du DP dans l'instance.
+
+**Frontend Rust.** vLLM ignore `--api-server-count` (frontend multithread, sans GIL) et refuse les flags
+inconnus. Son coût n'est pas modélisé : à comparer en A/B sur un même palier.
 
 ### 9. Dépannage
 
@@ -440,7 +510,7 @@ catalog/                    Données versionnées (YAML), séparées de la logiq
 src/vllm_configurator/
   catalog/                  Schémas pydantic et chargement + validation croisée
   formulas.py               Formules de la §3, fonctions pures
-  perf.py                   Modèle roofline d'un step du scheduler (latence)
+  perf.py                   Modèle d'un step du scheduler (somme des rooflines par opérateur) et files d'attente
   analysis.py               Paliers de test, contrôles SLO, goulots et pistes de correction
   scenario.py               Fichiers de scénario YAML (export / import du formulaire)
   rules/                    Règles : une fonction pure (RuleContext, state) -> RuleOutput par décision

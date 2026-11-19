@@ -143,6 +143,12 @@ class ModelPerformance(Provenance):
     dense_bytes_per_param: float = Field(gt=0)
     # Type des tensor cores utilisés par les GEMM (débit crête du GPU pris pour ce type).
     compute_dtype: ComputeDtype
+    # Coût de l'attention par token requête (facultatif ; sinon dérivé de l'architecture, voir analysis.attention_cost) :
+    # FLOPs par token de contexte (attention dense, ou indexeur d'une attention sparse), FLOPs par token sélectionné
+    # et nombre de tokens sélectionnés (attention sparse : top-k + fenêtre glissante).
+    attention_flops_per_context_token: float | None = Field(default=None, ge=0)
+    attention_sparse_flops_per_token: float | None = Field(default=None, ge=0)
+    attention_sparse_tokens: int | None = Field(default=None, ge=0)
 
 
 class ContextExtension(Provenance):

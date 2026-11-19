@@ -2,6 +2,7 @@
 
 from .context import RuleContext, RuleOutput
 from .extra import decide_extra_args
+from .frontend import decide_frontend
 from .diagnostics import check_support, decide_parallelism, itl_watch, resolve_workload, version_notes
 from .kv_cache import (
     decide_block_size,
@@ -40,6 +41,7 @@ PIPELINE = [
     decide_block_size,
     decide_kv_offload,
     decide_max_model_len,
+    decide_frontend,
     indicate_scheduler,
     itl_watch,
     version_notes,

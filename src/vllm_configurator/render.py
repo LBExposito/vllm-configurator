@@ -17,6 +17,7 @@ SECTIONS = [
                                    "block_size", "kv_offloading_size", "max_model_len", "hf_overrides"]),
     ("Speculative decoding", ["speculative_config"]),
     ("CUDA graphs", ["compilation_config"]),
+    ("Frontal", ["api_server_count", "renderer_num_workers"]),
 ]
 EXTRA_SECTION = "Arguments supplémentaires"
 

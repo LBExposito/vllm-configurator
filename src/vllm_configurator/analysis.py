@@ -5,8 +5,16 @@ number of instances) with two kinds of checks:
 
 - structural checks, which need no hardware model: KV occupancy, prefill load of the budget,
   queueing for a sequence slot;
-- latency checks (ITL p95, TTFT p95), from the roofline step model of perf.py, recalibrated by
-  the measured ITL when provided.
+- latency checks (ITL or TPOT p95, TTFT p95), from the step model of perf.py, recalibrated by
+  the measured ITL (decode part) and TTFT (prefill part) when provided.
+
+Percentiles are computed as percentiles, not as sums of means:
+- the tokens to prefill follow a distribution (cold requests prefilled in full, warm requests with a
+  heavy-tailed uncached part), not ISL P95 × (1 − mean hit rate);
+- the wait for the prefill comes from an M/G/c queue (variance of that distribution, several prefills
+  in parallel within the budget), and TTFT p95 is the 95th percentile of frontend + slot wait + prefill
+  wait + own prefill;
+- TPOT p95 divides the mean step by the acceptance length of the 5 % least accepted requests.
 
 It then classifies the bottleneck and searches the parameter grid (and then the number of
 instances) for an operating point that meets every target.
@@ -16,9 +24,11 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, replace
+from functools import cached_property
 from typing import Any
 
 from . import formulas as f
+from . import frontend as fe
 from . import perf as p
 from .catalog.loader import version_key
 from .domain import Bottleneck, CheckStatus, Recommendation, SloAnalysis, SloCheck, TestPlan, TestStep
@@ -51,8 +61,22 @@ class Env:
     kv_tokens: int | None
     model: p.PerfModel | None
     dspark_cap: bool
-    # Incertitude multiplicative sur les durées estimées (bas, haut).
+    # Tokens à prefiller par requête : (probabilité, tokens non cachés U, ISL), triés par U.
+    dist: tuple[tuple[float, float, float], ...] = ((1.0, 0.0, 0.0),)
+    hit_effective: float = 0.0
+    cold_fraction: float = 0.0
+    # Longueur d'acceptation des 5 % de requêtes les moins acceptées (TPOT p95).
+    a_low: float = 1.0
+    # Frontal Python : coûts CPU (None : non modélisé, frontend Rust), processus API et threads du renderer configurés.
+    # frontend_autosize : redimensionnés point par point (recherche de réglages : le CPU suit la charge).
+    frontend_costs: fe.FrontendCosts | None = None
+    api_servers: int = 1
+    renderer_workers: int = 1
+    frontend_autosize: bool = False
+    max_api_servers: int = 64
+    # Incertitude multiplicative (bas, haut) sur la partie decode et sur la partie prefill des durées.
     spread: tuple[float, float] = (1.0, 1.0)
+    spread_prefill: tuple[float, float] = (1.0, 1.0)
 
     @property
     def wl(self):
@@ -71,9 +95,26 @@ class Env:
         # Contexte moyen d'une séquence en decode : prompt moyen + moitié de la sortie moyenne.
         return self.isl_mean + self.osl_mean / 2
 
-    @property
+    @cached_property
     def isl_eff_mean(self) -> float:
-        return self.isl_mean * (1 - self.hit)
+        """Mean tokens to prefill per request (E[U])."""
+        return sum(prob * u for prob, u, _ in self.dist)
+
+    @cached_property
+    def u_scv(self) -> float:
+        """Squared coefficient of variation of U (variance / mean²)."""
+        mean = self.isl_eff_mean
+        if mean <= 0:
+            return 0.0
+        return max(sum(prob * u * u for prob, u, _ in self.dist) / mean**2 - 1.0, 0.0)
+
+    @cached_property
+    def prefill_context(self) -> float:
+        """Mean position of a prefilled token in its prompt (token-weighted): what its attention reads."""
+        weight = sum(prob * u for prob, u, _ in self.dist)
+        if weight <= 0:
+            return 0.0
+        return sum(prob * u * (isl - u / 2) for prob, u, isl in self.dist) / weight
 
     @property
     def metric(self) -> str:
@@ -81,19 +122,51 @@ class Env:
 
     @property
     def step_target_ms(self) -> float | None:
-        """Generation-latency target expressed as a step duration (TPOT × a with spec decoding)."""
+        """Generation-latency target expressed as a step duration (TPOT p95 × a of the slow requests)."""
         target = self.ctx.request.slo.itl_p95_ms
         if target is None:
             return None
-        return target * self.a if self.metric == "tpot" else target
+        return target * self.a_low if self.metric == "tpot" else target
 
-    @property
+    @cached_property
     def isl_eff_p95(self) -> float:
-        return (self.wl.isl.p95 or self.wl.isl.p50) * (1 - self.hit)
+        """95th percentile of the tokens to prefill per request."""
+        return f.quantile_of_points(list(self.dist), 0.95)
 
     @property
     def isl_cold(self) -> int:
         return self.wl.isl.p95 or self.wl.isl.p50
+
+    @cached_property
+    def attn_correction_flops(self) -> tuple[float, ...]:
+        """Per point of `dist`: attention FLOPs of its own prefill minus the same tokens at the mean prefill context
+        (the chunk steps are priced at that mean context)."""
+        m = self.model
+        if m is None:
+            return tuple(0.0 for _ in self.dist)
+        mean = m.attention_flops_per_query(self.prefill_context)
+        return tuple(u * (m.attention_flops_per_query(isl - u / 2) - mean) for _, u, isl in self.dist)
+
+    @cached_property
+    def isl_m2(self) -> float:
+        """Second moment of the full prompt length (the frontend renders and tokenizes the whole prompt)."""
+        return sum(prob * isl * isl for prob, _, isl in self.dist)
+
+    def frontend_s(self, isl: float) -> float:
+        """Time outside the GPU before the first token, without waiting: network, EPP, HTTP, chat template,
+        tokenization of the prompt."""
+        costs = self.frontend_costs
+        return 0.0 if costs is None else costs.network_s + costs.render_s(isl)
+
+    def frontend_at(self, requests_per_s: float, chunks_per_s: float) -> fe.FrontendLoad | None:
+        """Load of the frontend for this traffic, with the configured (or re-sized) processes and threads."""
+        costs = self.frontend_costs
+        if costs is None:
+            return None
+        servers, workers = self.api_servers, self.renderer_workers
+        if self.frontend_autosize:
+            servers, workers = fe.size_frontend(costs, requests_per_s, chunks_per_s, self.isl_mean, self.max_api_servers)
+        return fe.frontend_load(costs, requests_per_s, chunks_per_s, self.isl_mean, self.isl_m2, servers, workers)
 
 
 @dataclass(frozen=True)
@@ -110,29 +183,35 @@ class Evaluation:
     average: p.StepTime | None = None
     chunk: float = 0
     chunk_step: p.StepTime | None = None
-    prefill_wait_s: float = 0.0
-    own_prefill_s: float = 0.0
-    cold_prefill_s: float = 0.0
+    servers: int = 1                # prefills menés de front dans le budget
+    p_wait: float = 0.0             # probabilité d'attendre avant son prefill
+    prefill_wait_s: float = 0.0     # attente avant prefill, moyenne
+    prefill_wait_p95_s: float = 0.0
+    own_prefill_s: float = 0.0      # prefill d'un prompt au p95 des tokens non cachés
+    frontend_s: float = 0.0         # frontal (tokenisation…) pour l'ISL P95, attentes comprises
+    frontend: fe.FrontendLoad | None = None
+    ttft_s: float | None = None     # TTFT p95 (quantile de la somme des composantes)
+    ttft_cold_s: float | None = None
+    tpot_s: float | None = None     # TPOT p95
 
     @property
     def itl_ms(self) -> float | None:
-        return self.loaded.ms if self.loaded else None
+        """ITL p95: one loaded step, plus the p95 wait of a streamed output on the GIL of its API process."""
+        if self.loaded is None:
+            return None
+        return self.loaded.ms + (self.frontend.loop_wait_p95_s * 1e3 if self.frontend else 0.0)
 
     @property
     def tpot_ms(self) -> float | None:
-        return None if self.average is None else self.average.ms
+        return None if self.tpot_s is None else self.tpot_s * 1e3
 
     @property
     def ttft_ms(self) -> float | None:
-        if self.chunk_step is None:
-            return None
-        return (self.slot_wait_s + self.prefill_wait_s + self.own_prefill_s) * 1e3
+        return None if self.ttft_s is None else self.ttft_s * 1e3
 
     @property
     def ttft_cold_ms(self) -> float | None:
-        if self.chunk_step is None:
-            return None
-        return (self.slot_wait_s + self.prefill_wait_s + self.cold_prefill_s) * 1e3
+        return None if self.ttft_cold_s is None else self.ttft_cold_s * 1e3
 
     def throughput(self, a: float) -> float | None:
         """Output tokens per second and per instance."""
@@ -187,35 +266,98 @@ def build_perf_model(ctx: RuleContext, state: dict[str, Any]) -> tuple[p.PerfMod
         experts_per_tok, n_experts, routed_bpp = 0, 0, 0.0
     dense = max(perf.active_params_per_output_token - routed_active, 0.0)
     kv_bpt, kv_note = kv_bytes_per_token_per_gpu(ctx, state)
+    tp = ctx.request.gpus_per_instance
+    attn_full, attn_sparse, attn_tokens, attn_note = attention_cost(ctx)
+    nvlink = gpu.bandwidth.nvlink_gpu_to_gpu_tb_s
+    allreduce = nvlink * 1e12 / 2 * h("perf_nvlink_efficiency") if nvlink and tp > 1 else None
+    drafter, drafter_note = drafter_fraction(ctx, state)
     m = p.PerfModel(
-        tp=ctx.request.gpus_per_instance,
+        tp=tp,
         hbm_bytes_per_s=gpu.bandwidth.hbm_tb_s * 1e12 * h("perf_hbm_efficiency"),
         flops_per_s=gpu.compute.dense_tflops[perf.compute_dtype] * 1e12 * h("perf_mfu"),
         overhead_s=arch.num_hidden_layers * h("perf_overhead_per_layer_ms") * 1e-3,
         active_params_decode=perf.active_params_per_output_token,
         active_params_prefill=perf.active_params_per_prompt_token or perf.active_params_per_output_token,
         dense_params=dense, dense_bytes_per_param=perf.dense_bytes_per_param,
-        routed_params=routed, routed_bytes_per_param=routed_bpp,
+        routed_params=routed, routed_active_params=routed_active, routed_bytes_per_param=routed_bpp,
         experts_per_tok=experts_per_tok, n_experts=n_experts, kv_bytes_per_token_per_gpu=kv_bpt,
+        attn_full_flops=attn_full, attn_sparse_flops=attn_sparse, attn_sparse_tokens=attn_tokens,
+        hidden_size=arch.hidden_size, num_layers=arch.num_hidden_layers, allreduce_bytes_per_s=allreduce,
+        mixed_overhead_factor=h("perf_mixed_step_overhead_factor"),
+        per_seq_overhead_s=h("perf_overhead_per_seq_us") * 1e-6, drafter_fraction=drafter,
     )
     notes = [
-        f"Modèle de latence : {gpu.display_name} à {gpu.bandwidth.hbm_tb_s:g} To/s × {h('perf_hbm_efficiency'):g} et"
-        f" {fmt_int(gpu.compute.dense_tflops[perf.compute_dtype])} TFLOPS {perf.compute_dtype} × {h('perf_mfu'):g},"
-        + f" surcoût fixe {m.overhead_s * 1e3:.1f} ms par step ({arch.num_hidden_layers} couches × {h('perf_overhead_per_layer_ms'):g} ms)."
+        f"Modèle de latence : somme des opérateurs du step, chacun borné par son roofline (lecture mémoire ou calcul),"
+        f" sur {gpu.display_name} à {gpu.bandwidth.hbm_tb_s:g} To/s × {h('perf_hbm_efficiency'):g} et"
+        f" {fmt_int(gpu.compute.dense_tflops[perf.compute_dtype])} TFLOPS {perf.compute_dtype} × {h('perf_mfu'):g}."
+        f" Surcoût fixe {m.overhead_s * 1e3:.1f} ms par step ({arch.num_hidden_layers} couches ×"
+        f" {h('perf_overhead_per_layer_ms'):g} ms, × {m.mixed_overhead_factor:g} sur un step mixte prefill + decode),"
+        f" plus {h('perf_overhead_per_seq_us'):g} µs par séquence."
         f" Poids lus par step : {dense / 1e9:.1f} G paramètres non routés"
         + (f" + la part des {routed / 1e9:.0f} G paramètres d'experts routés touchée par au moins un token." if routed else ".")
-        + f" KV : {kv_note}.",
+        + f" KV : {kv_note}. Attention : {attn_note}."
+        + (f" All-reduce TP : 2 par couche sur NVLink à {nvlink / 2:g} To/s par sens × {h('perf_nvlink_efficiency'):g}."
+           if allreduce else (" All-reduce TP : volume non modélisé (débit NVLink inconnu)." if tp > 1 else ""))
+        + (f" Drafter : {drafter_note}." if drafter_note else ""),
     ]
-    if ctx.model.kv_cache.bytes_per_token is not None and any(
-            kind in ("sparse", "compressed_sparse", "sparse_dsa", "indexed_sparse") for kind in arch.attention):
+    if ctx.model.kv_cache.bytes_per_token is not None and set(arch.attention) & SPARSE_ATTENTION:
         notes.append("Attention sparse : le modèle suppose la lecture de tout le contexte en decode (borne haute).")
     return m, notes
 
 
+SPARSE_ATTENTION = {"sparse", "compressed_sparse", "sparse_dsa", "indexed_sparse", "sparse_qsa"}
+PARALLEL_DRAFTERS = {"dspark", "dflash"}
+FREE_DRAFTERS = {"ngram", "ngram_gpu", "suffix"}
+
+
+def attention_cost(ctx: RuleContext) -> tuple[float, float, float, str]:
+    """Attention FLOPs per query token: (per context token, per selected token, selected tokens, explanation).
+
+    QKᵀ and PV cost 2 × heads × (d_qk + d_v) FLOPs per (query, key) pair and per softmax layer (linear attention
+    layers have no context term). A sparse attention attends in full to top-k + sliding window tokens and runs an
+    indexer over the whole context, at `perf_sparse_indexer_cost_ratio` of a full pair. Values set in the
+    performance block of the model override the derivation."""
+    model = ctx.model
+    perf, arch, raw = model.performance, model.architecture, model.architecture.raw
+    if perf is not None and perf.attention_flops_per_context_token is not None:
+        return (perf.attention_flops_per_context_token, perf.attention_sparse_flops_per_token or 0.0,
+                float(perf.attention_sparse_tokens or 0), "valeurs du bloc performance du catalogue")
+    heads = arch.num_attention_heads
+    fallback = arch.head_dim or arch.hidden_size // heads
+    d_qk = raw.get("qk_head_dim") or ((raw.get("qk_nope_head_dim") or 0) + (raw.get("qk_rope_head_dim") or 0)) or fallback
+    d_v = raw.get("v_head_dim") or fallback
+    pair = 2.0 * heads * (d_qk + d_v)
+    layers = raw.get("sparse_attention_layers") or raw.get("full_attention_layers") or arch.num_hidden_layers
+    shape = (f"{layers} couches × 2 × {heads} têtes × ({d_qk} + {d_v}) = {pair * layers / 1e6:.1f} MFLOP par paire"
+             " (requête, token de contexte), dérivé de config.json")
+    if set(arch.attention) & SPARSE_ATTENTION:
+        topk = raw.get("index_topk") or raw.get("indexer_budget")
+        if topk:
+            window = raw.get("sliding_window") or 0
+            ratio = ctx.heuristic("perf_sparse_indexer_cost_ratio").value
+            return (layers * pair * ratio, layers * pair, float(topk + window),
+                    f"sparse, {shape} sur {topk + window} tokens sélectionnés + indexeur sur tout le contexte à"
+                    f" {ratio:g} paire (🔶)")
+        return layers * pair, 0.0, 0.0, f"sparse sans top-k connu, compté dense (borne haute) : {shape}"
+    return layers * pair, 0.0, 0.0, f"dense, {shape}"
+
+
+def drafter_fraction(ctx: RuleContext, state: dict[str, Any]) -> tuple[float, str | None]:
+    """Cost of the drafter pass as a fraction of a target decode step."""
+    k, method = state.get("num_speculative_tokens") or 0, state.get("spec_method")
+    if not k or not method or method in FREE_DRAFTERS:
+        return 0.0, None
+    h = ctx.heuristic("perf_drafter_step_fraction").value
+    if method in PARALLEL_DRAFTERS:
+        return h["parallel"], f"{method}, une passe par step ≈ {h['parallel']:.0%} d'un step de decode (🔶)"
+    value = h["autoregressive_per_token"] * k
+    return value, f"{method}, {k} passes par step ≈ {value:.0%} d'un step de decode (🔶)"
+
+
 # --- Evaluation of one operating point ---------------------------------------
 
-def evaluate(env: Env, pt: Point, inflight: int | None = None) -> Evaluation:
-    """Evaluate an operating point. `inflight` forces the in-flight requests per instance (test steps)."""
+def _load(env: Env, pt: Point, inflight: int | None) -> tuple[int | None, int, float, float, float, float | None]:
+    """(requests per instance, active sequences, prefill capacity per step, arrivals per step, prefill load, KV usage)."""
     wl = env.wl
     if inflight is not None:
         per_instance = inflight
@@ -225,9 +367,14 @@ def evaluate(env: Env, pt: Point, inflight: int | None = None) -> Evaluation:
     capacity = pt.budget - active * env.d
     # Régime stable : S·a/OSL requêtes finissent par step et sont remplacées (§3.1), longueurs moyennes.
     arrivals = active * env.a / env.osl_mean
-    demand = arrivals * env.isl_eff_mean
-    rho = math.inf if capacity <= 0 else demand / capacity
+    rho = math.inf if capacity <= 0 else arrivals * env.isl_eff_mean / capacity
     kv_usage = active * env.context_tokens / env.kv_tokens if env.kv_tokens else None
+    return per_instance, active, capacity, arrivals, rho, kv_usage
+
+
+def evaluate(env: Env, pt: Point, inflight: int | None = None) -> Evaluation:
+    """Evaluate an operating point. `inflight` forces the in-flight requests per instance (test steps)."""
+    per_instance, active, capacity, arrivals, rho, kv_usage = _load(env, pt, inflight)
     ev = Evaluation(point=pt, per_instance=per_instance, active=active, capacity=capacity, rho=rho,
                     kv_usage=kv_usage, slot_wait_s=0.0)
     m = env.model
@@ -236,50 +383,107 @@ def evaluate(env: Env, pt: Point, inflight: int | None = None) -> Evaluation:
 
     tokens_per_seq = env.k + 1
     ctx_tokens = env.context_tokens
+    pf_ctx = env.prefill_context
     chunk = capacity if active <= 1 else min(pt.threshold, capacity)
     decode = p.step_time(m, active, tokens_per_seq, ctx_tokens, 0)
-    average = p.step_time(m, active, tokens_per_seq, ctx_tokens, min(rho, 1.0) * capacity)
+    average = p.step_time(m, active, tokens_per_seq, ctx_tokens, min(rho, 1.0) * capacity, pf_ctx)
 
-    # Part des steps qui portent du prefill ; au-delà de 5 %, l'ITL p95 est celle d'un step chargé.
-    steps_per_prefill = math.ceil(env.isl_eff_mean / chunk) if env.isl_eff_mean >= 1 else 0
-    share = min(1.0, arrivals * steps_per_prefill)
-    if share >= 0.05:
-        in_step = rho * capacity / share if share else 0.0
-        p95_prefill = min(capacity, max(min(env.isl_eff_p95, chunk), in_step))
+    # Prefills en cours dans un step : Poisson de moyenne arrivées × steps de prefill par requête (loi de Little ;
+    # chaque requête occupe au moins un step, les longues un par morceau), chacun apportant en moyenne τ tokens. L'ITL p95
+    # est celle du step au 95e centile de ce nombre (0 si moins de 5 % des steps portent du prefill).
+    steps_per_prefill = sum(prob * max(1, math.ceil(u / chunk)) for prob, u, _ in env.dist)
+    in_progress = arrivals * steps_per_prefill
+    n95 = _poisson_quantile(in_progress, 0.95)
+    if n95:
+        tau = min(chunk, env.isl_eff_mean / steps_per_prefill) if steps_per_prefill else chunk
+        p95_prefill = min(capacity, max(min(env.isl_eff_p95, chunk), n95 * tau))
     else:
         p95_prefill = 0.0
-    loaded = p.step_time(m, active, tokens_per_seq, ctx_tokens, p95_prefill)
+    loaded = p.step_time(m, active, tokens_per_seq, ctx_tokens, p95_prefill, pf_ctx)
 
-    chunk_step = p.step_time(m, active, tokens_per_seq, ctx_tokens, min(capacity, max(chunk, min(rho, 1.0) * capacity)))
+    chunk_step = p.step_time(m, active, tokens_per_seq, ctx_tokens, min(capacity, max(chunk, min(rho, 1.0) * capacity)),
+                             pf_ctx)
     slot_wait = 0.0
     if per_instance and per_instance > pt.max_num_seqs:
         duration = env.osl_mean / env.a * average.seconds
         slot_wait = (per_instance - pt.max_num_seqs) / pt.max_num_seqs * duration
-    service = env.isl_eff_mean / capacity * average.seconds
-    prefill_wait = p.md1_wait(rho, service)
-    own = max(1, math.ceil(env.isl_eff_p95 / chunk)) * chunk_step.seconds
-    cold = max(1, math.ceil(env.isl_cold / chunk)) * chunk_step.seconds
+
+    # Attente avant prefill : M/G/c. Une requête en prefill occupe le budget pendant n = ⌈U / morceau⌉ steps, en y
+    # prenant τ tokens en moyenne (une petite requête ne prend que ses tokens, le reste sert les suivantes) : le budget
+    # mène de front c = capacité / τ prefills. Service = n steps, de variance celle de n (requêtes froides comprises).
+    second = sum(prob * max(1, math.ceil(u / chunk)) ** 2 for prob, u, _ in env.dist)
+    scv = max(second / steps_per_prefill**2 - 1.0, 0.0) if steps_per_prefill else 0.0
+    tau = min(chunk, env.isl_eff_mean / steps_per_prefill) if steps_per_prefill else chunk
+    servers = max(1, math.floor(capacity / max(tau, 1.0)))
+    p_wait, wait_scale = p.mgc_wait(rho, servers, steps_per_prefill * average.seconds, scv)
+    wait_p95 = wait_scale * math.log(p_wait / 0.05) if p_wait > 0.05 else 0.0
+
+    cs = chunk_step.seconds
+
+    def own_prefill(u: float, isl: float) -> float:
+        # Morceaux au rythme d'un step chargé (contexte moyen du prefill), corrigés du contexte propre au prompt.
+        correction = p.prefill_attention_seconds(m, u, isl - u / 2) - p.prefill_attention_seconds(m, u, pf_ctx)
+        return max(max(1, math.ceil(u / chunk)) * cs + correction, cs)
+
+    # Frontal : requêtes et sorties streamées par seconde au rythme du step moyen.
+    front = env.frontend_at(arrivals / average.seconds, active / average.seconds)
+    front_wait = (front.loop_wait_s + front.pool_wait_s) if front else 0.0
+
+    # Une requête arrive en cours de step : elle attend en moyenne un demi-step avant d'être ordonnancée.
+    fixed = slot_wait + 0.5 * average.seconds + front_wait
+    per_flop = m.prefill_factor / (m.tp * m.flops_per_s)
+    points = [(prob, fixed + env.frontend_s(isl) + max(max(1, math.ceil(u / chunk)) * cs + corr * per_flop, cs))
+              for (prob, u, isl), corr in zip(env.dist, env.attn_correction_flops)]
+    ttft = math.inf if math.isinf(front_wait) else p.quantile_of_sum(0.95, points, p_wait, wait_scale)
+    u95 = env.isl_eff_p95
+    isl95 = next((isl for prob, u, isl in env.dist if u >= u95), env.isl_cold)
+    cold = (fixed + env.frontend_s(env.isl_cold) + own_prefill(env.isl_cold, env.isl_cold)
+            + (p_wait * wait_scale if not math.isinf(wait_scale) else math.inf))
     return replace(ev, decode=decode, loaded=loaded, average=average, chunk=chunk, chunk_step=chunk_step,
-                   slot_wait_s=slot_wait, prefill_wait_s=prefill_wait, own_prefill_s=own, cold_prefill_s=cold)
+                   slot_wait_s=slot_wait, servers=servers, p_wait=p_wait,
+                   prefill_wait_s=p_wait * wait_scale if not math.isinf(wait_scale) else math.inf,
+                   prefill_wait_p95_s=wait_p95, own_prefill_s=own_prefill(u95, isl95),
+                   frontend_s=env.frontend_s(isl95) + front_wait, frontend=front, ttft_s=ttft, ttft_cold_s=cold,
+                   tpot_s=math.inf if front and front.gil_utilization >= 1 else average.seconds / env.a_low)
 
 
-def with_factor(env: Env, factor: float) -> Env:
-    if env.model is None or factor == 1.0:
+def _poisson_quantile(mean: float, q: float) -> int:
+    """Smallest n with P(N ≤ n) ≥ q for N ~ Poisson(mean)."""
+    if mean <= 0:
+        return 0
+    if mean > 50:  # approximation normale (exp(−mean) sous-déborderait)
+        return math.ceil(mean + f.normal_ppf(q) * math.sqrt(mean))
+    term = cdf = math.exp(-mean)
+    n = 0
+    while cdf < q and n < 10_000:
+        n += 1
+        term *= mean / n
+        cdf += term
+    return n
+
+
+def with_factor(env: Env, which: int) -> Env:
+    """The environment at the optimistic (0) or pessimistic (1) end of the model uncertainty."""
+    if env.model is None:
         return env
-    return replace(env, model=env.model.calibrated(env.model.calibration * factor))
+    decode, prefill = env.spread[which], env.spread_prefill[which]
+    if decode == 1.0 and prefill == 1.0:
+        return env
+    return replace(env, model=env.model.scaled(decode, prefill))
 
 
 def evaluate_range(env: Env, pt: Point, inflight: int | None = None) -> tuple[Evaluation, Evaluation, Evaluation]:
     """(central, optimistic, pessimistic) evaluations under the model uncertainty."""
-    return (evaluate(env, pt, inflight), evaluate(with_factor(env, env.spread[0]), pt, inflight),
-            evaluate(with_factor(env, env.spread[1]), pt, inflight))
+    return (evaluate(env, pt, inflight), evaluate(with_factor(env, 0), pt, inflight),
+            evaluate(with_factor(env, 1), pt, inflight))
 
 
 def gen_latency_ms(env: Env, ev: Evaluation) -> float | None:
-    """The generation latency the SLO is about: ITL (one loaded step) or TPOT (mean step / a)."""
+    """The generation latency the SLO is about: ITL p95 (one loaded step) or TPOT p95 (mean step / a of the 5 %
+    least accepted requests)."""
     if ev.loaded is None:
         return None
-    return ev.loaded.ms if env.metric == "itl" else ev.average.ms / env.a
+    return ev.itl_ms if env.metric == "itl" else ev.tpot_ms
 
 
 # --- Checks -------------------------------------------------------------------
@@ -317,8 +521,8 @@ def checks_for(env: Env, ev: Evaluation, observed=None) -> list[SloCheck]:
     ctx = env.ctx
     slo = ctx.request.slo
     inflight = ev.per_instance if ev.per_instance is not None else None
-    lo = evaluate(with_factor(env, env.spread[0]), ev.point, inflight) if env.model else ev
-    hi = evaluate(with_factor(env, env.spread[1]), ev.point, inflight) if env.model else ev
+    lo = evaluate(with_factor(env, 0), ev.point, inflight) if env.model else ev
+    hi = evaluate(with_factor(env, 1), ev.point, inflight) if env.model else ev
     rho_max = ctx.heuristic("prefill_load_max").value
     kv_max = ctx.heuristic("kv_usage_max").value
     out: list[SloCheck] = []
@@ -365,7 +569,10 @@ def checks_for(env: Env, ev: Evaluation, observed=None) -> list[SloCheck]:
             f" Step chargé ≈ {_ms(ev.loaded.ms)} ({ev.active} séquences × {env.k + 1} tokens vérifiés + prefill),"
             f" decode pur ≈ {_ms(ev.decode.ms)}, borné par la "
             + ("mémoire (lecture des poids et du KV)." if ev.loaded.bound == "memory" else "puissance de calcul.")
-            + (f" ITL = un step ; TPOT = step moyen / a ≈ {_ms(ev.average.ms / env.a)} avec a = {env.a:g}." if env.k else "")
+            + (f" Le step chargé se décompose en {_ops_text(ev.loaded)}." if ev.loaded.ops else "")
+            + (f" ITL = un step ; TPOT p95 = step moyen {_ms(ev.average.ms)} / a des 5 % de requêtes les moins acceptées"
+               f" ({env.a_low:.2f}, pour a moyen = {env.a:g}) ≈ {_ms(ev.tpot_ms)}." if env.k else
+               f" TPOT p95 = step moyen ≈ {_ms(ev.tpot_ms)}.")
         )
         out.append(SloCheck(key="itl", label=gen_label, status=status, target=slo.itl_p95_ms,
                             estimate=None if central is None else round(central, 1),
@@ -377,10 +584,14 @@ def checks_for(env: Env, ev: Evaluation, observed=None) -> list[SloCheck]:
         status = (_measured_status(ttft_measured, slo.ttft_p95_ms) if ttft_measured
                   else _status(lo.ttft_ms, hi.ttft_ms, slo.ttft_p95_ms))
         detail = "Pas de modèle de latence." if ev.chunk_step is None else (
-            f"Plage {_range_text(lo.ttft_ms, hi.ttft_ms)}. Attente d'une place {_ms(ev.slot_wait_s * 1e3)}"
-            f" + attente du prefill {_ms(ev.prefill_wait_s * 1e3)}"
-            f" + prefill de {fmt_int(env.isl_eff_p95)} tokens non cachés (ISL P95 × (1 − {env.hit:.3f}))"
-            f" en morceaux de {fmt_int(ev.chunk)} : {_ms(ev.own_prefill_s * 1e3)}."
+            f"Plage {_range_text(lo.ttft_ms, hi.ttft_ms)} (incertitude du prefill ×{env.spread_prefill[0]:g} à"
+            f" ×{env.spread_prefill[1]:g}). 95e centile de la somme frontal + attente d'une place + attente du prefill"
+            f" + prefill du prompt, sur la distribution des tokens non cachés ({env.cold_fraction:.1%} de requêtes"
+            f" froides prefillées en entier, hit effectif {env.hit_effective:.1%}). Composantes au p95 : frontal"
+            f" {_ms(ev.frontend_s * 1e3)}, attente d'une place {_ms(ev.slot_wait_s * 1e3)}, attente du prefill"
+            f" {_ms(ev.prefill_wait_p95_s * 1e3)} (moyenne {_ms(ev.prefill_wait_s * 1e3)}, file M/G/{ev.servers},"
+            f" {ev.p_wait:.0%} des requêtes attendent), prefill de {fmt_int(env.isl_eff_p95)} tokens non cachés en"
+            f" morceaux de {fmt_int(ev.chunk)} : {_ms(ev.own_prefill_s * 1e3)}."
         )
         out.append(SloCheck(key="ttft", label="TTFT p95", status=status, target=slo.ttft_p95_ms,
                             estimate=None if ev.ttft_ms is None else round(ev.ttft_ms, 1),
@@ -393,8 +604,29 @@ def checks_for(env: Env, ev: Evaluation, observed=None) -> list[SloCheck]:
                 status=_status(lo.ttft_cold_ms, hi.ttft_cold_ms, slo.ttft_p95_ms), target=slo.ttft_p95_ms,
                 estimate=round(ev.ttft_cold_ms, 1), estimate_low=round(lo.ttft_cold_ms, 1),
                 estimate_high=round(hi.ttft_cold_ms, 1), unit="ms", in_verdict=False,
-                detail=(f"Cas pire, hors verdict : préfixe évincé du cache (session reprise après une longue pause),"
-                        f" {fmt_int(env.isl_cold)} tokens à recalculer en {math.ceil(env.isl_cold / ev.chunk)} morceaux."),
+                detail=(f"Cas pire, hors verdict (les requêtes froides sont déjà dans le TTFT p95, à leur fréquence) :"
+                        f" prompt ISL P95 entièrement hors cache, {fmt_int(env.isl_cold)} tokens à recalculer en"
+                        f" {math.ceil(env.isl_cold / ev.chunk)} morceaux, attention sur tout le prompt comprise."),
+            ))
+    front = ev.frontend
+    if env.model is not None and ev.loaded is not None:
+        if front is None:
+            out.append(SloCheck(key="frontend", label="Frontal API (CPU)", status="unknown", unit="%",
+                                detail="Frontend Rust : coût CPU non modélisé, comparer les deux frontends sur un palier."))
+        else:
+            umax = env.frontend_costs.utilization_max
+            util = front.utilization
+            shares = ", ".join(f"{name} {share:.0%}" for name, share in front.gil_share.items())
+            out.append(SloCheck(
+                key="frontend", label="Frontal API (CPU, frontend Python)",
+                status="ko" if front.saturated else ("at_risk" if util > umax else "ok"),
+                target=umax * 100, estimate=None if math.isinf(util) else round(util * 100, 1), unit="%",
+                detail=(f"{front.api_servers} processus API × {front.workers} thread(s) de renderer pour"
+                        f" {fmt_int(front.requests_per_s)} requêtes/s et {fmt_int(front.chunks_per_s)} sorties streamées/s :"
+                        f" GIL de chaque processus à {front.gil_utilization:.0%} ({shares}), pool du renderer à"
+                        f" {front.pool_utilization:.0%}, ~{front.cores:.1f} cœur(s). Attentes : {_ms(front.loop_wait_p95_s * 1e3)}"
+                        f" au p95 sur le GIL (ajoutées à l'ITL), {_ms(front.pool_wait_s * 1e3)} en moyenne pour le rendu du"
+                        " prompt (ajoutées au TTFT). Coûts CPU supposés (🔶)."),
             ))
     return out
 
@@ -404,8 +636,56 @@ def worst(checks: list[SloCheck]) -> CheckStatus:
     return max(statuses, key=RANK.get) if statuses else "unknown"
 
 
+def _structural_ok(env: Env, pt: Point, per_instance: int | None, rho: float, kv_usage: float | None) -> bool:
+    """KV, prefill load and sequence slots all « ok »."""
+    if kv_usage is not None and kv_usage > env.ctx.heuristic("kv_usage_max").value:
+        return False
+    if rho >= 1 or rho > env.ctx.heuristic("prefill_load_max").value:
+        return False
+    return not (per_instance is not None and per_instance > pt.max_num_seqs and not env.ctx.request.slo.ttft_p95_ms)
+
+
+def _latency_ok(env: Env, hi: Evaluation) -> bool:
+    """Pessimistic generation latency and TTFT within their targets (or not estimated)."""
+    slo = env.ctx.request.slo
+    if hi.loaded is None:
+        return True
+    if slo.itl_p95_ms and gen_latency_ms(env, hi) > slo.itl_p95_ms:
+        return False
+    return not (slo.ttft_p95_ms and hi.ttft_ms is not None and hi.ttft_ms > slo.ttft_p95_ms)
+
+
+def _frontend_ok(env: Env, ev: Evaluation) -> bool:
+    """Frontend (central estimate) under its utilization threshold, or not modelled."""
+    front = ev.frontend
+    return front is None or env.frontend_costs is None or front.utilization <= env.frontend_costs.utilization_max
+
+
 def passes(env: Env, ev: Evaluation) -> bool:
-    return worst(checks_for(env, ev)) == "ok"
+    """worst(checks_for(env, ev)) == "ok", evaluating only the pessimistic end (what « ok » requires)."""
+    if not _structural_ok(env, ev.point, ev.per_instance, ev.rho, ev.kv_usage):
+        return False
+    if env.model is None or ev.loaded is None:
+        return True
+    return _frontend_ok(env, ev) and _latency_ok(env, evaluate(with_factor(env, 1), ev.point, ev.per_instance))
+
+
+def frontend_changes(env: Env, ev: Evaluation) -> dict[str, Any]:
+    """Frontend flags of an operating point found with a re-sized frontend, when they differ from the config."""
+    front, changes = ev.frontend, {}
+    if front is None:
+        return changes
+    if front.api_servers != env.api_servers:
+        changes["--api-server-count"] = front.api_servers
+    if front.workers != env.renderer_workers:
+        changes["--renderer-num-workers"] = front.workers
+    return changes
+
+
+def _ops_text(step: p.StepTime) -> str:
+    labels = {"dense": "poids denses", "experts": "experts", "attention": "attention", "allreduce": "all-reduce TP",
+              "fixed": "surcoûts fixes", "drafter": "drafter"}
+    return ", ".join(f"{labels.get(key, key)} {_ms(value * 1e3)}" for key, value in step.ops.items() if value > 0)
 
 
 # --- Search -------------------------------------------------------------------
@@ -440,9 +720,15 @@ def candidate_points(env: Env, base: Point, instances: int) -> list[Point]:
 def best_point(env: Env, points: list[Point], base: Point) -> tuple[Point, Evaluation] | None:
     """Among the points that pass every check: fewest parameter changes from the base, then highest throughput."""
     best = None
+    pessimistic = with_factor(env, 1)
     for pt in points:
+        per_instance, _, capacity, _, rho, kv_usage = _load(env, pt, None)
+        if not _structural_ok(env, pt, per_instance, rho, kv_usage):
+            continue
+        if env.model is not None and capacity > 0 and not _latency_ok(env, evaluate(pessimistic, pt)):
+            continue
         ev = evaluate(env, pt)
-        if not passes(env, ev):
+        if not _frontend_ok(env, ev):
             continue
         changed = sum((pt.max_num_seqs != base.max_num_seqs, pt.budget != base.budget, pt.threshold != base.threshold))
         tput = ev.throughput(env.a) or ev.active
@@ -517,14 +803,15 @@ def diagnose(env: Env, base: Point, ev: Evaluation, checks: list[SloCheck]) -> t
                 addresses=["kv_capacity"],
             ))
 
-    if bad("prefill_load") or (bad("ttft") and ev.prefill_wait_s >= max(ev.slot_wait_s, ev.own_prefill_s)):
+    if bad("prefill_load") or (bad("ttft") and ev.prefill_wait_p95_s >= max(ev.slot_wait_s, ev.own_prefill_s, ev.frontend_s)):
         bottlenecks.append(Bottleneck(
             key="prefill", label="Prefill (débit du budget de tokens)", status=by["prefill_load"].status if bad("prefill_load") else by["ttft"].status,
             explanation=(
                 "Le prefill non caché arrive plus vite que le budget ne peut l'absorber : les requêtes attendent avant leur premier"
                 " token et la file grandit." if ev.rho >= 1 else
-                f"Le budget de prefill est chargé à {ev.rho:.0%} : l'attente avant prefill ({_ms(ev.prefill_wait_s * 1e3)})"
-                " domine le TTFT."
+                f"Le budget de prefill est chargé à {ev.rho:.0%} : l'attente avant prefill ({_ms(ev.prefill_wait_p95_s * 1e3)}"
+                " au p95) domine le TTFT. Les prompts froids, longs, occupent les voies de prefill (file M/G/c à forte"
+                " variance)."
             ),
         ))
         recos.append(Recommendation(
@@ -540,7 +827,8 @@ def diagnose(env: Env, base: Point, ev: Evaluation, checks: list[SloCheck]) -> t
         ))
 
     if bad("ttft") and ev.chunk_step is not None:
-        parts = {"slots": ev.slot_wait_s, "prefill": ev.prefill_wait_s, "chunks": ev.own_prefill_s}
+        parts = {"slots": ev.slot_wait_s, "prefill": ev.prefill_wait_p95_s, "chunks": ev.own_prefill_s,
+                 "frontend": ev.frontend_s}
         main = max(parts, key=parts.get)
         if main == "slots":
             bottlenecks.append(Bottleneck(
@@ -548,12 +836,28 @@ def diagnose(env: Env, base: Point, ev: Evaluation, checks: list[SloCheck]) -> t
                 explanation=(f"{ev.per_instance - base.max_num_seqs} requêtes par instance attendent une place :"
                              f" {_ms(ev.slot_wait_s * 1e3)} d'attente, l'essentiel du TTFT."),
             ))
+        elif main == "frontend":
+            bottlenecks.append(Bottleneck(
+                key="frontend", label="Frontal (HTTP, routage, tokenisation)", status=by["ttft"].status,
+                explanation=(f"Avant le GPU, ≈ {_ms(ev.frontend_s * 1e3)} par prompt au p95 (tokenisation, chat template,"
+                             " passage par l'EPP) : comparer le TTFT client au TTFT serveur (vllm:time_to_first_token_seconds)."),
+            ))
         elif main == "chunks":
             bottlenecks.append(Bottleneck(
                 key="prefill_chunks", label="Prefill d'une longue requête (seuil de long prefill)", status=by["ttft"].status,
-                explanation=(f"Le prompt P95 ({fmt_int(env.isl_eff_p95)} tokens non cachés) est découpé en morceaux de"
-                             f" {fmt_int(ev.chunk)} : {math.ceil(env.isl_eff_p95 / ev.chunk)} steps de {_ms(ev.chunk_step.ms)}."),
+                explanation=(f"Le p95 des tokens à prefiller ({fmt_int(env.isl_eff_p95)} tokens non cachés"
+                             + (f", tiré par les {env.cold_fraction:.1%} de requêtes froides" if env.cold_fraction else "")
+                             + f") est découpé en morceaux de {fmt_int(ev.chunk)} :"
+                             f" {max(1, math.ceil(env.isl_eff_p95 / ev.chunk))} steps de {_ms(ev.chunk_step.ms)}."),
             ))
+            if env.cold_fraction:
+                recos.append(Recommendation(
+                    kind="architecture", title="Réduire les requêtes froides",
+                    rationale=("Chaque requête dont le préfixe manque au cache recalcule tout son prompt : routage par affinité"
+                               " de session (EPP llm-d, prefix-cache-scorer), préfixe commun stable en tête, offload du KV"
+                               " des sessions en pause plutôt que leur éviction."),
+                    addresses=["prefill_chunks"],
+                ))
             if version_key(ctx.vllm.version) >= (0, 33, 0) and ctx.model.architecture.model_type.startswith("deepseek"):
                 recos.append(Recommendation(
                     kind="architecture", title="Prefill context parallel (PCP) pour les très longs prompts",
@@ -603,11 +907,280 @@ def diagnose(env: Env, base: Point, ev: Evaluation, checks: list[SloCheck]) -> t
                 explanation=(f"Le decode pur tient ({_ms(ev.decode.ms)}), mais les steps qui embarquent du prefill durent"
                              f" ≈ {_ms(ev.loaded.ms)} : un budget plus bas ou un seuil de long prefill plus bas lissent l'ITL."),
             ))
+    if bad("frontend") and ev.frontend is not None:
+        front, costs = ev.frontend, env.frontend_costs
+        main = max(front.gil_share, key=front.gil_share.get)
+        gil_bound = front.gil_utilization >= front.pool_utilization
+        bottlenecks.append(Bottleneck(
+            key="frontend_cpu", label="Frontal API (CPU du frontend Python)", status=by["frontend"].status,
+            explanation=(
+                (f"Le GIL de chaque processus API est occupé à {front.gil_utilization:.0%}, surtout par {main}"
+                 f" ({front.gil_share[main]:.0%}) : les sorties partent en retard (ITL) et les requêtes attendent leur rendu"
+                 " (TTFT). Seuls d'autres processus API (--api-server-count) le soulagent ; le pool du renderer n'y peut"
+                 " rien." if gil_bound else
+                 f"Le pool du renderer est occupé à {front.pool_utilization:.0%} : les requêtes attendent leur chat template"
+                 " et leur tokenisation, le TTFT monte. Plus de threads (--renderer-num-workers) pour la tokenisation, plus"
+                 " de processus API si le chat template domine.")
+            ),
+        ))
+        servers, workers = fe.size_frontend(costs, front.requests_per_s, front.chunks_per_s, env.isl_mean,
+                                            env.max_api_servers)
+        changes = {}
+        if servers > front.api_servers:
+            changes["--api-server-count"] = servers
+        if workers > front.workers:
+            changes["--renderer-num-workers"] = workers
+        if changes:
+            recos.append(Recommendation(
+                kind="param", title="Dimensionner le frontal : " + ", ".join(f"{k} {v}" for k, v in changes.items()),
+                rationale=(f"Ramène chaque GIL et chaque pool sous {costs.utilization_max:.0%}. Prévoir ~1 cœur par processus"
+                           " API en plus et vérifier la limite CPU du pod : un CPU bridé ralentit aussi les workers GPU."),
+                changes=changes, addresses=["frontend_cpu"],
+            ))
+        else:
+            recos.append(Recommendation(
+                kind="capacity", title="Plus de CPU par pod, ou plus d'instances",
+                rationale=(f"Le nombre de processus API est plafonné ({env.max_api_servers}) : au-delà, répartir la charge sur"
+                           " plus d'instances (chacune a son frontal) ou relever la limite CPU du pod."),
+                addresses=["frontend_cpu"],
+            ))
+        recos.append(Recommendation(
+            kind="architecture", title="Comparer le frontend Rust (VLLM_USE_RUST_FRONTEND=1)",
+            rationale=("Frontend multithread, sans GIL : --api-server-count n'y a plus de sens (vLLM le ramène à 1). Son coût"
+                       " CPU n'est pas modélisé ici : à mesurer en A/B sur le même palier, en vérifiant d'abord que tous"
+                       " les flags de la config sont acceptés (il refuse les flags inconnus)."),
+            addresses=["frontend_cpu"],
+        ))
     bottlenecks.sort(key=lambda b: -RANK[b.status])
     return bottlenecks, recos
 
 
 # --- Entry point ---------------------------------------------------------------
+
+def build_env(ctx: RuleContext, state: dict[str, Any], kv_tokens: int | None,
+              model: p.PerfModel | None) -> tuple[Env, list[str]]:
+    """Everything that does not change between operating points, including the distribution of the tokens to prefill."""
+    req, wl = ctx.request, ctx.request.workload
+    h = lambda key: ctx.heuristic(key).value  # noqa: E731
+    hit = state["prefix_cache_hit_rate"]
+    cap = state.get("max_model_len") or ctx.model.architecture.max_position_embeddings
+    quantile = f.lognormal_quantile_fn(wl.isl.p50, wl.isl.p95, wl.isl.p99, cap=cap)
+    shared = (req.routing.shared_prefix_tokens or 0) if req.routing else 0
+    cold_h = h("cold_request_fraction")
+    notes = []
+    probe, _ = f.uncached_distribution(quantile, 0.0, 0.0, 0.0)
+    mean_isl = sum(prob * isl for prob, isl, _ in probe)
+    mean_cold = sum(prob * max(isl - shared, 1.0) for prob, isl, _ in probe)
+    if hit <= 0:
+        cold = 1.0
+    elif wl.cold_request_fraction is not None:
+        cold = wl.cold_request_fraction
+    else:
+        # Défaut plafonné : les requêtes froides ne portent pas plus d'une part donnée du prefill non caché, sans quoi le
+        # hit rate déclaré serait intenable (les premiers tours de session sont souvent plus courts que la moyenne).
+        ceiling = cold_h["max_share_of_uncached_tokens"] * (1 - hit) * mean_isl / mean_cold if mean_cold else 0.0
+        cold = min(cold_h["value"], ceiling)
+        notes.append(
+            f"Requêtes froides (préfixe absent du cache : nouvelle session au-delà du préfixe commun, éviction, mauvais"
+            f" routage) : {cold:.1%} des requêtes, hypothèse 🔶 ({cold_h['value']:.0%}"
+            + (f", plafonnée pour que leur prefill ne dépasse pas {cold_h['max_share_of_uncached_tokens']:.0%} du prefill"
+               f" non caché d'un hit rate de {hit:.1%}" if cold < cold_h["value"] else "")
+            + "). Mesure : part des requêtes dont vllm:prefix_cache_hits est nul ; saisir « Part de requêtes froides »."
+        )
+    points, hit_eff = f.uncached_distribution(quantile, hit, cold if hit > 0 else 0.0, h("uncached_tokens_sigma"),
+                                              shared)
+    dist = tuple(f.collapse(points))
+    if hit > 0 and hit_eff < hit - 0.002:
+        notes.append(f"Les requêtes froides ({cold:.1%}) prefillent à elles seules plus que ne le permet le hit rate de"
+                     f" {hit:.1%} : hit effectif retenu {hit_eff:.1%} (prudent). Vérifier l'une des deux valeurs.")
+    k, a = state["num_speculative_tokens"], state["acceptance_length"]
+    a_low = f.acceptance_quantile(a, k, 0.05, h("acceptance_dispersion")) if k else 1.0
+    caps = frontend_caps(ctx, state)
+    costs = None if caps.rust else fe.FrontendCosts.from_heuristic(h("frontend_python"))
+    spread = tuple(ctx.heuristic("perf_uncertainty").value["uncalibrated"])
+    env = Env(
+        ctx=ctx, k=k, d=state["decode_tokens_per_seq"], a=a, hit=hit, kv_tokens=kv_tokens, model=model,
+        dspark_cap=bool(ctx.behavior("spec_decode.dspark_active_seq_cap").value) and state.get("spec_method") in ("dspark", "dflash"),
+        dist=dist, hit_effective=hit_eff, cold_fraction=cold if 0 < hit else 0.0, a_low=a_low,
+        frontend_costs=costs, api_servers=caps.api_servers, renderer_workers=caps.renderer_workers,
+        max_api_servers=caps.max_servers, spread=spread, spread_prefill=spread,
+    )
+    notes.append(
+        f"Tokens à prefiller par requête : moyenne {fmt_int(env.isl_eff_mean)}, p95 {fmt_int(env.isl_eff_p95)}, p99"
+        f" {fmt_int(f.quantile_of_points(list(dist), 0.99))} (ISL lognormale ajustée sur les percentiles"
+        + (f", {env.cold_fraction:.1%} de requêtes froides prefillées en entier, part non cachée des requêtes chaudes"
+           f" dispersée (σ = {h('uncached_tokens_sigma'):g}, sorties d'outils)" if 0 < hit else ", aucun cache")
+        + f"). L'ancien calcul ISL P95 × (1 − hit) donnait {fmt_int((wl.isl.p95 or wl.isl.p50) * (1 - hit))}."
+    )
+    if k:
+        notes.append(f"Longueur d'acceptation : moyenne a = {a:g}, {a_low:.2f} pour les 5 % de requêtes les moins acceptées"
+                     f" (dispersion entre requêtes, concentration {h('acceptance_dispersion'):g} 🔶) : c'est elle qui fixe le"
+                     " TPOT p95.")
+    if costs is None:
+        notes.append("Frontend Rust (VLLM_USE_RUST_FRONTEND=1) : son coût CPU n'est pas modélisé, le TTFT et l'ITL ne"
+                     " comptent ni le réseau, ni le rendu du prompt, ni l'attente du frontal.")
+    else:
+        notes.append(
+            f"Frontal Python : {fmt_int(costs.network_s * 1e3)} ms de réseau et d'EPP, puis par requête"
+            f" {costs.request_loop_s * 1e3:g} ms de boucle asyncio et {costs.render_s(1000) * 1e3 - costs.request_loop_s * 1e3:.2f} ms"
+            " par millier de tokens de prompt (JSON des messages, chat template, tokenisation) ; chaque sortie streamée"
+            f" coûte {costs.chunk_s * 1e6:g} µs de boucle (🔶). {caps.api_servers} processus API ×"
+            f" {caps.renderer_workers} thread(s) de renderer ; les attentes sur le GIL et le pool s'ajoutent au TTFT et à"
+            " l'ITL. Plus un demi-step d'attente de l'ordonnancement."
+        )
+    notes += caps.notes
+    return env, notes
+
+
+@dataclass(frozen=True)
+class FrontendCaps:
+    rust: bool
+    api_servers: int        # valeur en vigueur : décision de l'app, argument supplémentaire ou défaut vLLM
+    renderer_workers: int
+    max_servers: int        # plafond des processus API (frontend Rust, LoRA à chaud, Elastic EP, CPU du pod)
+    reasons: tuple[str, ...]
+    notes: tuple[str, ...] = ()
+
+
+def _truthy(value: object) -> bool:
+    return str(value).strip().lower() in ("1", "true", "yes", "on")
+
+
+def frontend_caps(ctx: RuleContext, state: dict[str, Any]) -> FrontendCaps:
+    """Frontend kind, values in force and ceiling of the API server processes for this deployment."""
+    req = ctx.request
+    extra = {(k if k.startswith("--") else "--" + k.lstrip("-")): v for k, v in req.extra_args.items()}
+    env_vars = {**state.get("env", {}), **req.extra_env}
+    rust = _truthy(env_vars.get("VLLM_USE_RUST_FRONTEND", "0"))
+    beh = ctx.behavior("frontend.api_servers").value
+    reasons: list[str] = []
+    max_servers = 64
+    if rust:
+        max_servers = 1
+        reasons.append("frontend Rust : vLLM ignore --api-server-count et le ramène à 1")
+    for name in beh.get("incompatible_env", []):
+        if _truthy(env_vars.get(name, "0")):
+            max_servers = 1
+            reasons.append(f"{name}=1 est incompatible avec plusieurs processus API")
+    if beh.get("elastic_ep_caps_to_one") and _truthy(extra.get("--enable-elastic-ep", False)):
+        max_servers = 1
+        reasons.append("Elastic EP plafonne vLLM à un processus API")
+    h = ctx.heuristic("frontend_python").value
+    tp = req.gpus_per_instance
+    if req.cpu_cores_per_instance:
+        spare = req.cpu_cores_per_instance - h["cores_engine_core"] - tp * h["cores_per_gpu_worker"]
+        cpu_cap = max(1, math.floor(spare))
+        if cpu_cap < max_servers:
+            max_servers = cpu_cap
+            reasons.append(f"{req.cpu_cores_per_instance:g} cœurs par instance, dont {h['cores_engine_core']:g} pour l'engine"
+                           f" core et {tp * h['cores_per_gpu_worker']:g} pour les workers GPU")
+    dp = state.get("data_parallel_size") or 1
+    servers = state.get("api_server_count") or (1 if rust else dp)
+    workers = state.get("renderer_num_workers") or ctx.default("renderer_num_workers") or 1
+    notes: list[str] = []
+    if "--api-server-count" in extra:
+        servers = 1 if rust else int(extra["--api-server-count"])
+        notes.append(f"--api-server-count {extra['--api-server-count']} forcé en argument supplémentaire : retenu par l'analyse.")
+    if "--renderer-num-workers" in extra:
+        workers = int(extra["--renderer-num-workers"])
+        notes.append(f"--renderer-num-workers {workers} forcé en argument supplémentaire : retenu par l'analyse.")
+    return FrontendCaps(rust=rust, api_servers=max(1, servers), renderer_workers=max(1, workers),
+                        max_servers=max_servers, reasons=tuple(reasons), notes=tuple(notes))
+
+
+CALIBRATION_BOUNDS = (0.2, 10.0)
+
+
+def calibrate(env: Env, base: Point, observed, uncertainty: dict) -> tuple[Env, float | None, float | None, list[str]]:
+    """Recalibrate the decode part on the measured ITL/TPOT p95 and the prefill part on the measured TTFT p95.
+
+    The step durations are linear in the two factors (the token counts do not depend on them), so the generation
+    latency is solved exactly. Without a TTFT measurement the prefill part takes the decode factor (same hardware)
+    but keeps the uncalibrated uncertainty. With both, the TTFT fixes the prefill factor and the decode factor is
+    solved again so that the generation latency still matches. Factors are kept within CALIBRATION_BOUNDS: beyond,
+    the gap does not come from the speed of the GPU but from the shape of the load. Returns (env, decode factor,
+    prefill factor, notes)."""
+    model = env.model
+    if model is None or not observed or not (observed.itl_p95_ms or observed.ttft_p95_ms):
+        return env, None, None, []
+    lo_bound, hi_bound = CALIBRATION_BOUNDS
+    notes: list[str] = []
+    decode = prefill = 1.0
+    calibration = calibration_prefill = None
+    spread, spread_prefill = env.spread, env.spread_prefill
+
+    def at(decode_factor: float, prefill_factor: float) -> Evaluation:
+        return evaluate(replace(env, model=model.calibrated(decode_factor, prefill_factor)), base)
+
+    def solve_decode(prefill_factor: float | None) -> float | None:
+        """Decode factor matching the measured generation latency (prefill_factor None: tied to it)."""
+        ev = at(1.0, 1.0 if prefill_factor is None else prefill_factor)
+        if ev.loaded is None:
+            return None
+        step = ev.loaded if env.metric == "itl" else ev.average
+        lag = ev.frontend.loop_wait_p95_s if (ev.frontend and env.metric == "itl") else 0.0
+        target = (observed.itl_p95_ms / 1e3 - lag) * (1.0 if env.metric == "itl" else env.a_low)
+        if prefill_factor is None:
+            factor = target / step.seconds
+        else:
+            factor = (target - (step.seconds - step.decode_s)) / step.decode_s if step.decode_s > 0 else lo_bound
+        return min(max(factor, lo_bound), hi_bound)
+
+    if observed.itl_p95_ms:
+        found = solve_decode(None)
+        if found:
+            decode = prefill = calibration = found
+            spread = tuple(uncertainty["calibrated"])
+    if observed.ttft_p95_ms:
+        current = at(decode, prefill).ttft_ms
+        if current is None or math.isinf(current):
+            notes.append("TTFT mesuré non exploité pour recaler le prefill : au point de la config, la file de prefill est"
+                         " instable dans le modèle (charge ≥ 100 %), le TTFT estimé est infini quel que soit le facteur.")
+        else:
+            lo, hi = lo_bound, hi_bound
+            for _ in range(40):
+                mid = math.sqrt(lo * hi)
+                value = at(decode, mid).ttft_ms
+                lo, hi = (mid, hi) if value is not None and value < observed.ttft_p95_ms else (lo, mid)
+            prefill = calibration_prefill = math.sqrt(lo * hi)
+            spread_prefill = tuple(uncertainty["calibrated"])
+            if observed.itl_p95_ms:
+                found = solve_decode(prefill)
+                if found:
+                    decode = calibration = found
+            reached = at(decode, prefill)
+            gap_ttft = reached.ttft_ms / observed.ttft_p95_ms if reached.ttft_ms else 1.0
+            gap_gen = (gen_latency_ms(env, reached) or observed.itl_p95_ms) / observed.itl_p95_ms if observed.itl_p95_ms else 1.0
+            if not (0.85 <= gap_ttft <= 1.15 and 0.85 <= gap_gen <= 1.15):
+                notes.append(
+                    f"Mesures non conciliables par la seule vitesse du GPU (au mieux, TTFT {reached.ttft_ms:.0f} ms pour"
+                    f" {observed.ttft_p95_ms:g} mesurés" + (f", latence de génération {gen_latency_ms(env, reached):.1f} ms"
+                                                            f" pour {observed.itl_p95_ms:g}" if observed.itl_p95_ms else "")
+                    + "). Dans le modèle, le TTFT ≈ morceaux × step chargé + frontal + attente, et le step chargé est"
+                    " fixé par la latence de génération : l'écart vient de la forme de la charge (requêtes froides, hit"
+                    " rate réel, file d'attente, rafales), pas du prefill. Le prefill n'est pas recalé (le TTFT mesuré"
+                    " prime pour le verdict) : mesurer le hit rate et la part de requêtes froides et les saisir."
+                )
+                if observed.itl_p95_ms and calibration is not None:
+                    decode = prefill = calibration = solve_decode(None)
+                elif not observed.itl_p95_ms:
+                    decode = prefill = 1.0
+                calibration_prefill, spread_prefill = None, env.spread_prefill
+    env = replace(env, model=model.calibrated(decode, prefill), spread=spread, spread_prefill=spread_prefill)
+    label = "ITL" if env.metric == "itl" else "TPOT"
+    if calibration is not None:
+        notes.append(
+            f"Partie decode recalée sur la {label} p95 mesurée ({observed.itl_p95_ms:g} ms) : × {calibration:.2f}."
+            + (" Écart important : vérifier que la mesure porte bien sur cette config." if not 0.5 <= calibration <= 2 else "")
+            + (" En TPOT, le facteur absorbe aussi l'erreur sur la longueur d'acceptation : saisir a mesuré."
+               if env.metric == "tpot" and env.k else "")
+        )
+    if calibration_prefill is not None:
+        notes.append(f"Partie prefill recalée sur le TTFT p95 mesuré ({observed.ttft_p95_ms:g} ms) : × {calibration_prefill:.2f}.")
+    elif calibration is not None:
+        notes.append("Partie prefill : même facteur que le decode (même matériel), incertitude non réduite faute de TTFT mesuré.")
+    return env, calibration, calibration_prefill, notes
+
 
 def analyze(ctx: RuleContext, state: dict[str, Any]) -> SloAnalysis:
     req = ctx.request
@@ -616,18 +1189,15 @@ def analyze(ctx: RuleContext, state: dict[str, Any]) -> SloAnalysis:
     if kv_note:
         notes.append(kv_note)
     uncertainty = ctx.heuristic("perf_uncertainty").value
-    env = Env(
-        ctx=ctx, k=state["num_speculative_tokens"], d=state["decode_tokens_per_seq"], a=state["acceptance_length"],
-        hit=state["prefix_cache_hit_rate"], kv_tokens=kv_tokens, model=model,
-        dspark_cap=bool(ctx.behavior("spec_decode.dspark_active_seq_cap").value) and state.get("spec_method") in ("dspark", "dflash"),
-        spread=tuple(uncertainty["uncalibrated"]),
-    )
+    env, dist_notes = build_env(ctx, state, kv_tokens, model)
+    notes += dist_notes
     base = Point(max_num_seqs=state["max_num_seqs"], budget=state["max_num_batched_tokens"],
                  threshold=state["long_prefill_token_threshold"], instances=req.num_instances)
     notes.append(
         "Convention vLLM (vllm/v1/metrics/stats.py) : l'ITL est l'intervalle entre deux sorties d'une requête, soit un step"
         " du scheduler, quel que soit le nombre de tokens de la sortie ; le TPOT divise la durée du decode par le nombre de"
-        " tokens. Avec le speculative decoding, l'ITL augmente un peu mais le TPOT est divisé par ~a."
+        " tokens. Avec le speculative decoding, l'ITL augmente un peu mais le TPOT est divisé par ~a (moins pour les"
+        " requêtes peu acceptées, qui font le TPOT p95)."
     )
     notes.append(
         f"Longueurs moyennes estimées d'après les percentiles : ISL {fmt_int(env.isl_mean)}, OSL {fmt_int(env.osl_mean)}"
@@ -636,19 +1206,9 @@ def analyze(ctx: RuleContext, state: dict[str, Any]) -> SloAnalysis:
     if not req.workload.target_concurrency:
         notes.append(f"Requêtes en vol non fournies : analyse à pleine charge ({base.max_num_seqs} séquences par instance).")
 
-    calibration = None
+    env, calibration, calibration_prefill, calib_notes = calibrate(env, base, req.observed_perf, uncertainty)
+    notes += calib_notes
     observed = req.observed_perf
-    if model is not None and observed and observed.itl_p95_ms:
-        raw = gen_latency_ms(env, evaluate(env, base))
-        if raw:
-            calibration = observed.itl_p95_ms / raw
-            env = replace(env, model=model.calibrated(calibration), spread=tuple(uncertainty["calibrated"]))
-            notes.append(
-                f"Modèle recalibré sur la {'ITL' if env.metric == 'itl' else 'TPOT'} p95 mesurée ({observed.itl_p95_ms:g} ms"
-                f" contre {raw:.1f} ms estimés) :"
-                f" toutes les durées × {calibration:.2f}." + (" Écart important : vérifier que la mesure porte bien sur cette config."
-                                                                 if not 0.5 <= calibration <= 2 else "")
-            )
 
     ev = evaluate(env, base)
     checks = checks_for(env, ev, observed)
@@ -665,10 +1225,12 @@ def analyze(ctx: RuleContext, state: dict[str, Any]) -> SloAnalysis:
             + " Valider en production avec les métriques de l'onglet Vérification.",
         ))
     else:
-        tune = best_point(env, candidate_points(env, base, base.instances), base)
+        # Le frontal se redimensionne point par point : un réglage ou des instances de plus n'en sont pas bloqués.
+        search = replace(env, frontend_autosize=True)
+        tune = best_point(search, candidate_points(search, base, base.instances), base)
         if tune is not None:
             pt, tev = tune
-            changes = changes_between(env, base, pt)
+            changes = changes_between(env, base, pt) | frontend_changes(env, tev)
             if changes:
                 recos.append(Recommendation(
                     kind="param", title="Réglage qui tient les SLO sans GPU supplémentaire : " + _describe(changes),
@@ -677,12 +1239,12 @@ def analyze(ctx: RuleContext, state: dict[str, Any]) -> SloAnalysis:
                 ))
         if req.workload.target_concurrency:
             tp = req.gpus_per_instance
-            scale = _scale_out(env, base)
-            wider = _wider_tp(env, base) if model is not None else None
+            scale = _scale_out(search, base)
+            wider = _wider_tp(search, base) if model is not None else None
             gpus_now = base.instances * tp
             if scale is not None:
                 n, pt, sev = scale
-                changes = {"instances": n, "GPU": n * tp} | changes_between(env, base, pt)
+                changes = {"instances": n, "GPU": n * tp} | changes_between(env, base, pt) | frontend_changes(env, sev)
                 costly = wider is not None and wider[0] * wider[1] < n * tp
                 recos.append(Recommendation(
                     kind="capacity",
@@ -700,9 +1262,9 @@ def analyze(ctx: RuleContext, state: dict[str, Any]) -> SloAnalysis:
                     title=f"Passer en TP{tp2} : {_instances(n2)} ({_gpus(n2 * tp2, gpus_now)})",
                     rationale=(_point_summary(env, ev2) + f" En TP{tp2}, chaque GPU lit deux fois moins de poids par step :"
                                " c'est le levier quand l'ITL est bornée par la lecture des poids. Hypothèses : même KV par"
-                               " instance (prudent) et même surcoût fixe par step (all-reduce plus large non modélisé)."),
+                               " instance (prudent), volume d'all-reduce recalculé, même latence fixe par couche."),
                     changes={"instances": n2, "GPU": n2 * tp2, "--tensor-parallel-size": tp2}
-                    | changes_between(env, base, pt2),
+                    | changes_between(env, base, pt2) | frontend_changes(env, ev2),
                     addresses=[b.key for b in bottlenecks],
                 ))
             if scale is None and wider is None and tune is None:
@@ -714,12 +1276,12 @@ def analyze(ctx: RuleContext, state: dict[str, Any]) -> SloAnalysis:
                 rationale="Sans elles, l'analyse suppose des instances pleines et ne peut pas chiffrer la capacité GPU à ajouter.",
             ))
         recos.extend(specific)
-    if model is not None and not (observed and observed.itl_p95_ms):
+    if model is not None and not (observed and observed.itl_p95_ms and observed.ttft_p95_ms):
         recos.append(Recommendation(
             kind="measure", title="Valider par paliers, puis saisir la latence mesurée pour recaler l'analyse",
             rationale=("Le modèle de latence est un ordre de grandeur (×"
-                       f"{env.spread[0]:g} à ×{env.spread[1]:g}) : suivre le plan de paliers et saisir la latence mesurée"
-                       " au palier de la config générée."),
+                       f"{env.spread[0]:g} à ×{env.spread[1]:g}) : suivre le plan de paliers et saisir la latence de"
+                       " génération et le TTFT mesurés au palier de la config générée (chacun recale sa partie du modèle)."),
         ))
 
     summary = _summary(verdict, bottlenecks, slo_given, model is not None)
@@ -731,16 +1293,30 @@ def analyze(ctx: RuleContext, state: dict[str, Any]) -> SloAnalysis:
             "Step chargé, ITL p95 (ms)": round(ev.loaded.ms, 2),
             "Step moyen (ms)": round(ev.average.ms, 2),
             "Borne du step chargé": "mémoire" if ev.loaded.bound == "memory" else "calcul",
-            "Lecture mémoire / calcul / surcoût du step chargé (ms)": (
-                f"{ev.loaded.memory_s * 1e3:.2f} / {ev.loaded.compute_s * 1e3:.2f} / {ev.loaded.overhead_s * 1e3:.2f}"),
+            "Opérateurs du step chargé (ms)": _ops_text(ev.loaded),
+            "Lecture mémoire / calcul / all-reduce / surcoûts / drafter du step chargé (ms)": (
+                f"{ev.loaded.memory_s * 1e3:.2f} / {ev.loaded.compute_s * 1e3:.2f} / {ev.loaded.comm_s * 1e3:.2f}"
+                f" / {ev.loaded.overhead_s * 1e3:.2f} / {ev.loaded.drafter_s * 1e3:.2f}"),
+            "Tokens à prefiller par requête, moyenne / p95": f"{fmt_int(env.isl_eff_mean)} / {fmt_int(env.isl_eff_p95)}",
+            "TTFT p95 : frontal / place / attente prefill / prefill (ms)": (
+                f"{ev.frontend_s * 1e3:.1f} / {ev.slot_wait_s * 1e3:.1f} / {ev.prefill_wait_p95_s * 1e3:.1f}"
+                f" / {ev.own_prefill_s * 1e3:.1f}"),
             "Poids lus par GPU et par step (Go)": round(ev.loaded.weights_bytes / 1e9, 1),
             "KV lu par GPU et par step (Go)": round(ev.loaded.kv_bytes / 1e9, 1),
+            **({"Frontal : processus API × threads du renderer": f"{ev.frontend.api_servers} × {ev.frontend.workers}",
+                "Frontal : requêtes/s et sorties streamées/s": (f"{fmt_int(ev.frontend.requests_per_s)} /"
+                                                               f" {fmt_int(ev.frontend.chunks_per_s)}"),
+                "Frontal : GIL / pool du renderer par processus (%)": (f"{ev.frontend.gil_utilization * 100:.0f} /"
+                                                                       f" {ev.frontend.pool_utilization * 100:.0f}"),
+                "Frontal : cœurs CPU": round(ev.frontend.cores, 2)} if ev.frontend else {}),
             "Débit de sortie par instance (tokens/s)": round(ev.throughput(env.a) or 0),
         }
-    notes.append(f"Méthode : {KB} §3.1 (régime stable du budget) et modèle roofline de src/vllm_configurator/perf.py.")
+    notes.append(f"Méthode : {KB} §3.1 (régime stable du budget), somme des rooflines par opérateur de"
+                 " src/vllm_configurator/perf.py, file M/G/c pour le prefill et percentiles calculés sur les distributions.")
     return SloAnalysis(verdict=verdict, summary=summary, checks=checks, bottlenecks=bottlenecks, recommendations=recos,
-                       step_breakdown=breakdown, calibration=calibration,
-                       uncertainty=env.spread if model is not None else None, test_plan=plan, notes=notes)
+                       step_breakdown=breakdown, calibration=calibration, calibration_prefill=calibration_prefill,
+                       uncertainty=env.spread if model is not None else None,
+                       uncertainty_ttft=env.spread_prefill if model is not None else None, test_plan=plan, notes=notes)
 
 
 def adjusted_kv_tokens(ctx: RuleContext, state: dict[str, Any]) -> tuple[int | None, str | None]:
@@ -840,8 +1416,7 @@ def build_test_plan(env: Env, base: Point) -> TestPlan:
             index=index, max_num_seqs=count, max_num_batched_tokens=pt.budget, long_prefill_token_threshold=pt.threshold,
             capture_size=f.clamp_capture_size(f.cudagraph_capture_size(env.k, count), pt.budget, env.k + 1),
             inflight_per_instance=count,
-            itl_ms=_pair(lo.itl_ms, hi.itl_ms), tpot_ms=_pair(
-                None if lo.average is None else lo.average.ms / env.a, None if hi.average is None else hi.average.ms / env.a),
+            itl_ms=_pair(lo.itl_ms, hi.itl_ms), tpot_ms=_pair(lo.tpot_ms, hi.tpot_ms),
             ttft_ms=_pair(lo.ttft_ms, hi.ttft_ms),
             output_tokens_per_s=_pair(hi.throughput(env.a), lo.throughput(env.a), 0),
             kv_usage_pct=None if ev.kv_usage is None else round(ev.kv_usage * 100, 1),
@@ -873,7 +1448,7 @@ def build_test_plan(env: Env, base: Point) -> TestPlan:
 
     duration_s = None
     if env.model is not None:
-        ev_base = evaluate(with_factor(env, env.spread[1]), base)
+        ev_base = evaluate(with_factor(env, 1), base)
         if ev_base.average is not None:
             duration_s = env.osl_mean / env.a * ev_base.average.seconds + (ev_base.ttft_ms or 0) / 1e3
     soak = max(10.0, 3 * duration_s / 60) if duration_s else 10.0
@@ -884,14 +1459,24 @@ def build_test_plan(env: Env, base: Point) -> TestPlan:
         " --long-prefill-token-threshold et la capture des CUDA graphs du palier.",
         "Injecter en boucle fermée, par rejeu de traces réelles (mêmes ISL, OSL et thinking qu'en production), autant de"
         " requêtes en vol que max-num-seqs : chaque requête terminée est aussitôt remplacée"
-        " (par exemple vllm bench serve --max-concurrency sur un jeu de traces).",
+        " (par exemple vllm bench serve --max-concurrency sur un jeu de traces). Rejouer des sessions entières, dans"
+        " l'ordre et avec le même routage qu'en production : des prompts aléatoires ou mélangés n'ont pas le hit rate de"
+        " la production et font exploser le TTFT.",
+        "Garder la dispersion réelle des sorties : une OSL fixe (ignore_eos avec une longueur constante) et une montée en"
+        " charge d'un bloc font finir les requêtes par vagues, et leurs prefills arrivent en rafale (TTFT p95 doublé).",
         f"Mesurer en régime stable pendant au moins {soak:.0f} min après la montée en charge"
         + (f" (une requête dure jusqu'à ~{duration_s / 60:.1f} min ici)." if duration_s else "."),
         f"Relever {gen_metric}, TTFT p95 (vllm:time_to_first_token_seconds), vllm:num_requests_waiting,"
-        " vllm:num_preemptions et vllm:kv_cache_usage_perc.",
+        " vllm:num_preemptions, vllm:kv_cache_usage_perc et le hit rate (vllm:prefix_cache_hits /"
+        " vllm:prefix_cache_queries). Côté client, le TTFT se compte au premier token émis, raisonnement compris : avec"
+        " le thinking, le premier token de « content » arrive après tout le raisonnement.",
+        "Surveiller le CPU de chaque processus API (top -H, pidstat ; py-spy dump pour voir où il passe son temps) :"
+        " un processus à ~100 % d'un cœur, et un TTFT ou une ITL client qui s'écartent de plus en plus du serveur quand"
+        " la charge monte, signalent un frontal saturé (--api-server-count, --renderer-num-workers).",
         "Palier validé : passer au suivant. Premier palier en échec : la capacité d'une instance est le palier précédent.",
-        "Saisir la latence mesurée au palier de la config générée (★) dans « Mesures en production » : l'app recale le"
-        " modèle et resserre les plages des autres paliers.",
+        "Saisir la latence de génération et le TTFT mesurés au palier de la config générée (★) dans « Mesures en"
+        " production » : l'app recale séparément la partie decode et la partie prefill du modèle et resserre les plages"
+        " des autres paliers.",
         "Dimensionner : instances = ⌈requêtes en vol visées / max-num-seqs validé⌉ (colonne « Si validé »), plus une marge"
         " pour les pics.",
     ]

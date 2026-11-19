@@ -35,6 +35,9 @@ class Workload(_Frozen):
     osl: Percentiles
     # None : le moteur prend la valeur publiée pour le type d'usage (hypothèse affichée) s'il y en a une.
     prefix_cache_hit_rate: float | None = Field(default=None, ge=0, le=1)
+    # Part des requêtes dont le préfixe est absent du cache (nouvelle session au-delà du préfixe commun, éviction,
+    # mauvais routage) : leur prompt est prefillé en entier. None : heuristique cold_request_fraction.
+    cold_request_fraction: float | None = Field(default=None, ge=0, le=1)
     # Requêtes en vol visées (running + waiting), toutes instances confondues. Ce n'est pas un nombre
     # d'utilisateurs : un utilisateur agentique n'a une requête en cours qu'une partie du temps.
     target_concurrency: int | None = Field(default=None, gt=0)
@@ -82,6 +85,9 @@ class ObservedEpp(_Frozen):
     max_prefix_tokens_to_match: int | None = Field(default=None, gt=0)
     # vllm:prefix_cache_hits / vllm:prefix_cache_queries, pire pod.
     prefix_cache_hit_rate: float | None = Field(default=None, ge=0, le=1)
+    # Part des requêtes dont le préfixe est absent du cache (nouvelle session au-delà du préfixe commun, éviction,
+    # mauvais routage) : leur prompt est prefillé en entier. None : heuristique cold_request_fraction.
+    cold_request_fraction: float | None = Field(default=None, ge=0, le=1)
 
 
 RoutingScorer = Literal["queue-scorer", "kv-cache-utilization-scorer", "prefix-cache-scorer", "no-hit-lru-scorer"]
@@ -129,6 +135,8 @@ class DeploymentRequest(_Frozen):
     extra_env: dict[str, str] = {}
     # Réserve par GPU (activations, CUDA graphs, drafter) pour l'estimation du KV sans logs.
     kv_estimate_reserve_gib_per_gpu: float | None = Field(default=None, ge=0)
+    # Cœurs CPU disponibles par instance (limite CPU du pod) : plafonne les processus API et les threads du renderer.
+    cpu_cores_per_instance: float | None = Field(default=None, gt=0)
     # Routage llm-d (EPP) entre les instances : None = réglages par défaut de la cible llmd_epp.
     routing: RoutingRequest | None = None
 
@@ -280,9 +288,12 @@ class SloAnalysis(_Frozen):
     recommendations: list[Recommendation]
     # Décomposition du step au point de fonctionnement (ms), si le modèle de latence est disponible.
     step_breakdown: dict[str, Any] | None = None
+    # Facteurs de recalage : partie decode (latence de génération mesurée), partie prefill (TTFT mesuré).
     calibration: float | None = None
-    # Multiplicateurs d'incertitude appliqués aux durées estimées (bas, haut).
+    calibration_prefill: float | None = None
+    # Multiplicateurs d'incertitude (bas, haut) de la latence de génération et du TTFT.
     uncertainty: tuple[float, float] | None = None
+    uncertainty_ttft: tuple[float, float] | None = None
     test_plan: TestPlan | None = None
     notes: list[str] = []
     confidence: Status = "unverified"

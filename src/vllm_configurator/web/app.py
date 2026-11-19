@@ -63,9 +63,9 @@ DEFAULTS = {
     "allow_lossy": False, "itl_metric": "itl",
     "llmd_version": sorted(catalog.llmd_versions)[-1], "llmd_mode": "approximate", "llmd_kv_endpoint": "",
 }
-OPTIONAL = ["isl_p50", "isl_p95", "isl_p99", "osl_p50", "osl_p95", "osl_p99", "hit_rate", "target_concurrency",
+OPTIONAL = ["isl_p50", "isl_p95", "isl_p99", "osl_p50", "osl_p95", "osl_p99", "hit_rate", "cold_fraction", "target_concurrency",
             "paused_sessions", "ttft", "itl", "itl_measured", "ttft_measured", "k", "acceptance_length", "kv_tokens", "kv_util", "kv_block", "gpu_util",
-            "reserve", "max_model_len", "llmd_shared_prefix", "llmd_obs_block", "llmd_obs_lru", "llmd_obs_window",
+            "reserve", "cpu_cores", "max_model_len", "llmd_shared_prefix", "llmd_obs_block", "llmd_obs_lru", "llmd_obs_window",
             "llmd_obs_hit", *ROUTING_WEIGHT_KEYS.values()]
 for _key, _value in DEFAULTS.items():
     st.session_state.setdefault(_key, _value)
@@ -170,6 +170,10 @@ with st.sidebar:
     c1, c2 = st.columns(2)
     gpus_per_instance = c1.number_input("GPU par instance (TP)", min_value=1, max_value=64, key="gpus_per_instance")
     num_instances = c2.number_input("Instances", min_value=1, max_value=1024, key="num_instances")
+    cpu_cores = opt_float(
+        "Cœurs CPU par instance (limite du pod)", "cpu_cores", 1.0, step=1.0,
+        help=("Plafonne les processus API (--api-server-count) : il faut ~1 cœur pour l'engine core, ~1 par worker GPU,"
+              " plus le frontal. Vide : pas de plafond, l'app indique le besoin."))
 
     st.header("Modèle et version")
     model_id = st.selectbox("Modèle", sorted(catalog.models), key="model_id", format_func=lambda m: catalog.models[m].display_name)
@@ -199,6 +203,11 @@ with st.sidebar:
         osl_p99 = opt_int("P99 ", "osl_p99")
     hit_rate = opt_float("Prefix cache hit attendu (0–1)", "hit_rate", 0.0, 1.0,
                          help="Vide : valeur publiée pour le type d'usage, affichée comme hypothèse.")
+    cold_fraction = opt_float(
+        "Part de requêtes froides (0–1)", "cold_fraction", 0.0, 1.0,
+        help=("Requêtes dont le préfixe est absent du cache (nouvelle session au-delà du préfixe commun, éviction,"
+              " mauvais routage) : leur prompt est prefillé en entier et fait le TTFT p95. Mesure : part des requêtes sans"
+              " prefix cache hit. Vide : hypothèse de l'app, plafonnée par le hit rate."))
     target_concurrency = opt_int(
         "Requêtes en vol visées (toutes instances)", "target_concurrency",
         help=("Requêtes en cours + en file (running + waiting), pas des utilisateurs : un utilisateur agentique n'a une"
@@ -342,6 +351,7 @@ try:
         vllm_version=vllm_version,
         workload={"usage_type": usage_type, "mode": mode, "isl": pct(isl_p50, isl_p95, isl_p99),
                   "osl": pct(osl_p50, osl_p95, osl_p99), "prefix_cache_hit_rate": hit_rate,
+                  "cold_request_fraction": cold_fraction,
                   "target_concurrency": target_concurrency, "paused_sessions": paused_sessions},
         slo={"ttft_p95_ms": ttft, "itl_p95_ms": itl, "itl_metric": itl_metric}, allow_lossy=allow_lossy,
         spec={"enabled": spec_enabled, "num_speculative_tokens": k, "acceptance_length": acceptance,
@@ -350,7 +360,7 @@ try:
                      if kv_tokens else None),
         observed_perf=({"itl_p95_ms": itl_measured, "ttft_p95_ms": ttft_measured}
                        if itl_measured or ttft_measured else None),
-        gpu_memory_utilization=gpu_util, kv_estimate_reserve_gib_per_gpu=reserve,
+        gpu_memory_utilization=gpu_util, kv_estimate_reserve_gib_per_gpu=reserve, cpu_cores_per_instance=cpu_cores,
         max_model_len=max_model_len, extra_args=extra_args, extra_env=extra_env,
         routing={
             "llmd_version": llmd_version, "prefix_mode": llmd_mode, "shared_prefix_tokens": llmd_shared_prefix,
@@ -569,7 +579,10 @@ with tabs[2]:
             "Pourquoi": s.expectation_reason,
         } for s in plan.steps], width="stretch", hide_index=True)
         st.caption(f"★ : palier de la config générée. Plages = estimation ×{analysis.uncertainty[0]:g} à"
-                   f" ×{analysis.uncertainty[1]:g} ({'recalée sur la mesure' if analysis.calibration else 'non calibrée'})."
+                   f" ×{analysis.uncertainty[1]:g} pour la génération"
+                   f" ({'recalée sur la mesure' if analysis.calibration else 'non calibrée'}),"
+                   f" ×{analysis.uncertainty_ttft[0]:g} à ×{analysis.uncertainty_ttft[1]:g} pour le TTFT"
+                   f" ({'recalé sur la mesure' if analysis.calibration_prefill else 'non calibré'})."
                    f" Le verdict de chaque palier porte sur la cible {gen_label}."
                    if analysis.uncertainty else "★ : palier de la config générée. Pas de modèle de latence : la mesure tranche.")
         c1, c2 = st.columns(2)

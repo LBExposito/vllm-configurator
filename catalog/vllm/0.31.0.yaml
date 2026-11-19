@@ -53,6 +53,17 @@ defaults:
     value: false
     status: verified
     source: vllm/config/speculative.py (SpeculativeConfig.enable_adaptive_verification)
+  api_server_count:
+    value: null
+    status: verified
+    source: "vllm/entrypoints/launchers/cli_args.py (--api-server-count, default=None) ; vllm/entrypoints/cli/serve.py (ServeSubcommand.cmd)"
+    note: >-
+      None : data_parallel_size (DP interne), 1 en DP externe ou multi-port, 1 avec le frontend Rust. Une instance DP1
+      a donc un seul processus API par défaut.
+  renderer_num_workers:
+    value: 1
+    status: verified
+    source: vllm/config/model.py (ModelConfig.renderer_num_workers)
 
 behaviors:
   max_model_len.yarn_factor_extends_derived:
@@ -133,6 +144,43 @@ behaviors:
     source: "Changement introduit en 0.33.0 (#62431) d'après les notes de version ; comportement antérieur non relu"
 
 # Flags et clés JSON que le moteur peut émettre. Chaque nom est validé contre extracted/0.31.0.yaml.
+  frontend.api_servers:
+    value:
+      default: data_parallel_size
+      rust_frontend_enabled_by_default: false
+      rust_frontend_forces_one: true
+      incompatible_env: [VLLM_ALLOW_RUNTIME_LORA_UPDATING]
+      elastic_ep_caps_to_one: true
+      multiprocess_prometheus: true
+    status: verified
+    source: >-
+      vllm/entrypoints/cli/serve.py au tag v0.31.0 (ServeSubcommand.cmd, run_multi_api_server) ; vllm/envs.py
+      (VLLM_USE_RUST_FRONTEND, défaut 0)
+    note: >-
+      Frontend Python : N processus API sur un port partagé (reuse_port), chacun avec sa boucle asyncio, son GIL, son
+      renderer et sa détokenisation ; un seul engine core. Frontend Rust (VLLM_USE_RUST_FRONTEND=1) : le flag est ignoré
+      et ramené à 1 (frontend multithread).
+  frontend.renderer_pool:
+    value:
+      default_workers: 1
+      offloaded: [chat_template, tokenization, prompt_embeds]
+      chat_template_offloaded_by: [hf, deepseek_v4]
+      multimodal_single_worker: true
+      output_processing: event_loop
+    status: verified
+    source: >-
+      vllm/renderers/base.py (_executor = pool de renderer_num_workers threads, _mm_executor à 1 thread),
+      vllm/renderers/hf.py et vllm/renderers/deepseek_v4.py (_apply_chat_template_async sur _executor),
+      vllm/v1/engine/async_llm.py (output_handler : process_outputs sur la boucle asyncio), au tag v0.31.0
+    note: >-
+      Le pool ne sert que l'entrée (chat template, tokenisation) et seulement dans `vllm serve`. Le prétraitement
+      multimodal reste sur un thread dédié ; la détokenisation et le streaming des sorties restent sur la boucle
+      asyncio du processus API. Le chat template est du Python et tient le GIL (Jinja, ou encode_messages pour
+      DeepSeek V4/V4.1 dans vllm/tokenizers/). La tokenisation passe par transformers TokenizersBackend._encode_plus
+      → tokenizers encode_batch, dont le cœur Rust tourne hors GIL (py.allow_threads / py.detach) ; seules
+      l'extraction du texte et la conversion du résultat en listes Python le gardent. Relu dans transformers 5.10.3 et tokenizers 0.21.1 (planchers de requirements/common.txt).
+      Backend fastokens (VLLM_USE_FASTOKENS=1) non relu.
+
 flags:
   tensor_parallel_size: {cli: --tensor-parallel-size, kind: value}
   data_parallel_size: {cli: --data-parallel-size, kind: value}
@@ -151,6 +199,8 @@ flags:
   kv_offloading_backend: {cli: --kv-offloading-backend, kind: value}
   speculative_config: {cli: --speculative-config, kind: json}
   compilation_config: {cli: --compilation-config, kind: json}
+  api_server_count: {cli: --api-server-count, kind: value}
+  renderer_num_workers: {cli: --renderer-num-workers, kind: value}
 
 breaking_changes: []
 

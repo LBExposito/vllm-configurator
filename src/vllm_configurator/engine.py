@@ -17,6 +17,7 @@ DECISION_ORDER = [
     "enable_prefix_caching", "kv_cache_dtype", "gpu_memory_utilization", "block_size", "kv_offloading_size",
     "max_model_len", "hf_overrides",
     "speculative_config", "compilation_config",
+    "api_server_count", "renderer_num_workers",
 ]
 
 

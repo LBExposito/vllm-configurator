@@ -166,3 +166,61 @@ class TestKvEstimate:
             hbm_bytes_per_gpu=10e9, gpu_memory_utilization=0.5, weights_bytes=100e9, tensor_parallel_size=1,
             reserve_bytes_per_gpu=0, bytes_per_token=100, replicated_across_tp=True, num_kv_heads=1,
         ) == 0
+
+
+class TestDistributions:
+    """Distributions used by the SLO analysis (tokens to prefill, acceptance length)."""
+
+    def test_normal_ppf(self):
+        assert f.normal_ppf(0.5) == pytest.approx(0.0, abs=1e-9)
+        assert f.normal_ppf(0.975) == pytest.approx(1.95996, abs=1e-4)
+        assert f.normal_ppf(0.01) == pytest.approx(-2.32635, abs=1e-4)
+
+    def test_lognormal_quantiles_match_the_percentiles(self):
+        q = f.lognormal_quantile_fn(24000, 75000, 666000)
+        assert q(0.5) == pytest.approx(24000)
+        assert q(0.95) == pytest.approx(75000, rel=1e-3)
+        assert q(0.99) == pytest.approx(666000, rel=1e-3)  # queue étirée jusqu'au P99 observé
+        assert f.lognormal_quantile_fn(24000, 75000, 666000, cap=500000)(0.995) == 500000
+
+    def test_uncached_distribution_keeps_the_hit_rate(self):
+        q = f.lognormal_quantile_fn(24000, 75000)
+        points, hit = f.uncached_distribution(q, 0.957, 0.02, 1.0)
+        assert sum(p for p, _, _ in points) == pytest.approx(1.0)
+        assert hit == pytest.approx(0.957, abs=1e-3)
+        mean_isl = sum(p * isl for p, _, isl in points)
+        assert sum(p * u for p, u, _ in points) == pytest.approx(0.043 * mean_isl, rel=1e-3)
+        # Les requêtes froides font la queue : bien plus lourde que ISL P95 × (1 − hit).
+        assert f.quantile_of_points(points, 0.99) > 5 * 75000 * 0.043
+
+    def test_cold_requests_beyond_the_hit_rate_lower_the_effective_hit(self):
+        q = f.lognormal_quantile_fn(24000, 75000)
+        _, hit = f.uncached_distribution(q, 0.957, 0.2, 1.0)
+        assert hit == pytest.approx(0.8, abs=0.01)
+
+    def test_no_cache_prefills_every_prompt(self):
+        q = f.lognormal_quantile_fn(24000, 75000)
+        points, hit = f.uncached_distribution(q, 0.0, 0.0, 1.0)
+        assert hit == 0.0 and all(u == isl for _, u, isl in points)
+
+    def test_collapse_keeps_probability_and_mean(self):
+        points, _ = f.uncached_distribution(f.lognormal_quantile_fn(24000, 75000), 0.9, 0.05, 1.0)
+        merged = f.collapse(points)
+        assert len(merged) < len(points)
+        assert sum(p for p, _, _ in merged) == pytest.approx(1.0)
+        assert sum(p * u for p, u, _ in merged) == pytest.approx(sum(p * u for p, u, _ in points), rel=1e-9)
+
+    def test_interpolated_quantile_has_no_jump_at_slice_edges(self):
+        slices = [(0.5, 10.0), (0.5, 20.0)]
+        assert f.quantile_interpolated(slices, 0.25) == 10.0
+        assert f.quantile_interpolated(slices, 0.5) == pytest.approx(15.0)
+        assert f.quantile_interpolated(slices, 0.75) == 20.0
+
+    def test_acceptance_length(self):
+        assert f.tokens_per_step(0.0, 3) == 1.0
+        assert f.tokens_per_step(1.0, 3) == 4.0
+        assert f.tokens_per_step(0.5, 3) == pytest.approx(1.875)
+        low = f.acceptance_quantile(3.0, 3, 0.05, 8)
+        assert 1.0 < low < 3.0
+        assert f.acceptance_quantile(3.0, 3, 0.05, 1000) == pytest.approx(3.0, rel=0.05)  # peu de dispersion
+        assert f.acceptance_quantile(1.0, 0, 0.05, 8) == 1.0

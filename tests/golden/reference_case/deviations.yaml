@@ -25,6 +25,14 @@ flags:
     justification: >-
       Politique « toujours émettre » : c'est le défaut, mais le remplissage du budget et le seuil de long prefill en
       dépendent.
+  - flag: --api-server-count
+    kind: added
+    value: "2"
+    justification: >-
+      La §7 ne dimensionne pas le frontal. À pleine charge (512 séquences par instance), l'instance streame ~12 800
+      sorties par seconde : une seule boucle asyncio du frontend Python y passerait ~85 % de son GIL (coût d'une sortie
+      supposé à 60 µs, heuristique frontend_python 🔶), au-delà du seuil de 70 %. Deux processus API ramènent chacun à
+      ~42 %. Comportement vérifié dans vllm/entrypoints/cli/serve.py au tag v0.33.0 (défaut = data_parallel_size = 1).
   - flag: --gpu-memory-utilization
     kind: changed
     value: "0.92"

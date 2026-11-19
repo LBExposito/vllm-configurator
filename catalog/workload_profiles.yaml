@@ -118,9 +118,11 @@ heuristics:
 
   # --- Analyse SLO (modèle de latence roofline, src/vllm_configurator/perf.py) ---
   perf_hbm_efficiency:
-    value: 0.7
+    value: 0.6
     status: unverified
-    source: "Choix de l'app : fraction de la bande passante HBM nominale atteinte par les GEMM et l'attention en decode"
+    source: >-
+      Choix de l'app : fraction de la bande passante HBM nominale atteinte par les GEMM et l'attention en decode.
+      0,6 plutôt que 0,7 : les GEMM groupées des experts MoE ne voient qu'une dizaine de lignes par expert en decode.
     note: "Ordre de grandeur. Saisir l'ITL p95 mesurée recalibre tout le modèle."
   perf_mfu:
     value: 0.4
@@ -129,19 +131,97 @@ heuristics:
   perf_overhead_per_layer_ms:
     value: 0.1
     status: unverified
-    source: "Choix de l'app : coût fixe par couche et par step (lancements de kernels, all-reduce TP, scheduler)"
-    note: "Domine à faible concurrence : c'est lui qui fixe le plancher d'ITL d'une séquence seule."
+    source: "Choix de l'app : coût fixe par couche et par step (lancements de kernels, latence des all-reduce TP, scheduler)"
+    note: >-
+      Domine à faible concurrence : c'est lui qui fixe le plancher d'ITL d'une séquence seule. Le volume des all-reduce,
+      qui croît avec les tokens du step, est compté à part (perf_nvlink_efficiency).
+  perf_mixed_step_overhead_factor:
+    value: 1.5
+    status: unverified
+    source: >-
+      Choix de l'app : un step mixte prefill + decode tourne en CUDA graphs par morceaux (attention hors graph), son
+      coût fixe est plus élevé que celui d'un step de decode pur capturé en entier
+  perf_overhead_per_seq_us:
+    value: 8
+    status: unverified
+    source: "Choix de l'app : coût par séquence et par step (sampling sur tout le vocabulaire, rejection sampling, scheduler)"
+  perf_nvlink_efficiency:
+    value: 0.6
+    status: unverified
+    source: >-
+      Choix de l'app : fraction du débit NVLink par sens (moitié du débit GPU à GPU bidirectionnel de la fiche GPU)
+      atteinte par les all-reduce NCCL de taille moyenne
+  perf_sparse_indexer_cost_ratio:
+    value: 0.1
+    status: unverified
+    source: >-
+      Choix de l'app : coût de l'indexeur d'une attention sparse, par token de contexte, rapporté à une paire
+      (requête, clé) d'attention complète. Ordre de grandeur de DSA (DeepSeek V3.2 : indexeur à 64 têtes de 128 en
+      FP8, QK seul, face à une attention MLA de 64 têtes de 576)
+  perf_drafter_step_fraction:
+    value: {parallel: 0.15, autoregressive_per_token: 0.08}
+    status: unverified
+    source: >-
+      Choix de l'app : coût de la passe du drafter rapporté à un step de decode du modèle cible. Drafter parallèle
+      (DSpark, DFlash) : une passe par step ; drafter autorégressif (MTP, EAGLE, draft model) : k passes. ngram : nul
+  frontend_python:
+    value:
+      network_ms: 10
+      request_loop_ms: 1.5
+      parse_loop_ms_per_1k_tokens: 0.05
+      template_ms_per_1k_tokens: 0.15
+      tokenize_ms_per_1k_tokens: 0.5
+      tokenize_gil_share: 0.1
+      output_chunk_us: 60
+      utilization_max: 0.7
+      cores_engine_core: 1
+      cores_per_gpu_worker: 1
+    status: unverified
+    source: >-
+      Choix de l'app : coûts CPU du frontend Python de `vllm serve`, par processus API. Hors CPU du pod : réseau et
+      EPP (network_ms, TTFT seulement). Sur la boucle asyncio : HTTP, validation et routage par requête
+      (request_loop_ms), décodage JSON de l'historique de messages (~4 caractères par token). Sur le pool du renderer :
+      chat template (Python, tient le GIL) et tokenisation (tokenizer rapide, ~2 M tokens/s par thread). Le cœur Rust
+      de la tokenisation tourne hors GIL (vérifié : comportement frontend.renderer_pool) ; la conversion du résultat
+      en listes Python le garde, part supposée à 10 % (tokenize_gil_share). Par séquence et par step, sur la boucle :
+      détokenisation, delta de streaming, parseurs de raisonnement et
+      de tool calls, SSE (output_chunk_us). Au-delà de 70 % d'occupation d'un GIL ou du pool, l'attente explose.
+      Hors frontal : l'engine core (boucle active, ~1 cœur) et un processus worker par GPU (~1 cœur chacun)
+    note: >-
+      Mesure : CPU de chaque processus API (top -H, pidstat), py-spy dump pendant un palier ; un processus API à ~100 %
+      d'un cœur et un écart client/serveur sur le TTFT et l'ITL qui grandit avec la charge signalent un frontal saturé.
+      Frontend Rust (VLLM_USE_RUST_FRONTEND=1) non modélisé.
   slo_margin:
     value: {ok_below: 0.85, ko_above: 1.15}
     status: unverified
     source: "Choix de l'app : une estimation à ±15 % de la cible est classée « à risque », faute de précision du modèle"
+  cold_request_fraction:
+    value: {value: 0.05, max_share_of_uncached_tokens: 0.5}
+    status: unverified
+    source: >-
+      Choix de l'app : 5 % de requêtes au préfixe absent du cache (premier appel d'une session d'une vingtaine d'appels,
+      évictions, mauvais routage), prefillées en entier. Plafond : leur prefill ne dépasse pas la moitié du prefill
+      non caché qu'implique le hit rate (sinon le hit rate déclaré serait intenable)
+    note: "Mesure : part des requêtes sans prefix cache hit. Saisie possible dans le formulaire (Part de requêtes froides)."
+  uncached_tokens_sigma:
+    value: 1.0
+    status: unverified
+    source: >-
+      Choix de l'app : dispersion lognormale de la part non cachée d'un prompt chaud (sorties d'outils, messages
+      utilisateur), qui fait la queue de la distribution des tokens à prefiller
+  acceptance_dispersion:
+    value: 8
+    status: unverified
+    source: >-
+      Choix de l'app : concentration (alpha + beta) de la loi Beta du taux d'acceptation par requête (prose, code, JSON
+      d'outils s'acceptent très différemment) ; fixe la longueur d'acceptation des 5 % de requêtes les moins acceptées
   perf_uncertainty:
     value: {uncalibrated: [0.8, 2.5], calibrated: [0.85, 1.15]}
     status: unverified
     source: >-
-      Choix de l'app : plage multiplicative appliquée aux durées estimées. Sans mesure, le roofline est plutôt optimiste
-      (kernels, all-reduce, attention sparse et indexeur non modélisés finement) : jusqu'à ×2,5. Recalé sur une ITL
-      mesurée : ±15 %.
+      Choix de l'app : plage multiplicative appliquée aux durées estimées. Sans mesure, le modèle reste un ordre de
+      grandeur (rendements des kernels, coût réel de l'indexeur sparse et du drafter supposés) : de ×0,8 à ×2,5.
+      Recalé sur une mesure : ±15 %, séparément pour la partie decode (latence de génération) et prefill (TTFT).
   test_plan_ladder:
     value: [16, 32, 64, 96, 128, 192, 256, 384, 512, 640, 768, 1024, 1280, 1536, 2048]
     status: unverified
@@ -149,7 +229,7 @@ heuristics:
   prefill_load_max:
     value: 0.8
     status: unverified
-    source: "Choix de l'app : au-delà de 80 % de charge du budget de prefill, l'attente avant prefill explose (file M/D/1)"
+    source: "Choix de l'app : au-delà de 80 % de charge du budget de prefill, l'attente avant prefill explose (file M/G/c)"
   kv_usage_max:
     value: 0.9
     status: unverified
