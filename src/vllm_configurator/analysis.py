@@ -30,6 +30,7 @@ from typing import Any
 from . import formulas as f
 from . import frontend as fe
 from . import perf as p
+from . import traces
 from .catalog.loader import version_key
 from .domain import Bottleneck, CheckStatus, Recommendation, SloAnalysis, SloCheck, TestPlan, TestStep
 from .rules.context import KB, RuleContext, fmt_int
@@ -987,8 +988,14 @@ def build_env(ctx: RuleContext, state: dict[str, Any], kv_tokens: int | None,
                f" non caché d'un hit rate de {hit:.1%}" if cold < cold_h["value"] else "")
             + "). Mesure : part des requêtes dont vllm:prefix_cache_hits est nul ; saisir « Part de requêtes froides »."
         )
-    points, hit_eff = f.uncached_distribution(quantile, hit, cold if hit > 0 else 0.0, h("uncached_tokens_sigma"),
-                                              shared)
+    if wl.warm_uncached_tokens is not None and wl.warm_uncached_tokens.p95:
+        sigma = traces.warm_sigma(wl.warm_uncached_tokens.p50, wl.warm_uncached_tokens.p95)
+        sigma_text = (f"σ = {sigma:.2f}, lue sur les percentiles fournis ({fmt_int(wl.warm_uncached_tokens.p50)} /"
+                      f" {fmt_int(wl.warm_uncached_tokens.p95)} tokens)")
+    else:
+        sigma = h("uncached_tokens_sigma")
+        sigma_text = f"σ = {sigma:g} 🔶, sorties d'outils"
+    points, hit_eff = f.uncached_distribution(quantile, hit, cold if hit > 0 else 0.0, sigma, shared)
     dist = tuple(f.collapse(points))
     if hit > 0 and hit_eff < hit - 0.002:
         notes.append(f"Les requêtes froides ({cold:.1%}) prefillent à elles seules plus que ne le permet le hit rate de"
@@ -1009,7 +1016,7 @@ def build_env(ctx: RuleContext, state: dict[str, Any], kv_tokens: int | None,
         f"Tokens à prefiller par requête : moyenne {fmt_int(env.isl_eff_mean)}, p95 {fmt_int(env.isl_eff_p95)}, p99"
         f" {fmt_int(f.quantile_of_points(list(dist), 0.99))} (ISL lognormale ajustée sur les percentiles"
         + (f", {env.cold_fraction:.1%} de requêtes froides prefillées en entier, part non cachée des requêtes chaudes"
-           f" dispersée (σ = {h('uncached_tokens_sigma'):g}, sorties d'outils)" if 0 < hit else ", aucun cache")
+           f" dispersée ({sigma_text})" if 0 < hit else ", aucun cache")
         + f"). L'ancien calcul ISL P95 × (1 − hit) donnait {fmt_int((wl.isl.p95 or wl.isl.p50) * (1 - hit))}."
     )
     if k:
@@ -1285,7 +1292,7 @@ def analyze(ctx: RuleContext, state: dict[str, Any]) -> SloAnalysis:
         ))
 
     summary = _summary(verdict, bottlenecks, slo_given, model is not None)
-    plan = build_test_plan(env, base)
+    plan = build_test_plan(env, base, state.get("block_size"))
     breakdown = None
     if ev.loaded is not None:
         breakdown = {
@@ -1362,7 +1369,47 @@ def _pair(low: float | None, high: float | None, digits: int = 1) -> tuple[float
     return (round(low, digits), round(high, digits) if not math.isinf(high) else math.inf)
 
 
-def build_test_plan(env: Env, base: Point) -> TestPlan:
+def request_duration_s(env: Env, ev: Evaluation) -> float | None:
+    """Duration of a request at this operating point: its decode steps plus its TTFT p95 (rounded up)."""
+    if ev.average is None or ev.ttft_s is None or math.isinf(ev.ttft_s) or math.isinf(ev.average.seconds):
+        return None
+    return env.osl_mean / env.a * ev.average.seconds + ev.ttft_s
+
+
+def session_equivalent(env: Env, inflight: int, fast: Evaluation, slow: Evaluation
+                       ) -> tuple[tuple[int, int], float | None] | None:
+    """Sessions per instance that keep `inflight` requests in flight, when a session waits `session_gap_s` between
+    two requests (tools, a person): inflight × (duration + wait) / duration, for the slow then the fast end of the
+    estimate. Also the KV those sessions hold at the low end (shared prefix counted once), as a share of the pool."""
+    gap = env.wl.session_gap_s
+    if gap is None:
+        return None
+    d_slow, d_fast = request_duration_s(env, slow), request_duration_s(env, fast)
+    if not d_slow or not d_fast:
+        return None
+    low = math.floor(inflight * (d_slow + gap) / d_slow)
+    high = max(low, math.floor(inflight * (d_fast + gap) / d_fast))
+    kv = None
+    if env.kv_tokens:
+        routing = env.ctx.request.routing
+        shared = min((routing.shared_prefix_tokens or 0) if routing else 0, env.isl_mean)
+        kv = (low * (env.isl_mean + env.osl_mean - shared) + shared) / env.kv_tokens
+    return (low, high), kv
+
+
+def _ws_thresholds(env: Env) -> list[str]:
+    """`ws replay` pass-rule flags matching the SLOs (approximate: working-set judges other percentiles)."""
+    slo, flags = env.ctx.request.slo, []
+    if slo.ttft_p95_ms:
+        flags.append(f"--max-warm-ttft-s {slo.ttft_p95_ms / 1e3:g}")
+    if slo.itl_p95_ms:
+        # Débit de decode d'une requête ≈ tokens par sortie / intervalle entre sorties.
+        per_output = 1.0 if env.metric == "tpot" else env.a_low
+        flags.append(f"--min-decode-tok-s {math.floor(per_output * 1e3 / slo.itl_p95_ms):g}")
+    return flags
+
+
+def build_test_plan(env: Env, base: Point, block_size: int | None = None) -> TestPlan:
     """Load steps to validate in order; the last validated one sizes the deployment."""
     ctx, wl, slo = env.ctx, env.wl, env.ctx.request.slo
     tp = ctx.request.gpus_per_instance
@@ -1383,7 +1430,11 @@ def build_test_plan(env: Env, base: Point) -> TestPlan:
         status = worst(checks)
         if env.model is None and status == "ok":
             status = "unknown"  # capacité suffisante, mais latences non estimées : la mesure tranche
-        rows.append((count, pt, ev, lo, hi, checks, status))
+        sessions = session_equivalent(env, count, lo, hi)
+        kv_max = ctx.heuristic("kv_usage_max").value
+        if sessions and sessions[1] is not None and sessions[1] > kv_max and status == "ok":
+            status = "at_risk"
+        rows.append((count, pt, ev, lo, hi, checks, status, sessions))
 
     generated = min(base.max_num_seqs, top)
     if env.model is None:
@@ -1401,7 +1452,7 @@ def build_test_plan(env: Env, base: Point) -> TestPlan:
         keep = sorted(keep + [r for r in rows if r[0] == generated], key=lambda r: r[0])
 
     steps = []
-    for index, (count, pt, ev, lo, hi, checks, status) in enumerate(keep, 1):
+    for index, (count, pt, ev, lo, hi, checks, status, sessions) in enumerate(keep, 1):
         reasons = []
         for c in checks:
             if c.key in ("itl", "ttft") and c.estimate_low is not None:
@@ -1411,6 +1462,9 @@ def build_test_plan(env: Env, base: Point) -> TestPlan:
                 reasons.append(f"{c.label} {c.estimate:g} {c.unit or ''}".strip())
         if env.model is None and status == "unknown":
             reasons.append("KV et prefill suffisants ; latences non estimées")
+        if sessions and sessions[1] is not None and sessions[1] > ctx.heuristic("kv_usage_max").value:
+            reasons.append(f"{sessions[0][0]} sessions (actives et en attente) occupent ~{sessions[1]:.0%} du KV : les"
+                           " sessions en attente seront évincées et leur tour suivant refait son prefill")
         instances = math.ceil(target / count) if target else None
         steps.append(TestStep(
             index=index, max_num_seqs=count, max_num_batched_tokens=pt.budget, long_prefill_token_threshold=pt.threshold,
@@ -1424,6 +1478,8 @@ def build_test_plan(env: Env, base: Point) -> TestPlan:
             expectation=status, expectation_reason=" ; ".join(reasons),
             instances_needed=instances, gpus_needed=None if instances is None else instances * tp,
             is_generated_config=count == generated and pt.budget == base.budget,
+            sessions_per_instance=sessions[0] if sessions else None,
+            sessions_kv_pct=None if not sessions or sessions[1] is None else round(sessions[1] * 100, 1),
         ))
 
     safe = max((s.max_num_seqs for s in steps if s.expectation == "ok"), default=None)
@@ -1454,16 +1510,49 @@ def build_test_plan(env: Env, base: Point) -> TestPlan:
     soak = max(10.0, 3 * duration_s / 60) if duration_s else 10.0
     gen_metric = ("ITL p95 (vllm:inter_token_latency_seconds)" if env.metric == "itl"
                   else "TPOT p95 (vllm:request_time_per_output_token_seconds)")
+    if wl.session_gap_s is not None:
+        routing = ctx.request.routing
+        shared = (routing.shared_prefix_tokens or 0) if routing else 0
+        command = " ".join([
+            "ws replay trace.json --base-url http://<pod>:8000/v1 --metrics-url http://<pod>:8000/metrics --api chat",
+            f"--shared-prefix-tokens {shared}", *([f"--kv-block-tokens {block_size}"] if block_size else []),
+            *_ws_thresholds(env), "--start-sessions <S bas / 2> --max-sessions <2 × S haut> --out palier-<n>.json",
+        ])
+        injection = [
+            "Injecter par rejeu des sessions de la trace avec working-set, contre le pod seul (pas la passerelle) :"
+            f" `{command}`. S bas et S haut : colonne « Sessions working-set » du palier (sessions qui tiennent"
+            f" max-num-seqs requêtes en vol avec {wl.session_gap_s:g} s d'attente entre deux requêtes).",
+            f"--shared-prefix-tokens {shared} est obligatoire : sans lui, ws replay prend le plus petit premier prompt de"
+            " la trace comme préfixe commun à toutes les sessions, et leurs premiers tours, souvent les plus gros,"
+            " deviennent quasi chauds. Le fixer au préfixe réellement commun (system prompt + outils ; « Préfixe commun"
+            " à toutes les sessions » de la section llm-d)."
+            + ("" if shared else " 0 ici : aucun préfixe commun déclaré."),
+            "--api chat fait passer le chat template et le renderer comme en production (completions les court-circuite,"
+            " le frontal paraît moins chargé). Le texte du rejeu est synthétique, avec une longueur de sortie forcée :"
+            " relever l'acceptation du spec decoding pendant le test (1 + vllm:spec_decode_num_accepted_tokens /"
+            " vllm:spec_decode_num_drafts) et la saisir dans « Longueur d'acceptation mesurée », sinon le recalage"
+            " attribue l'écart au mauvais facteur.",
+            "Les seuils ws replay ci-dessus sont la traduction approchée des SLO : working-set juge le TTFT p90 des"
+            " requêtes chaudes et le débit de decode p10 par requête, plus permissifs que des p95. Le verdict du palier"
+            " reste lu sur les métriques serveur ci-dessous. Viser une part d'évictions nulle (rapportée par ws replay) :"
+            f" chaque éviction refait le prefill de tout le contexte (ISL p50 {fmt_int(wl.isl.p50)} tokens).",
+        ]
+    else:
+        injection = [
+            "Injecter en boucle fermée, par rejeu de traces réelles (mêmes ISL, OSL et thinking qu'en production), autant"
+            " de requêtes en vol que max-num-seqs : chaque requête terminée est aussitôt remplacée"
+            " (par exemple vllm bench serve --max-concurrency sur un jeu de traces). Rejouer des sessions entières, dans"
+            " l'ordre et avec le même routage qu'en production : des prompts aléatoires ou mélangés n'ont pas le hit rate"
+            " de la production et font exploser le TTFT. Pour des sessions agentiques, importer une trace working-set"
+            " (`ws trace`) dans « Profil de charge » : le plan donne alors les sessions à rejouer par palier.",
+            "Garder la dispersion réelle des sorties : une OSL fixe (ignore_eos avec une longueur constante) et une montée"
+            " en charge d'un bloc font finir les requêtes par vagues, et leurs prefills arrivent en rafale (TTFT p95"
+            " doublé).",
+        ]
     protocol = [
         "Déployer une instance avec les args générés, en ne changeant que --max-num-seqs, --max-num-batched-tokens,"
         " --long-prefill-token-threshold et la capture des CUDA graphs du palier.",
-        "Injecter en boucle fermée, par rejeu de traces réelles (mêmes ISL, OSL et thinking qu'en production), autant de"
-        " requêtes en vol que max-num-seqs : chaque requête terminée est aussitôt remplacée"
-        " (par exemple vllm bench serve --max-concurrency sur un jeu de traces). Rejouer des sessions entières, dans"
-        " l'ordre et avec le même routage qu'en production : des prompts aléatoires ou mélangés n'ont pas le hit rate de"
-        " la production et font exploser le TTFT.",
-        "Garder la dispersion réelle des sorties : une OSL fixe (ignore_eos avec une longueur constante) et une montée en"
-        " charge d'un bloc font finir les requêtes par vagues, et leurs prefills arrivent en rafale (TTFT p95 doublé).",
+        *injection,
         f"Mesurer en régime stable pendant au moins {soak:.0f} min après la montée en charge"
         + (f" (une requête dure jusqu'à ~{duration_s / 60:.1f} min ici)." if duration_s else "."),
         f"Relever {gen_metric}, TTFT p95 (vllm:time_to_first_token_seconds), vllm:num_requests_waiting,"
@@ -1490,6 +1579,14 @@ def build_test_plan(env: Env, base: Point) -> TestPlan:
         "Démarrage sans OOM pendant la capture des CUDA graphs",
     ]
     notes = []
+    if wl.session_gap_s is not None:
+        notes.append(
+            f"Sessions working-set = requêtes en vol × (durée d'une requête + {wl.session_gap_s:g} s d'attente) / durée,"
+            " pour la durée estimée la plus longue puis la plus courte (decode + TTFT p95, donc arrondie vers le haut)."
+            " Une session en attente d'un outil garde son contexte en KV : au-delà du pool, vLLM évince les plus"
+            " anciennes et leur tour suivant est froid. ws replay rapporte la capacité en sessions : la comparer à la"
+            " colonne du palier."
+        )
     if target:
         notes.append(
             "Requêtes en vol ≠ utilisateurs : un utilisateur agentique n'a une requête en cours qu'une partie du temps"

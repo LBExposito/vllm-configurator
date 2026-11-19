@@ -36,13 +36,13 @@ import streamlit as st  # noqa: E402
 import yaml  # noqa: E402
 from pydantic import ValidationError  # noqa: E402
 
-from vllm_configurator import render  # noqa: E402
+from vllm_configurator import render, traces  # noqa: E402
 from vllm_configurator.catalog import default_catalog  # noqa: E402
 from vllm_configurator.domain import DeploymentRequest, GenerationError  # noqa: E402
 from vllm_configurator.engine import generate  # noqa: E402
 from vllm_configurator.llmd import generate_routing, render_epp_config, render_vllm_args  # noqa: E402
 from vllm_configurator.scenario import (  # noqa: E402
-    ROUTING_WEIGHT_KEYS, ScenarioError, dump_scenario, load_scenario, request_to_form,
+    ROUTING_WEIGHT_KEYS, ScenarioError, dump_scenario, load_scenario, request_to_form, trace_to_form,
 )
 
 REFERENCE_INPUT = Path(__file__).resolve().parents[3] / "tests" / "golden" / "reference_case" / "input.yaml"
@@ -64,7 +64,7 @@ DEFAULTS = {
     "llmd_version": sorted(catalog.llmd_versions)[-1], "llmd_mode": "approximate", "llmd_kv_endpoint": "",
 }
 OPTIONAL = ["isl_p50", "isl_p95", "isl_p99", "osl_p50", "osl_p95", "osl_p99", "hit_rate", "cold_fraction", "target_concurrency",
-            "paused_sessions", "ttft", "itl", "itl_measured", "ttft_measured", "k", "acceptance_length", "kv_tokens", "kv_util", "kv_block", "gpu_util",
+            "paused_sessions", "warm_p50", "warm_p95", "session_gap", "trace_sessions", "ttft", "itl", "itl_measured", "ttft_measured", "k", "acceptance_length", "kv_tokens", "kv_util", "kv_block", "gpu_util",
             "reserve", "cpu_cores", "max_model_len", "llmd_shared_prefix", "llmd_obs_block", "llmd_obs_lru", "llmd_obs_window",
             "llmd_obs_hit", *ROUTING_WEIGHT_KEYS.values()]
 for _key, _value in DEFAULTS.items():
@@ -75,6 +75,7 @@ st.session_state.setdefault("scenario_name", "")
 st.session_state.setdefault("extra_args_text", "")
 st.session_state.setdefault("extra_env_text", "")
 st.session_state.setdefault("llmd_params_text", "")
+st.session_state.setdefault("trace_reply_cached", True)
 
 
 def parse_mapping(text: str, label: str) -> dict:
@@ -132,6 +133,22 @@ def import_scenario() -> None:
     st.session_state["scenario_message"] = ("success", f"Scénario « {st.session_state['scenario_name']} » importé.")
 
 
+def import_trace() -> None:
+    """Fill the workload from a working-set trace (sizes, cache, waits), with the current shared prefix."""
+    uploaded = st.session_state.get("trace_file")
+    if uploaded is None:
+        return
+    try:
+        profile = traces.profile_trace(uploaded.getvalue(), st.session_state.get("llmd_shared_prefix") or 0,
+                                       bool(st.session_state.get("trace_reply_cached", True)))
+    except traces.TraceError as exc:
+        st.session_state["trace_message"] = ("error", f"{uploaded.name} : {exc}")
+        return
+    st.session_state.update(trace_to_form(profile, st.session_state.get("trace_sessions")))
+    st.session_state["trace_summary"] = (traces.summary_rows(profile), profile.notes)
+    st.session_state["trace_message"] = ("success", f"Trace « {uploaded.name} » appliquée au profil de charge.")
+
+
 def slug(name: str) -> str:
     return re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-") or "scenario"
 
@@ -181,6 +198,27 @@ with st.sidebar:
     vllm_version = st.selectbox("Version de vLLM", versions, key="vllm_version")
 
     st.header("Profil de charge")
+    with st.expander("📼 Importer une trace working-set (ws trace)", expanded=False):
+        st.caption("Trace `ws trace pi|claude` (tailles et attentes seulement) : remplit ISL, OSL, hit rate, requêtes"
+                   " froides, tokens des requêtes chaudes et attente entre requêtes, en cache parfait. Le préfixe commun"
+                   " est celui de la section « Routage llm-d ».")
+        opt_int("Sessions visées (toutes instances)", "trace_sessions",
+                help="Avec les durées de service de la trace : requêtes en vol et sessions en pause. Vide : inchangées.")
+        st.checkbox("La réponse précédente reste en cache", key="trace_reply_cached",
+                    help=("Décocher si le chat template retire la réponse précédente (raisonnement) de l'historique :"
+                          " elle est alors prefillée de nouveau au tour suivant."))
+        st.file_uploader("Trace (.json)", type=["json"], key="trace_file", on_change=import_trace)
+        st.button("Réappliquer la trace", on_click=import_trace, width="stretch",
+                  help="Après avoir changé les sessions, le préfixe commun ou la case ci-dessus.")
+        message = st.session_state.pop("trace_message", None)
+        if message:
+            (st.success if message[0] == "success" else st.error)(message[1])
+        summary = st.session_state.get("trace_summary")
+        if summary:
+            st.dataframe([{"Lu sur la trace": label, "Valeur": value} for label, value in summary[0]],
+                         hide_index=True, width="stretch")
+            for note in summary[1]:
+                st.caption(note)
     usage_type = st.selectbox("Type d'usage", USAGE_ORDER, key="usage_type",
                               format_func=lambda u: catalog.workload.profiles[u].label)
     mode = st.radio("Mode", ["interactive", "batch"], horizontal=True, key="mode",
@@ -215,6 +253,16 @@ with st.sidebar:
               " vllm:num_requests_running + vllm:num_requests_waiting sur tous les pods, ou débit de requêtes × durée"
               " d'une requête."))
     paused_sessions = opt_int("Sessions en pause à garder en cache", "paused_sessions", min_value=0)
+    st.caption("Tokens à prefiller d'une requête chaude (ce qu'ajoute un tour)")
+    c1, c2 = st.columns(2)
+    with c1:
+        warm_p50 = opt_int("P50  ", "warm_p50", help="Sorties d'outils, message. Vide : dispersion par défaut (σ = 1).")
+    with c2:
+        warm_p95 = opt_int("P95  ", "warm_p95")
+    session_gap = opt_float(
+        "Attente entre deux requêtes d'une session (s)", "session_gap", 0.0, step=1.0,
+        help=("Outils et humain, moyenne. Donne les sessions à rejouer par palier (working-set) et le KV qu'elles"
+              " occupent. Vide : plan de test en requêtes en vol."))
 
     st.header("SLO")
     c1, c2 = st.columns(2)
@@ -352,7 +400,9 @@ try:
         workload={"usage_type": usage_type, "mode": mode, "isl": pct(isl_p50, isl_p95, isl_p99),
                   "osl": pct(osl_p50, osl_p95, osl_p99), "prefix_cache_hit_rate": hit_rate,
                   "cold_request_fraction": cold_fraction,
-                  "target_concurrency": target_concurrency, "paused_sessions": paused_sessions},
+                  "target_concurrency": target_concurrency, "paused_sessions": paused_sessions,
+                  "warm_uncached_tokens": pct(warm_p50, warm_p95, None) if warm_p50 else None,
+                  "session_gap_s": session_gap},
         slo={"ttft_p95_ms": ttft, "itl_p95_ms": itl, "itl_metric": itl_metric}, allow_lossy=allow_lossy,
         spec={"enabled": spec_enabled, "num_speculative_tokens": k, "acceptance_length": acceptance,
               "draft_sample_method": None if draft_choice == "défaut vLLM" else draft_choice},
@@ -576,6 +626,10 @@ with tabs[2]:
             "KV": "—" if s.kv_usage_pct is None else f"{s.kv_usage_pct:g} %",
             "Attendu vs SLO": VERDICT_LABEL[s.expectation],
             "Si validé : instances (GPU)": "—" if s.instances_needed is None else f"{s.instances_needed} ({s.gpus_needed})",
+            **({"Sessions working-set / instance": "—" if s.sessions_per_instance is None
+                else f"{s.sessions_per_instance[0]} – {s.sessions_per_instance[1]}",
+                "KV des sessions": "—" if s.sessions_kv_pct is None else f"{s.sessions_kv_pct:g} %"}
+               if request.workload.session_gap_s is not None else {}),
             "Pourquoi": s.expectation_reason,
         } for s in plan.steps], width="stretch", hide_index=True)
         st.caption(f"★ : palier de la config générée. Plages = estimation ×{analysis.uncertainty[0]:g} à"

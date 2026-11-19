@@ -27,7 +27,7 @@ version à l'autre. L'app applique ces règles de façon reproductible et montre
 |---|---|
 | Matériel | Type de GPU, nombre de GPU par instance (tensor parallel), nombre d'instances |
 | Modèle et version | Modèle du catalogue, version de vLLM |
-| Profil de charge | Type d'usage (chat, agentique, RAG, extraction, résumé, scoring, batch), mode interactif ou batch, ISL et OSL en P50 / P95 / P99, taux de prefix cache hit attendu, part de requêtes froides (préfixe absent du cache), requêtes en vol visées |
+| Profil de charge | Type d'usage (chat, agentique, RAG, extraction, résumé, scoring, batch), mode interactif ou batch, ISL et OSL en P50 / P95 / P99, taux de prefix cache hit attendu, part de requêtes froides (préfixe absent du cache), requêtes en vol visées, tokens à prefiller d'une requête chaude, attente entre deux requêtes d'une session ; ou import d'une trace [working-set](https://github.com/T0mSIlver/working-set) qui remplit ces champs |
 | SLO | TTFT p95 et ITL p95 cibles (optionnels) |
 | Mesures en production (optionnel) | ITL (ou TPOT) p95 et TTFT p95 mesurés avec la config générée : ils priment sur l'estimation ; la latence de génération recale la partie decode du modèle, le TTFT sa partie prefill |
 | Speculative decoding | Activation, `k`, méthode d'échantillonnage du draft, longueur d'acceptation mesurée, tolérance à une vérification lossy (FLy) |
@@ -381,6 +381,46 @@ passe si la latence de génération et le TTFT p95 tiennent la cible, sans file 
 (`vllm:num_requests_waiting` ≈ 0), sans préemption (`vllm:num_preemptions`) et avec `vllm:kv_cache_usage_perc` sous
 90 %. Le premier palier en échec fixe la capacité d'une instance au palier précédent.
 
+**Sessions agentiques : rejeu working-set.** Quand l'attente entre deux requêtes d'une session est connue (saisie, ou
+lue sur une trace importée), chaque palier donne aussi les **sessions à rejouer** : requêtes en vol × (durée d'une
+requête + attente) / durée, pour la durée estimée la plus longue puis la plus courte. Il donne aussi le KV que ces
+sessions occupent : une session en attente d'un outil garde son contexte en cache, et au-delà du pool vLLM évince
+les plus anciennes, dont le tour suivant refait tout son prefill. Un palier dont les sessions dépassent 90 % du KV
+passe à ⚠️. Le protocole donne alors la commande `ws replay` du palier, avec des seuils tirés des SLO.
+
+**Import d'une trace working-set** (`src/vllm_configurator/traces.py`, encart « 📼 Importer une trace » du profil de
+charge). Une trace `ws trace pi|claude` (format `workingset-agent-trace` v1 ou v2) ne contient que des tailles et des
+attentes. L'app la lit avec la même comptabilité que `ws replay`, en cache parfait :
+
+| Requête | Tokens à prefiller |
+|---|---|
+| Premier tour d'une session, ou prompt qui rétrécit (compaction, branche) : froide | prompt − préfixe commun à toutes les sessions (section llm-d) |
+| Tour suivant : chaude | prompt − prompt précédent − réponse précédente (sans la réponse si le chat template la retire de l'historique : case à décocher) |
+
+Elle en déduit :
+- l'ISL et l'OSL en P50, P95 et P99 ;
+- le hit rate pondéré par les tokens, et la part de requêtes froides ;
+- les P50 et P95 des tokens d'une requête chaude, qui fixent la dispersion σ à la place de l'heuristique ;
+- l'attente moyenne entre deux requêtes. Comme `ws replay`, l'app remplace les attentes inactives (erreur, reprise,
+  session laissée ouverte) par l'attente humaine moyenne.
+
+Avec un nombre de sessions et les durées de service d'une trace v2, elle répartit aussi ces sessions entre requêtes
+en vol et sessions en pause. Le hit rate et la part froide d'un cache parfait sont des planchers : évictions et
+mauvais routage ne font qu'ajouter des requêtes froides. Il faut les comparer au hit rate mesuré et à la part
+d'évictions rapportée par `ws replay`.
+
+Trois points à respecter pour que le rejeu ressemble à la production :
+- **`--shared-prefix-tokens`.** Par défaut, `ws replay` prend le plus petit premier prompt de la trace comme préfixe
+  commun à toutes les sessions. Avec des sessions qui démarrent au-delà de 100k tokens, ces 100k tokens deviennent
+  communs et les premiers tours sont quasi chauds. Le protocole fixe donc ce flag au préfixe commun déclaré.
+- **`--api chat`.** Il fait passer le chat template et le renderer ; l'API completions les court-circuite.
+- **L'acceptation du spec decoding.** Le texte rejoué est synthétique et sa sortie a une longueur forcée :
+  l'acceptation mesurée pendant le test est à saisir dans l'app pour recaler le bon facteur.
+
+working-set juge le TTFT p90 des requêtes chaudes et le débit de decode p10. Les seuils qui en découlent
+(`--max-warm-ttft-s`, `--min-decode-tok-s`) sont donc plus permissifs que les SLO p95 : le verdict d'un palier reste
+lu sur les métriques serveur.
+
 **Le modèle d'estimation**, qui sert à placer les paliers :
 
 | Grandeur | Calcul |
@@ -513,6 +553,7 @@ src/vllm_configurator/
   perf.py                   Modèle d'un step du scheduler (somme des rooflines par opérateur) et files d'attente
   analysis.py               Paliers de test, contrôles SLO, goulots et pistes de correction
   scenario.py               Fichiers de scénario YAML (export / import du formulaire)
+  traces.py                 Traces working-set (ws trace) : profil de charge lu sur des sessions enregistrées
   rules/                    Règles : une fonction pure (RuleContext, state) -> RuleOutput par décision
   engine.py                 Exécute le pipeline de règles, produit un GenerationResult
   render.py                 YAML `args` (KServe/K8s), ligne de commande, commande de vérification

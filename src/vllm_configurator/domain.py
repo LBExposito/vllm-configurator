@@ -43,6 +43,12 @@ class Workload(_Frozen):
     target_concurrency: int | None = Field(default=None, gt=0)
     # Sessions en pause dont le préfixe doit rester en cache (offload KV, §5).
     paused_sessions: int | None = Field(default=None, ge=0)
+    # Tokens à prefiller d'une requête chaude (ce que le tour ajoute : sorties d'outils, message). Fixe la dispersion
+    # de leur distribution (lue sur une trace) ; None : heuristique uncached_tokens_sigma.
+    warm_uncached_tokens: Percentiles | None = None
+    # Attente moyenne entre deux requêtes d'une même session (outils, humain), en secondes. Traduit les requêtes en
+    # vol en sessions (plan de test, rejeu working-set) ; None : plan de test en requêtes en vol seulement.
+    session_gap_s: float | None = Field(default=None, ge=0)
 
 
 class Slo(_Frozen):
@@ -270,6 +276,11 @@ class TestStep(_Frozen):
     instances_needed: int | None = None
     gpus_needed: int | None = None
     is_generated_config: bool = False
+    # Sessions équivalentes par instance (rejeu working-set) : requêtes en vol × (durée + attente) / durée, pour la
+    # durée d'une requête la plus longue puis la plus courte de l'estimation. None sans attente entre requêtes.
+    sessions_per_instance: tuple[int, int] | None = None
+    # KV occupé par ces sessions (actives et en attente), à la borne basse, en % du pool d'une instance.
+    sessions_kv_pct: float | None = None
 
 
 class TestPlan(_Frozen):

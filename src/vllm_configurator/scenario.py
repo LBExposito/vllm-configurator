@@ -21,6 +21,7 @@ import yaml
 from pydantic import ValidationError
 
 from .domain import DeploymentRequest, GenerationResult, RoutingRequest
+from .traces import TraceProfile
 
 KIND = "vllm-configurator/scenario"
 VERSION = 1
@@ -92,6 +93,9 @@ def request_to_form(request: DeploymentRequest) -> dict[str, Any]:
         "hit_rate": wl.prefix_cache_hit_rate, "cold_fraction": wl.cold_request_fraction,
         "target_concurrency": wl.target_concurrency,
         "paused_sessions": wl.paused_sessions,
+        "warm_p50": wl.warm_uncached_tokens.p50 if wl.warm_uncached_tokens else None,
+        "warm_p95": wl.warm_uncached_tokens.p95 if wl.warm_uncached_tokens else None,
+        "session_gap": wl.session_gap_s,
         "ttft": request.slo.ttft_p95_ms, "itl": request.slo.itl_p95_ms, "itl_metric": request.slo.itl_metric,
         "itl_measured": perf.itl_p95_ms if perf else None, "ttft_measured": perf.ttft_p95_ms if perf else None,
         "allow_lossy": request.allow_lossy, "spec_enabled": spec.enabled, "k": spec.num_speculative_tokens,
@@ -104,6 +108,23 @@ def request_to_form(request: DeploymentRequest) -> dict[str, Any]:
         "extra_args_text": _yaml_text(request.extra_args), "extra_env_text": _yaml_text(request.extra_env),
         **routing_to_form(request.routing),
     }
+
+
+TRACE_FORM_KEYS = {"prefix_cache_hit_rate": "hit_rate", "cold_request_fraction": "cold_fraction",
+                   "session_gap_s": "session_gap", "target_concurrency": "target_concurrency",
+                   "paused_sessions": "paused_sessions"}
+
+
+def trace_to_form(profile: TraceProfile, sessions: int | None = None) -> dict[str, Any]:
+    """Session-state values of the « Profil de charge » form section read off a working-set trace."""
+    updates = profile.workload_updates(sessions)
+    form: dict[str, Any] = {f"isl_{k}": v for k, v in updates["isl"].items()}
+    form |= {f"osl_{k}": v for k, v in updates["osl"].items()}
+    if "warm_uncached_tokens" in updates:
+        form |= {"warm_p50": updates["warm_uncached_tokens"]["p50"], "warm_p95": updates["warm_uncached_tokens"]["p95"]}
+    form |= {TRACE_FORM_KEYS[k]: v for k, v in updates.items() if k in TRACE_FORM_KEYS}
+    form["usage_type"] = "agentic"
+    return form
 
 
 ROUTING_WEIGHT_KEYS = {"queue-scorer": "llmd_w_queue", "kv-cache-utilization-scorer": "llmd_w_kv",

@@ -106,3 +106,15 @@ def test_llmd_parameters_can_be_forced_and_are_explained():
     epp = next(code.value for code in at.code if code.value.startswith("apiVersion:"))
     assert "lruCapacityPerServer: 700000" in epp and "forcé (calculé : 673639)" in epp
     assert any(e.label.startswith("📖 Comprendre") for e in at.expander)
+
+
+def test_session_gap_adds_the_working_set_columns():
+    at = AppTest.from_file(APP, default_timeout=30).run()
+    at.sidebar.button[0].click().run()
+    at.number_input(key="session_gap").set_value(6.0)
+    at.number_input(key="warm_p50").set_value(1000)
+    at.number_input(key="warm_p95").set_value(8000).run()
+    assert not at.exception
+    columns = [c for df in at.dataframe for c in df.value.columns]
+    assert "Sessions working-set / instance" in columns
+    assert any(e.label.startswith("📼 Importer une trace") for e in at.sidebar.expander)
